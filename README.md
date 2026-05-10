@@ -116,6 +116,48 @@ systemctl --user enable --now claude-discord-bridge
 ```
 If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl enable-linger $USER` first.
 
+**macOS launchd user agent (survives reboots and login):**
+
+```bash
+uv tool install .   # places `claude-discord-bridge` at ~/.local/bin/
+```
+
+Write `~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist`, replacing `<you>` with your home dir leaf:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.brokentoys.claude-discord-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/<you>/.local/bin/claude-discord-bridge</string>
+        <string>serve</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key>
+    <string>/Users/<you>/Library/Logs/claude-discord-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/<you>/Library/Logs/claude-discord-bridge.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/<you>/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+```
+
+Load it:
+```bash
+launchctl load -w ~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist
+```
+
+`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Tail the log with `tail -f ~/Library/Logs/claude-discord-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/org.brokentoys.claude-discord-bridge.plist`.
+
 ### 7. Verify
 
 ```bash
