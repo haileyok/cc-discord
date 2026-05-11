@@ -111,12 +111,14 @@ class BotNotReady(RuntimeError):
     pass
 
 
-class Bot:
+class DiscordBot:
     """Wraps a discord.py Client with the operations the bridge needs.
 
     State machine: instances start `not connected`. After `await start()` the
     Gateway handshake runs in the background; `is_ready` flips to True when
     the bot has fully connected and resolved the configured channel.
+
+    Implements the ChatPlatform protocol, converting str IDs to/from Discord's int IDs.
     """
 
     def __init__(
@@ -400,6 +402,25 @@ class Bot:
         msg = await channel.fetch_message(discord_message_id)
         for e in emoji:
             await msg.add_reaction(e)
+
+    async def download_attachment(
+        self, attachment_ref: discord.Attachment, dest_dir: Path
+    ) -> Path:
+        """Download a Discord attachment to the given directory.
+
+        Args:
+            attachment_ref: A discord.Attachment object.
+            dest_dir: Directory to download to.
+
+        Returns:
+            Path to the downloaded file.
+        """
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / (attachment_ref.filename or "download")
+        await attachment_ref.save(dest_path)
+        return dest_path
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         """Called by discord.py on every reaction-add. Bridges to the approval router callback."""
