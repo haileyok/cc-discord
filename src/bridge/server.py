@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from aiohttp import web
 
 from bridge.approvals import ApprovalRouter
-from bridge.backends.discord import DiscordBot, DiscordRichFormatter
 from bridge.backends.discord.bot import BotNotReady
 from bridge.listener import Listener, _PendingAsk
 from bridge.platform import ChatPlatform
@@ -446,14 +445,18 @@ async def build_app(platform: ChatPlatform, *, started_at: float | None = None) 
     return app
 
 
-async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) -> None:
+async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, platform: str = "discord") -> None:
     """Run the bridge server with bot integration and signal handling.
 
-    Binds to host:port, starts the Discord bot, and runs until SIGTERM/SIGINT.
+    Binds to host:port, starts the selected chat platform backend, and runs until SIGTERM/SIGINT.
     Opens the database for session persistence and instantiates ThreadRegistry.
-    """
-    import discord
 
+    Args:
+        secrets: Secrets dataclass containing platform-specific credentials.
+        host: Host to bind to (default: 127.0.0.1).
+        port: Port to bind to (default: 8787).
+        platform: Chat platform to use ('discord' or 'mattermost').
+    """
     listener = Listener()
     zellij = ZellijManager()
     await zellij.ensure_session_alive()
@@ -464,24 +467,58 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     await task_registry.load_from_db(reconcile_with_zellij=True)
 
     # Dispatcher closures call into approval_router/task_registry; both are
-    # available now. The DiscordBot is constructed after these closures because DiscordBot's
-    # constructor wires the callbacks up to discord.py event handlers.
+    # available now. The bot is constructed after these closures.
     _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
 
-    bot_holder: dict[str, DiscordBot] = {}
+    # Instantiate the appropriate backend based on platform
+    if platform == "discord":
+        import discord
+        from bridge.backends.discord.bot import DiscordBot
+        from bridge.backends.discord.formatting import DiscordRichFormatter
 
-    async def _on_reaction_dispatch(payload: discord.RawReactionActionEvent) -> None:
-        """Dispatch raw reaction events to approval and TUI resolvers."""
-        bot_self = bot_holder.get("bot")
-        client_user = bot_self.client.user if bot_self and bot_self.client else None
-        user_is_self_bot = bool(client_user and payload.user_id == client_user.id)
-        if await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot):
-            return
-        await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
+        bot_holder: dict[str, DiscordBot] = {}
 
-    bot = DiscordBot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
-    bot_holder["bot"] = bot
-    formatter = DiscordRichFormatter(bot)
+        async def _on_reaction_dispatch(payload: discord.RawReactionActionEvent) -> None:
+            """Dispatch raw reaction events to approval and TUI resolvers."""
+            bot_self = bot_holder.get("bot")
+            client_user = bot_self.client.user if bot_self and bot_self.client else None
+            user_is_self_bot = bool(client_user and payload.user_id == client_user.id)
+            if await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot):
+                return
+            await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
+
+        bot = DiscordBot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
+        bot_holder["bot"] = bot
+        formatter = DiscordRichFormatter(bot)
+
+    elif platform == "mattermost":
+        from bridge.backends.mattermost.bot import MattermostBot
+        from bridge.backends.mattermost.rich_formatter import MattermostRichFormatter
+
+        bot_holder_mm: dict[str, MattermostBot] = {}
+
+        async def _on_message_dispatch_mm(msg: dict[str, str]) -> None:
+            """Dispatch Mattermost messages (passed as dict)."""
+            await _dispatch_message(msg)
+
+        async def _on_reaction_dispatch_mm(reaction: dict[str, str]) -> None:
+            """Dispatch Mattermost reactions."""
+            # Mattermost reactions are different; handle appropriately
+            pass
+
+        bot = MattermostBot(
+            secrets.server_url,
+            secrets.bot_token,
+            secrets.channel_id,
+            on_message=_on_message_dispatch_mm,
+            on_reaction=_on_reaction_dispatch_mm,
+            allowed_user_ids=secrets.allowed_user_ids,
+        )
+        bot_holder_mm["bot"] = bot
+        formatter = MattermostRichFormatter(bot)
+
+    else:
+        raise ValueError(f"Unknown platform: {platform}")
 
     approval_router.bind_bot(bot)
     task_registry.bind_bot(bot)
@@ -501,42 +538,50 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     await bot.start()
     logger.info("listening on http://%s:%d", host, port)
 
-    # Build and sync the slash command tree
-    from bridge.backends.discord.commands import build_tree
+    # Build and sync the slash command tree (Discord only)
+    if platform == "discord":
+        import discord
+        from bridge.backends.discord.commands import build_tree
 
-    tree = build_tree(bot, task_registry)
-    # Wait for bot to be ready before syncing commands
-    while not bot.is_ready:
-        await asyncio.sleep(0.1)
-    # Bot is ready — drain any reconciliation notices staged by load_from_db.
-    await task_registry.flush_startup_notices()
-    guild_id = bot.channel.guild.id  # type: ignore[union-attr]
-    guild = discord.Object(id=guild_id)
-    tree.copy_global_to(guild=guild)  # registers globally to this guild for instant sync
-    # Slash-command sync hits the Discord HTTP API and can transiently 503
-    # during incidents; bounded retry so a single 503 doesn't crash startup.
-    sync_attempts = 0
-    while True:
-        try:
-            synced = await tree.sync(guild=guild)
-            break
-        except discord.DiscordServerError as e:
-            sync_attempts += 1
-            if sync_attempts >= 4:
-                logger.warning(
-                    "slash command sync failed after %d attempts (%s); "
-                    "continuing without resync",
-                    sync_attempts, e,
-                )
-                synced = []
+        tree = build_tree(bot, task_registry)
+        # Wait for bot to be ready before syncing commands
+        while not bot.is_ready:
+            await asyncio.sleep(0.1)
+        # Bot is ready — drain any reconciliation notices staged by load_from_db.
+        await task_registry.flush_startup_notices()
+        guild_id = bot.channel.guild.id  # type: ignore[union-attr]
+        guild = discord.Object(id=guild_id)
+        tree.copy_global_to(guild=guild)  # registers globally to this guild for instant sync
+        # Slash-command sync hits the Discord HTTP API and can transiently 503
+        # during incidents; bounded retry so a single 503 doesn't crash startup.
+        sync_attempts = 0
+        while True:
+            try:
+                synced = await tree.sync(guild=guild)
                 break
-            backoff = 0.5 * (2 ** (sync_attempts - 1))
-            logger.warning(
-                "slash command sync got %s; retrying in %.1fs (attempt %d/4)",
-                e, backoff, sync_attempts,
-            )
-            await asyncio.sleep(backoff)
-    logger.info("synced %d slash commands to guild %d", len(synced), guild_id)
+            except discord.DiscordServerError as e:
+                sync_attempts += 1
+                if sync_attempts >= 4:
+                    logger.warning(
+                        "slash command sync failed after %d attempts (%s); "
+                        "continuing without resync",
+                        sync_attempts, e,
+                    )
+                    synced = []
+                    break
+                backoff = 0.5 * (2 ** (sync_attempts - 1))
+                logger.warning(
+                    "slash command sync got %s; retrying in %.1fs (attempt %d/4)",
+                    e, backoff, sync_attempts,
+                )
+                await asyncio.sleep(backoff)
+        logger.info("synced %d slash commands to guild %d", len(synced), guild_id)
+    else:
+        # Mattermost or other platforms
+        # Wait for bot to be ready before continuing
+        while not bot.is_ready:
+            await asyncio.sleep(0.1)
+        await task_registry.flush_startup_notices()
 
     # Sweep stale attachments at startup, then schedule hourly background
     # sweep. TTL is `BRIDGE_ATTACHMENT_TTL_SECS` env var (default 7 days).
