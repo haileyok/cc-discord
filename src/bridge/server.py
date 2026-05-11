@@ -536,6 +536,8 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
     approval_router.bind_bot(bot)
     task_registry.bind_bot(bot)
     task_registry.bind_formatter(formatter)
+    bot.bind_registry(task_registry)
+    bot.bind_approval_router(approval_router)
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry
