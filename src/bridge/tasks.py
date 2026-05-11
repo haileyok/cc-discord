@@ -307,7 +307,7 @@ class _ToolSummaryAggregator:
     FLUSH_WINDOW = 1.0  # seconds
     SLOW_FLUSH_WINDOW = 5.0  # seconds (when rate-limited)
 
-    def __init__(self, bot: Bot, thread_id: int) -> None:
+    def __init__(self, bot: Bot, thread_id: str) -> None:
         self._bot = bot
         self._thread_id = thread_id
         self._lines: list[str] = []
@@ -370,7 +370,7 @@ class Task:
     """An in-memory task representation."""
 
     task_id: str
-    thread_id: int
+    thread_id: str
     zellij_pane_id: str | None
     cwd: str
     status: str
@@ -453,7 +453,7 @@ class TaskRegistry:
         self._zellij = zellij
         self._approval_router = approval_router
         self._by_task_id: dict[str, Task] = {}
-        self._by_thread_id: dict[int, Task] = {}
+        self._by_thread_id: dict[str, Task] = {}
         self._by_session_id: dict[str, Task] = {}
         self._stop_futures: dict[str, asyncio.Future] = {}
         self._typing_tasks: dict[str, asyncio.Task] = {}
@@ -587,7 +587,7 @@ class TaskRegistry:
         """Get task by task_id."""
         return self._by_task_id.get(task_id)
 
-    def get_by_thread_id(self, thread_id: int) -> Task | None:
+    def get_by_thread_id(self, thread_id: str) -> Task | None:
         """Get task by thread_id."""
         return self._by_thread_id.get(thread_id)
 
@@ -683,12 +683,12 @@ class TaskRegistry:
         # Clean up the task-scoped settings file
         _cleanup_task_artifacts(task.task_id)
 
-    async def _archive_thread(self, thread_id: int) -> None:
+    async def _archive_thread(self, thread_id: str) -> None:
         """Archive a Discord thread."""
         try:
             await self._bot.archive_thread(thread_id)
         except Exception:
-            logger.exception("Failed to archive thread %d", thread_id)
+            logger.exception("Failed to archive thread %s", thread_id)
 
     async def _start_typing(self, task: Task) -> None:
         """Start a typing indicator for a task. Cancels any prior typing task."""

@@ -54,7 +54,7 @@ class _PendingApproval:
     task_id: str
     tool_name: str
     tool_input: dict[str, Any]
-    thread_id: int
+    thread_id: str
     created_at: int
     future: asyncio.Future  # resolves to (decision: str, reason: str)
     message_id: int | None = None  # Discord message id; set after we post the prompt
@@ -64,7 +64,7 @@ class _PendingApproval:
 class _PendingTuiAnswer:
     request_id: str
     task_id: str
-    thread_id: int
+    thread_id: str
     pane_id: str
     kind: str  # "ask_question" | "multi_select" | "exit_plan" | "free_text"
     options: list[str]  # [] for free_text/exit_plan; option labels for ask_question/multi_select
@@ -98,8 +98,8 @@ class ApprovalRouter:
         self._by_message_id: dict[int, _PendingApproval] = {}
         self._tui_pending: dict[str, _PendingTuiAnswer] = {}
         self._tui_by_message_id: dict[int, _PendingTuiAnswer] = {}
-        self._tui_by_thread_id: dict[int, list[_PendingTuiAnswer]] = {}
-        self._recently_cancelled_threads: dict[int, float] = {}  # thread_id -> cancel_timestamp
+        self._tui_by_thread_id: dict[str, list[_PendingTuiAnswer]] = {}
+        self._recently_cancelled_threads: dict[str, float] = {}  # thread_id -> cancel_timestamp
         self._lock = asyncio.Lock()
 
     def bind_bot(self, bot: Bot) -> None:
@@ -112,7 +112,7 @@ class ApprovalRouter:
         *,
         request_id: str,
         task_id: str,
-        thread_id: int,
+        thread_id: str,
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> tuple[str, str]:
@@ -205,7 +205,7 @@ class ApprovalRouter:
         pending.future.set_result((decision, reason))
         return True
 
-    async def resolve_by_text(self, thread_id: int, text: str, author_is_bot: bool) -> bool:
+    async def resolve_by_text(self, thread_id: str, text: str, author_is_bot: bool) -> bool:
         """Called by the bot on a thread message. Resolves any pending approval for this thread
         as deny-with-reason only if the message contains non-whitespace text.
 
@@ -253,7 +253,7 @@ class ApprovalRouter:
         *,
         request_id: str,
         task_id: str,
-        thread_id: int,
+        thread_id: str,
         pane_id: str,
         kind: str,
         prompt_body: str,
@@ -406,7 +406,7 @@ class ApprovalRouter:
                     break
         return sorted(selected)
 
-    async def resolve_tui_by_text(self, thread_id: int, text: str, author_is_bot: bool) -> bool:
+    async def resolve_tui_by_text(self, thread_id: str, text: str, author_is_bot: bool) -> bool:
         if author_is_bot:
             return False
         async with self._lock:
@@ -444,7 +444,7 @@ class ApprovalRouter:
         pending.future.set_result((text.strip(), "reply"))
         return True
 
-    async def cancel_thread_tui(self, thread_id: int) -> int:
+    async def cancel_thread_tui(self, thread_id: str) -> int:
         """Cancel all pending TUI prompts in this thread (used when zellij UserPromptSubmit
         fires while a Discord prompt is still pending). Returns count cancelled.
 

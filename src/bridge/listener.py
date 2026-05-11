@@ -100,10 +100,10 @@ class Listener:
     """
 
     def __init__(self) -> None:
-        self._pending: dict[int, _PendingAsk] = {}
+        self._pending: dict[str, _PendingAsk] = {}
         self._lock = asyncio.Lock()  # guards _pending mutation
 
-    async def register(self, thread_id: int, ask: _PendingAsk) -> None:
+    async def register(self, thread_id: str, ask: _PendingAsk) -> None:
         """Register an ask for a thread.
 
         Raises RuntimeError if the thread already has a pending ask
@@ -116,7 +116,7 @@ class Listener:
                 raise RuntimeError(f"thread {thread_id} already has a pending ask")
             self._pending[thread_id] = ask
 
-    async def unregister(self, thread_id: int, ask: _PendingAsk) -> None:
+    async def unregister(self, thread_id: str, ask: _PendingAsk) -> None:
         """Unregister an ask from a thread.
 
         Cancels any pending coalesce task to prevent task leak.

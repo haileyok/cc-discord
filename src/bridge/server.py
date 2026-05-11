@@ -59,10 +59,10 @@ class AskLockMap:
     """Per-thread asyncio.Lock factory for FIFO serialization of /v1/ask calls."""
 
     def __init__(self) -> None:
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
         self._guard = asyncio.Lock()
 
-    async def get(self, thread_id: int) -> asyncio.Lock:
+    async def get(self, thread_id: str) -> asyncio.Lock:
         """Get or create a lock for a thread_id.
 
         Args:

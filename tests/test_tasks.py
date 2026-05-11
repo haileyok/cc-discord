@@ -38,7 +38,7 @@ class TestTask:
         """Task.from_row converts TaskRow to Task."""
         row = TaskRow(
             task_id="task-123",
-            thread_id=999,
+            thread_id="999",
             zellij_pane_id="terminal_1",
             cwd="/tmp/test",
             status="running",
@@ -49,7 +49,7 @@ class TestTask:
         )
         task = Task.from_row(row)
         assert task.task_id == "task-123"
-        assert task.thread_id == 999
+        assert task.thread_id == "999"
         assert task.zellij_pane_id == "terminal_1"
         assert task.cwd == "/tmp/test"
         assert task.status == "running"
@@ -99,9 +99,9 @@ class TestTaskRegistry:
         assert registry.get_by_task_id("task-3") is None  # Stopped task not loaded
 
         # By thread_id
-        assert registry.get_by_thread_id(1001) is not None
-        assert registry.get_by_thread_id(1002) is not None
-        assert registry.get_by_thread_id(1003) is None
+        assert registry.get_by_thread_id("1001") is not None
+        assert registry.get_by_thread_id("1002") is not None
+        assert registry.get_by_thread_id("1003") is None
 
         # By session_id
         assert registry.get_by_session_id("sess-1") is not None
@@ -943,7 +943,7 @@ class TestTaskRegistry:
         # Manually load the stopped task since load_from_db skips stopped tasks
         task = Task(
             task_id="task-123",
-            thread_id=999,
+            thread_id="999",
             zellij_pane_id=None,
             cwd="/tmp",
             status="stopped",
