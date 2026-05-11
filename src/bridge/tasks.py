@@ -307,7 +307,7 @@ class _ToolSummaryAggregator:
     FLUSH_WINDOW = 1.0  # seconds
     SLOW_FLUSH_WINDOW = 5.0  # seconds (when rate-limited)
 
-    def __init__(self, bot: Bot, thread_id: str) -> None:
+    def __init__(self, bot: ChatPlatform, thread_id: str) -> None:
         self._bot = bot
         self._thread_id = thread_id
         self._lines: list[str] = []

@@ -116,7 +116,7 @@ async def _handle_notify(request: web.Request) -> web.Response:
             content_type="application/json",
         )
 
-    bot: Bot = request.app[BOT_KEY]
+    bot: ChatPlatform = request.app[BOT_KEY]
     registry: ThreadRegistry = request.app[THREADS_KEY]
     message = body["message"]
 
@@ -203,7 +203,7 @@ async def _handle_ask(request: web.Request) -> web.Response:
             )
 
     try:
-        bot: Bot = request.app[BOT_KEY]
+        bot: ChatPlatform = request.app[BOT_KEY]
         registry: ThreadRegistry = request.app[THREADS_KEY]
         listener: Listener = request.app[LISTENER_KEY]
         locks: AskLockMap = request.app[ASK_LOCKS_KEY]
@@ -286,7 +286,7 @@ async def _handle_ask(request: web.Request) -> web.Response:
 
 async def _handle_health(request: web.Request) -> web.Response:
     """Handle GET /v1/health."""
-    bot: Bot = request.app[BOT_KEY]
+    bot: ChatPlatform = request.app[BOT_KEY]
     started_at: float = request.app[STARTED_AT_KEY]
     uptime_secs = int(time.monotonic() - started_at)
 
