@@ -56,7 +56,7 @@ class FakeBot:
         self._post_calls: list[dict] = []
         self._create_thread_calls: list[dict] = []
         self._next_thread_id = 2000
-        self._thread_alive_map: dict[int, bool] = {}
+        self._thread_alive_map: dict[str, bool] = {}
         self._client = None  # Stub for commands.py compatibility
 
     @property
@@ -75,7 +75,7 @@ class FakeBot:
     def set_ready(self, ready: bool) -> None:
         self._is_ready = ready
 
-    async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
+    async def post(self, message: str, *, thread_id: str | None = None) -> list[str]:
         """Fake post: record the call, return a fake message ID."""
         self._post_calls.append(
             {"message": message, "thread_id": thread_id}
@@ -83,29 +83,29 @@ class FakeBot:
         if not self.is_ready:
             raise BotNotReady("bot not connected to Discord")
         # Return a fake ID (first chunk always gets ID 1001)
-        return [1001]
+        return ["1001"]
 
-    async def create_thread(self, name: str) -> int:
+    async def create_thread(self, name: str) -> str:
         """Fake create_thread: record the call and return a fake thread ID."""
         thread_id = self._next_thread_id
         self._next_thread_id += 1
         self._create_thread_calls.append({"name": name, "id": thread_id})
-        self._thread_alive_map[thread_id] = True
-        return thread_id
+        self._thread_alive_map[str(thread_id)] = True
+        return str(thread_id)
 
-    async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
+    async def add_reactions(self, message_id: str, thread_id: str, emoji: list[str]) -> None:
         """Fake add_reactions: do nothing for testing."""
         if not self.is_ready:
             raise BotNotReady("bot not connected to Discord")
         # Just do nothing for testing
 
-    async def thread_alive(self, thread_id: int) -> bool:
+    async def thread_alive(self, thread_id: str) -> bool:
         """Fake thread_alive: check the map."""
         return self._thread_alive_map.get(thread_id, True)
 
-    def set_thread_alive(self, thread_id: int, alive: bool) -> None:
+    def set_thread_alive(self, thread_id: str | int, alive: bool) -> None:
         """Set whether a thread is considered alive."""
-        self._thread_alive_map[thread_id] = alive
+        self._thread_alive_map[str(thread_id)] = alive
 
     def get_post_calls(self) -> list[dict]:
         return self._post_calls
@@ -188,8 +188,8 @@ async def test_notify_success(client, fake_bot):
     )
     assert resp.status == 200
     body = await resp.json()
-    assert isinstance(body["thread_id"], int)
-    assert body["message_id"] == 1001
+    assert isinstance(body["thread_id"], str)
+    assert body["message_id"] == "1001"
 
     # Verify bot.post was called with the right thread_id
     calls = fake_bot.get_post_calls()
@@ -332,8 +332,8 @@ async def test_notify_recovers_after_error(client, fake_bot):
     )
     assert resp2.status == 200
     body = await resp2.json()
-    assert isinstance(body["thread_id"], int)
-    assert body["message_id"] == 1001
+    assert isinstance(body["thread_id"], str)
+    assert body["message_id"] == "1001"
 
 
 @pytest.mark.asyncio
@@ -352,8 +352,8 @@ async def test_notify_with_optional_fields(client, fake_bot):
     )
     assert resp.status == 200
     body = await resp.json()
-    assert isinstance(body["thread_id"], int)
-    assert body["message_id"] == 1001
+    assert isinstance(body["thread_id"], str)
+    assert body["message_id"] == "1001"
 
 
 @pytest.mark.asyncio
@@ -1120,7 +1120,7 @@ class TestHookEvent:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -1147,7 +1147,7 @@ class TestHookEvent:
         # Verify bot.post was called
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
-        assert posts[0]["thread_id"] == 999
+        assert posts[0]["thread_id"] == "999"
 
     async def test_hook_event_stop(self, client, fake_bot):
         """POST /v1/hook/event with Stop event returns 200."""
@@ -1421,7 +1421,7 @@ class TestDispatcher:
 
         # Create a task in the database
         task_id = "task-123"
-        thread_id = 5000
+        thread_id = "5000"
         pane_id = "pane_1"
         now = int(__import__('time').time())
         await upsert_task(

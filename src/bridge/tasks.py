@@ -865,7 +865,7 @@ class TaskRegistry:
         and their absolute paths are appended to the relayed text so Claude can read them
         with the Read tool (handles images, PDFs, JSON, plain text, etc.).
         """
-        thread_id = msg.channel.id
+        thread_id = str(msg.channel.id)
         task = self.get_by_thread_id(thread_id)
         if task is None:
             return False

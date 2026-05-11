@@ -128,7 +128,7 @@ class Listener:
 
     async def deliver(self, msg: MessageLike) -> None:
         """Deliver an incoming message to the pending ask for its thread (if any)."""
-        thread_id = msg.channel.id
+        thread_id = str(msg.channel.id)
         async with self._lock:
             ask = self._pending.get(thread_id)
         if ask is None:
