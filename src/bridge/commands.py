@@ -292,7 +292,7 @@ def _resolve_task(
 
     Raises _NotInTaskThread if no task is bound to the thread.
     """
-    target_id = override.id if override else interaction.channel_id
+    target_id = str(override.id if override else interaction.channel_id)
     task = registry.get_by_thread_id(target_id)
     if task is None:
         raise _NotInTaskThread(

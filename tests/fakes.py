@@ -8,6 +8,32 @@ from typing import Any
 
 
 @dataclass
+class FakeTypingContext:
+    """Fake typing context manager (shared with Discord backend)."""
+
+    entered: bool = False
+    exited: bool = False
+
+    async def __aenter__(self) -> FakeTypingContext:
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        self.exited = True
+
+
+@dataclass
+class FakeMessageable:
+    """Fake messageable object with typing support."""
+
+    typing_context: FakeTypingContext = field(default_factory=FakeTypingContext)
+
+    def typing(self) -> FakeTypingContext:
+        """Return typing context manager."""
+        return self.typing_context
+
+
+@dataclass
 class FakePlatform:
     """Fake ChatPlatform implementation for testing core modules.
 
@@ -111,9 +137,9 @@ class FakePlatform:
             {"thread_id": thread_id, "message_id": message_id, "content": content}
         )
 
-    async def fetch_messageable(self, thread_id: str) -> Any:
-        """Fake fetch_messageable: return a FakeBotChannel."""
-        return FakeBotChannel()
+    async def fetch_messageable(self, thread_id: str) -> FakeMessageable:
+        """Fake fetch_messageable: return a FakeMessageable with typing context."""
+        return FakeMessageable()
 
 
 @dataclass
