@@ -8,8 +8,15 @@ from unittest import mock
 
 import pytest
 
+from bridge.approvals import ApprovalRouter
 from bridge.backends.mattermost.api import RateLimitError
-from bridge.backends.mattermost.bot import MattermostBot, _chunk, _emoji_to_mattermost, _process_post_files
+from bridge.backends.mattermost.bot import (
+    MattermostBot,
+    _chunk,
+    _emoji_to_mattermost,
+    _mattermost_to_emoji,
+    _process_post_files,
+)
 
 
 class TestChunkFunction:
@@ -76,6 +83,53 @@ class TestEmojiMapping:
     def test_emoji_unknown_returns_as_is(self):
         """Test unknown emoji returns unchanged."""
         assert _emoji_to_mattermost("🎉") == "🎉"
+
+
+class TestMattermostToEmojiMapping:
+    """Tests for reverse emoji mapping (Mattermost name → Unicode)."""
+
+    def test_mattermost_white_check_mark_mapped(self):
+        """Test white_check_mark maps to checkmark emoji."""
+        assert _mattermost_to_emoji("white_check_mark") == "✅"
+
+    def test_mattermost_x_mapped(self):
+        """Test x maps to X emoji."""
+        assert _mattermost_to_emoji("x") == "❌"
+
+    def test_mattermost_thumbsup_mapped(self):
+        """Test thumbsup maps to thumbsup emoji."""
+        assert _mattermost_to_emoji("thumbsup") == "👍"
+
+    def test_mattermost_thumbsdown_mapped(self):
+        """Test thumbsdown maps to thumbsdown emoji."""
+        assert _mattermost_to_emoji("thumbsdown") == "👎"
+
+    def test_mattermost_number_mapped(self):
+        """Test number names map to number emojis."""
+        assert _mattermost_to_emoji("one") == "1️⃣"
+        assert _mattermost_to_emoji("two") == "2️⃣"
+        assert _mattermost_to_emoji("three") == "3️⃣"
+        assert _mattermost_to_emoji("four") == "4️⃣"
+
+    def test_mattermost_unknown_returns_as_is(self):
+        """Test unknown Mattermost emoji name returns unchanged."""
+        assert _mattermost_to_emoji("custom_emoji") == "custom_emoji"
+
+    def test_bidirectional_mapping_consistency(self):
+        """Test that mapped emojis are consistent in both directions."""
+        test_pairs = [
+            ("✅", "white_check_mark"),
+            ("❌", "x"),
+            ("1️⃣", "one"),
+            ("2️⃣", "two"),
+            ("3️⃣", "three"),
+            ("4️⃣", "four"),
+            ("👍", "thumbsup"),
+            ("👎", "thumbsdown"),
+        ]
+        for emoji, mm_name in test_pairs:
+            assert _emoji_to_mattermost(emoji) == mm_name
+            assert _mattermost_to_emoji(mm_name) == emoji
 
 
 class TestMattermostBotConstruction:
@@ -555,7 +609,11 @@ class TestMattermostBotEventHandling:
 
         await bot._handle_event("reaction_added", {"reaction": reaction})
 
-        handler.assert_called_once_with(reaction)
+        handler.assert_called_once()
+        called_reaction = handler.call_args[0][0]
+        assert called_reaction["post_id"] == "msg1"
+        assert called_reaction["user_id"] == "user1"
+        assert called_reaction["emoji"] == "👍"
 
     @pytest.mark.asyncio
     async def test_handle_reaction_added_ignores_own_reactions(self):
@@ -578,6 +636,83 @@ class TestMattermostBotEventHandling:
         await bot._handle_event("reaction_added", {"reaction": reaction})
 
         handler.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_reaction_added_normalizes_emoji(self):
+        """Test reaction handler receives normalized Unicode emoji."""
+        handler = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_reaction=handler,
+        )
+        bot._bot_user_id = "bot123"
+
+        reaction = {
+            "user_id": "user1",
+            "post_id": "msg1",
+            "emoji_name": "white_check_mark",
+        }
+
+        await bot._handle_event("reaction_added", {"reaction": reaction})
+
+        handler.assert_called_once()
+        called_reaction = handler.call_args[0][0]
+        # Should have normalized emoji_name to Unicode
+        assert called_reaction["emoji"] == "✅"
+        assert called_reaction["post_id"] == "msg1"
+        assert called_reaction["user_id"] == "user1"
+
+    @pytest.mark.asyncio
+    async def test_handle_reaction_added_normalizes_deny_emoji(self):
+        """Test X emoji reaction is normalized correctly."""
+        handler = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_reaction=handler,
+        )
+        bot._bot_user_id = "bot123"
+
+        reaction = {
+            "user_id": "user1",
+            "post_id": "msg1",
+            "emoji_name": "x",
+        }
+
+        await bot._handle_event("reaction_added", {"reaction": reaction})
+
+        handler.assert_called_once()
+        called_reaction = handler.call_args[0][0]
+        assert called_reaction["emoji"] == "❌"
+
+    @pytest.mark.asyncio
+    async def test_handle_reaction_added_normalizes_number_emoji(self):
+        """Test numeric emoji reactions are normalized correctly."""
+        handler = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_reaction=handler,
+        )
+        bot._bot_user_id = "bot123"
+
+        for mm_name, expected_emoji in [("one", "1️⃣"), ("two", "2️⃣"), ("three", "3️⃣")]:
+            handler.reset_mock()
+            reaction = {
+                "user_id": "user1",
+                "post_id": "msg1",
+                "emoji_name": mm_name,
+            }
+
+            await bot._handle_event("reaction_added", {"reaction": reaction})
+
+            handler.assert_called_once()
+            called_reaction = handler.call_args[0][0]
+            assert called_reaction["emoji"] == expected_emoji
 
 
 class TestAudioProcessing:
@@ -897,3 +1032,192 @@ class TestMattermostBotTextCommands:
         bot.post.assert_called_once()
         result_msg = bot.post.call_args[0][0]
         assert "No active tasks" in result_msg or "Active" in result_msg
+
+
+class TestMattermostBotApprovalRouterBinding:
+    """Tests for bind_approval_router binding."""
+
+    def test_bind_approval_router(self):
+        """Test bind_approval_router stores the router."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        router = mock.MagicMock()
+
+        bot.bind_approval_router(router)
+
+        assert bot._approval_router is router
+
+    def test_bind_approval_router_initially_none(self):
+        """Test approval_router is None before binding."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+
+        assert bot._approval_router is None
+
+
+class TestMattermostBotApprovalTextResolution:
+    """Tests for text-based approval/TUI resolution in threads."""
+
+    @pytest.mark.asyncio
+    async def test_text_reply_in_thread_resolves_approval(self):
+        """Test text reply in thread with pending approval resolves as deny."""
+        on_msg = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+
+        # Mock the approval router
+        approval_router = mock.AsyncMock()
+        approval_router.resolve_by_text = mock.AsyncMock(return_value=True)
+        approval_router.resolve_tui_by_text = mock.AsyncMock()
+        bot.bind_approval_router(approval_router)
+
+        post = {
+            "id": "msg2",
+            "message": "deny because of security",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": "msg1",  # In a thread
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # resolve_by_text should be called
+        approval_router.resolve_by_text.assert_called_once_with(
+            "msg1", "deny because of security", author_is_bot=False
+        )
+        # on_message should NOT be called since approval was resolved
+        on_msg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_text_reply_in_thread_resolves_tui_when_approval_fails(self):
+        """Test text reply tries TUI resolver if approval resolver returns False."""
+        on_msg = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+
+        # Mock the approval router
+        approval_router = mock.AsyncMock()
+        approval_router.resolve_by_text = mock.AsyncMock(return_value=False)
+        approval_router.resolve_tui_by_text = mock.AsyncMock(return_value=True)
+        bot.bind_approval_router(approval_router)
+
+        post = {
+            "id": "msg2",
+            "message": "option 1",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": "msg1",  # In a thread
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # resolve_by_text should be called first
+        approval_router.resolve_by_text.assert_called_once_with(
+            "msg1", "option 1", author_is_bot=False
+        )
+        # resolve_tui_by_text should be called second
+        approval_router.resolve_tui_by_text.assert_called_once_with(
+            "msg1", "option 1", author_is_bot=False
+        )
+        # on_message should NOT be called since TUI was resolved
+        on_msg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_text_reply_in_thread_passes_to_on_message_if_no_approval(self):
+        """Test text reply without pending prompt passes to on_message."""
+        on_msg = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+
+        # Mock the approval router
+        approval_router = mock.AsyncMock()
+        approval_router.resolve_by_text = mock.AsyncMock(return_value=False)
+        approval_router.resolve_tui_by_text = mock.AsyncMock(return_value=False)
+        bot.bind_approval_router(approval_router)
+
+        post = {
+            "id": "msg2",
+            "message": "just a regular message",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": "msg1",  # In a thread
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # resolve_by_text and resolve_tui_by_text should be called
+        approval_router.resolve_by_text.assert_called_once()
+        approval_router.resolve_tui_by_text.assert_called_once()
+        # on_message should be called since nothing was resolved
+        on_msg.assert_called_once_with(post)
+
+    @pytest.mark.asyncio
+    async def test_text_reply_without_approval_router_passes_to_on_message(self):
+        """Test text reply without router bound still passes to on_message."""
+        on_msg = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+        # Don't bind approval router
+
+        post = {
+            "id": "msg2",
+            "message": "message in thread",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": "msg1",  # In a thread
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # on_message should be called since there's no router
+        on_msg.assert_called_once_with(post)
+
+    @pytest.mark.asyncio
+    async def test_text_reply_not_in_thread_skips_approval_check(self):
+        """Test top-level messages don't check approval resolver."""
+        on_msg = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+
+        # Mock the approval router
+        approval_router = mock.AsyncMock()
+        bot.bind_approval_router(approval_router)
+
+        post = {
+            "id": "msg1",
+            "message": "top-level message",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            # No root_id = top-level message
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # Approval resolvers should NOT be called for top-level messages
+        approval_router.resolve_by_text.assert_not_called()
+        approval_router.resolve_tui_by_text.assert_not_called()
+        # on_message should be called
+        on_msg.assert_called_once_with(post)

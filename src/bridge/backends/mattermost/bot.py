@@ -16,6 +16,7 @@ from bridge.backends.mattermost.commands import dispatch_text_command, parse_tex
 from bridge.backends.mattermost.ws import MattermostWebSocket
 
 if TYPE_CHECKING:
+    from bridge.approvals import ApprovalRouter
     from bridge.tasks import TaskRegistry
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class MattermostBot:
         self._ready = False
         self._bot_user_id: str | None = None
         self._registry: TaskRegistry | None = None
+        self._approval_router: ApprovalRouter | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -60,6 +62,14 @@ class MattermostBot:
             registry: TaskRegistry instance for dispatching commands
         """
         self._registry = registry
+
+    def bind_approval_router(self, approval_router: ApprovalRouter) -> None:
+        """Bind an ApprovalRouter for handling approval/TUI text-based resolutions.
+
+        Args:
+            approval_router: ApprovalRouter instance for resolving text replies
+        """
+        self._approval_router = approval_router
 
     async def start(self) -> None:
         """Start the bot."""
@@ -228,6 +238,23 @@ class MattermostBot:
                     await self.post(result.message, thread_id=thread_id)
                     return
 
+            # If reply in a thread, check for pending approval/TUI resolution
+            thread_id = post.get("root_id") or None
+            is_reply_in_thread = bool(post.get("root_id"))
+
+            if is_reply_in_thread and self._approval_router:
+                resolved = await self._approval_router.resolve_by_text(
+                    thread_id, message, author_is_bot=False
+                )
+                if resolved:
+                    return
+                resolved = await self._approval_router.resolve_tui_by_text(
+                    thread_id, message, author_is_bot=False
+                )
+                if resolved:
+                    return
+
+            # Normal message handling
             if self._on_message:
                 await self._on_message(post)
 
@@ -236,7 +263,14 @@ class MattermostBot:
             if reaction.get("user_id") == self._bot_user_id:
                 return
             if self._on_reaction:
-                await self._on_reaction(reaction)
+                # Convert MM emoji name to Unicode for the approval router
+                emoji_unicode = _mattermost_to_emoji(reaction.get("emoji_name", ""))
+                normalized_reaction = {
+                    "post_id": reaction.get("post_id"),
+                    "user_id": reaction.get("user_id"),
+                    "emoji": emoji_unicode,
+                }
+                await self._on_reaction(normalized_reaction)
 
     async def _api_with_retry(
         self, factory: Callable[[], Awaitable[Any]], max_retries: int = 3
@@ -286,6 +320,23 @@ def _emoji_to_mattermost(emoji: str) -> str:
         "👎": "thumbsdown",
     }
     return mapping.get(emoji, emoji)
+
+
+_MATTERMOST_TO_UNICODE: dict[str, str] = {
+    "white_check_mark": "✅",
+    "x": "❌",
+    "one": "1️⃣",
+    "two": "2️⃣",
+    "three": "3️⃣",
+    "four": "4️⃣",
+    "thumbsup": "👍",
+    "thumbsdown": "👎",
+}
+
+
+def _mattermost_to_emoji(mm_name: str) -> str:
+    """Convert Mattermost emoji name to Unicode emoji for the approval router."""
+    return _MATTERMOST_TO_UNICODE.get(mm_name, mm_name)
 
 
 def _is_audio_mime_type(mime_type: str) -> bool:
