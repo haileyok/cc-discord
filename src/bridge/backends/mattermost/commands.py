@@ -3,13 +3,17 @@
 This module provides:
 - parse_text_command: Parse !-prefixed commands from message text
 - dispatch_text_command: Dispatch parsed commands to shared command handlers
+- slash_handler: HTTP handler for Mattermost slash commands
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 from typing import Any
+
+from aiohttp import web
 
 from bridge.command_handlers import (
     CommandResult,
@@ -115,3 +119,60 @@ async def dispatch_text_command(
 
     else:
         return CommandResult(success=False, message=f"Unknown command: !{command}")
+
+
+async def slash_handler(
+    request: web.Request,
+    command: str,
+    registry: Any,
+) -> web.Response:
+    """HTTP handler for Mattermost slash commands.
+
+    Receives form-encoded request body with command, text, channel_id, etc.
+    Returns JSON response with text and response_type.
+
+    Args:
+        request: aiohttp Request object
+        command: Command name (e.g., "start")
+        registry: TaskRegistry instance
+
+    Returns:
+        JSON response with text and response_type fields
+    """
+    try:
+        data = await request.post()
+        text = data.get("text", "")
+        args = shlex.split(text) if text else []
+
+        # Dispatch the command
+        result = await dispatch_text_command(command, args, registry, thread_id=None)
+
+        # Determine response type: ephemeral for errors, in_channel for success
+        response_type = "in_channel" if result.success else "ephemeral"
+
+        response_body = json.dumps(
+            {
+                "text": result.message,
+                "response_type": response_type,
+            }
+        )
+
+        return web.Response(
+            text=response_body,
+            content_type="application/json",
+            status=200,
+        )
+
+    except Exception as e:
+        logger.exception("slash_handler error for command %s", command)
+        error_body = json.dumps(
+            {
+                "text": f"❌ Internal error: {e}",
+                "response_type": "ephemeral",
+            }
+        )
+        return web.Response(
+            text=error_body,
+            content_type="application/json",
+            status=200,
+        )

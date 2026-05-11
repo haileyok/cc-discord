@@ -263,3 +263,73 @@ class TestDispatchTextCommand:
 
         assert result.success is False
         assert "Unknown" in result.message
+
+
+class TestSlashCommandHandlers:
+    """Tests for HTTP slash command handlers."""
+
+    @pytest.mark.asyncio
+    async def test_slash_handler_success_response(self):
+        """Test slash handler returns correct JSON response on success."""
+        from aiohttp import web
+        from bridge.backends.mattermost.commands import slash_handler
+
+        request = mock.AsyncMock(spec=web.Request)
+        request.post = mock.AsyncMock(
+            return_value={"text": "/tmp", "channel_id": "ch123"}
+        )
+
+        registry = mock.MagicMock()
+        task = mock.MagicMock()
+        task.task_id = "task123abc"
+        registry.spawn_task = mock.AsyncMock(return_value=task)
+        registry.get_by_task_id = mock.MagicMock(return_value=task)
+
+        response = await slash_handler(request, "start", registry)
+
+        assert response.status == 200
+        data = response.body.decode()
+        assert "response_type" in data
+        assert "text" in data
+
+    @pytest.mark.asyncio
+    async def test_slash_handler_error_response(self):
+        """Test slash handler returns ephemeral response on error."""
+        from aiohttp import web
+        from bridge.backends.mattermost.commands import slash_handler
+
+        request = mock.AsyncMock(spec=web.Request)
+        request.post = mock.AsyncMock(return_value={"text": "", "channel_id": "ch123"})
+
+        registry = mock.MagicMock()
+
+        response = await slash_handler(request, "start", registry)
+
+        assert response.status == 200
+        data = response.body.decode()
+        assert "ephemeral" in data
+
+    @pytest.mark.asyncio
+    async def test_slash_handler_parses_text_args(self):
+        """Test slash handler parses text field correctly."""
+        from aiohttp import web
+        from bridge.backends.mattermost.commands import slash_handler
+
+        request = mock.AsyncMock(spec=web.Request)
+        request.post = mock.AsyncMock(
+            return_value={
+                "text": "/tmp my prompt",
+                "channel_id": "ch123",
+                "command": "/start",
+            }
+        )
+
+        registry = mock.MagicMock()
+        task = mock.MagicMock()
+        task.task_id = "task123abc"
+        registry.spawn_task = mock.AsyncMock(return_value=task)
+        registry.get_by_task_id = mock.MagicMock(return_value=task)
+
+        response = await slash_handler(request, "start", registry)
+
+        assert response.status == 200
