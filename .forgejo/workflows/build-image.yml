@@ -1,0 +1,63 @@
+name: Build and push container image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  REGISTRY: forgejo.buttplug.haus
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: docker-amd64
+          - arch: arm64
+            runner: docker-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}-${{ matrix.arch }}
+
+  manifest:
+    needs: build
+    runs-on: docker-amd64
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Determine tags
+        id: tags
+        run: |
+          TAGS="${{ env.REGISTRY }}/${{ github.repository }}:latest"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ github.repository }}:${{ github.ref_name }}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push multi-arch manifests
+        run: |
+          IFS=',' read -ra TAG_LIST <<< "${{ steps.tags.outputs.tags }}"
+          for TAG in "${TAG_LIST[@]}"; do
+            docker manifest create "${TAG}" \
+              "${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}-amd64" \
+              "${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}-arm64"
+            docker manifest push "${TAG}"
+          done
