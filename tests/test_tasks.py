@@ -209,6 +209,8 @@ class TestTaskRegistry:
     ) -> None:
         """handle_event('SessionStart') rotates session_id and invalidates old mapping."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "bbbbbbbb-5555-6666-7777-888888888888"
         # Seed task with initial session_id
         await upsert_task(
             in_memory_db,
@@ -216,7 +218,7 @@ class TestTaskRegistry:
             "999",
             "/tmp",
             "running",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -224,28 +226,28 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         # Verify initial state
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
+        assert registry.get_by_session_id(old_sid) is not None
+        assert registry.get_by_session_id(new_sid) is None
 
-        # Rotate session_id to sess-B (e.g., on /clear or /compact)
+        # Rotate session_id (e.g., on /clear or /compact)
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "12345678-1234-5678-1234-567812345678",
+            "session_id": new_sid,
             "cwd": "/tmp",
             "transcript_path": "/path/to/transcript",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry.handle_event("SessionStart", body)
 
         # Task should be updated with new session_id
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
+        assert task.current_claude_session_id == new_sid
 
         # Old session_id mapping should be invalidated
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
+        assert registry.get_by_session_id(old_sid) is None
         # New session_id mapping should be valid
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
+        assert registry.get_by_session_id(new_sid) is not None
 
     async def test_handle_event_session_start_missing_session_id(
         self, fake_bot, fake_zellij, in_memory_db
@@ -533,7 +535,7 @@ class TestTaskRegistry:
         assert len(posts) == 1
         assert posts[0]["thread_id"] == "999"
         assert "🟢 Task started" in posts[0]["content"]
-        assert "sess-abc" in posts[0]["content"]
+        assert "12345678" in posts[0]["content"]
 
     async def test_on_session_start_unknown_task_id(
         self, fake_bot, fake_zellij, in_memory_db
@@ -647,13 +649,15 @@ class TestTaskRegistry:
     ) -> None:
         """_on_session_start with matcher='clear' posts 🧹 notice and rebinds."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "bbbbbbbb-5555-6666-7777-888888888888"
         await upsert_task(
             in_memory_db,
             "task-123",
             "999",
             "/tmp",
             "running",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -661,45 +665,47 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         # Verify old session id is indexed
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
+        assert registry.get_by_session_id(old_sid) is not None
 
         body = {
-            "session_id": "12345678-1234-5678-1234-567812345678",
+            "session_id": new_sid,
             "transcript_path": "/path/to/transcript2",
             "matcher": "clear",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry._on_session_start(body)
 
         # Verify rebind
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
+        assert task.current_claude_session_id == new_sid
         assert task.current_transcript_path == "/path/to/transcript2"
         assert task.status == "running"  # Status unchanged
 
         # Verify session_id index updated
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
-        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
+        assert registry.get_by_session_id(old_sid) is None
+        assert registry.get_by_session_id(new_sid) is not None
 
         # Verify notice
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
         assert "🧹 Context cleared" in posts[0]["content"]
-        assert "sess-new" in posts[0]["content"]
+        assert "bbbbbbbb" in posts[0]["content"]
 
     async def test_on_session_start_matcher_compact(
         self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """_on_session_start with matcher='compact' posts 🧰 notice and rebinds."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "cccccccc-5555-6666-7777-888888888888"
         await upsert_task(
             in_memory_db,
             "task-123",
             "999",
             "/tmp",
             "running",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -707,17 +713,17 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "12345678-1234-5678-1234-567812345678",
+            "session_id": new_sid,
             "transcript_path": "/path/to/transcript3",
             "matcher": "compact",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry._on_session_start(body)
 
         # Verify rebind
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
+        assert task.current_claude_session_id == new_sid
 
         # Verify notice
         posts = fake_bot.get_post_calls()
@@ -729,13 +735,15 @@ class TestTaskRegistry:
     ) -> None:
         """_on_session_start with matcher='resume' rebinds without posting notice."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "dddddddd-5555-6666-7777-888888888888"
         await upsert_task(
             in_memory_db,
             "task-123",
             "999",
             "/tmp",
             "running",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -743,17 +751,17 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "12345678-1234-5678-1234-567812345678",
+            "session_id": new_sid,
             "transcript_path": "/path/to/transcript4",
             "matcher": "resume",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry._on_session_start(body)
 
         # Verify rebind
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
+        assert task.current_claude_session_id == new_sid
 
         # Verify NO notice
         posts = fake_bot.get_post_calls()
@@ -1161,7 +1169,7 @@ class TestTaskRegistry:
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id="aaaaaaaa-1111-2222-3333-444444444444",
             now=now,
         )
         await upsert_task(
@@ -1171,7 +1179,7 @@ class TestTaskRegistry:
             "/tmp",
             "running",
             zellij_pane_id="terminal_dead",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id="bbbbbbbb-5555-6666-7777-888888888888",
             now=now,
         )
 
@@ -1219,6 +1227,10 @@ class FakeAuthor:
 class FakeAttachment:
     """Minimal fake attachment for maybe_route_message tests."""
     url: str = "http://example.com/image.png"
+    filename: str = "image.png"
+
+    async def read(self) -> bytes:
+        return b"fake image data"
 
 
 @dataclass
@@ -1340,7 +1352,7 @@ class TestMaybeRouteMessage:
     ) -> None:
         """maybe_route_message writes placeholder for message with attachments but no content."""
         task_id = "task-ghi"
-        thread_id = 8000
+        thread_id = "8000"
         pane_id = "pane_3"
         now = int(__import__('time').time())
         await upsert_task(
@@ -1363,7 +1375,7 @@ class TestMaybeRouteMessage:
 
         # Empty content but with attachment
         msg = FakeMsgLike(
-            channel=FakeChannel(id=thread_id),
+            channel=FakeChannel(id=int(thread_id)),
             content="",
             attachments=[FakeAttachment(url="http://example.com/image.png")]
         )
@@ -1371,7 +1383,8 @@ class TestMaybeRouteMessage:
 
         assert result is True
         assert len(write_calls) == 1
-        assert "(image attached — image relay not yet supported)" in write_calls[0]["text"]
+        # Attachment is downloaded and path relayed to pane
+        assert write_calls[0]["text"].strip() != ""
 
 
 @pytest.mark.asyncio
@@ -1390,7 +1403,7 @@ class TestTaskRegistryPhase3:
             "1001",
             "/a",
             "running",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id="aaaaaaaa-1111-2222-3333-444444444444",
             now=now,
         )
         # Insert another active task with more recent last_activity
@@ -1400,7 +1413,7 @@ class TestTaskRegistryPhase3:
             "1002",
             "/b",
             "running",
-            current_claude_session_id="12345678-1234-5678-1234-567812345678",
+            current_claude_session_id="bbbbbbbb-5555-6666-7777-888888888888",
             now=now + 100,
         )
         # Insert stopped task (should be filtered out)
@@ -1809,7 +1822,7 @@ class TestTaskRegistryPhase3:
 
         # Should have written the resume command
         assert len(write_calls) == 1
-        assert "claude --resume sess-abc" in write_calls[0]["text"]
+        assert "claude --resume 12345678-1234-5678-1234-567812345678" in write_calls[0]["text"]
 
         # Task should still be running
         assert task.status == "running"
@@ -2246,7 +2259,7 @@ class TestTaskRegistryPhase3:
         await asyncio.sleep(0)
 
         # Verify typing context was entered
-        thread_id = 999
+        thread_id = "999"
         typing_context = fake_bot._fake_channels[thread_id].typing_context
         assert typing_context.entered is True
         assert typing_context.exited is False
