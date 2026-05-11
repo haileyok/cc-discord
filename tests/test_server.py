@@ -1134,7 +1134,7 @@ class TestHookEvent:
             "/v1/hook/event",
             json={
                 "hook_event_name": "SessionStart",
-                "session_id": "sess-abc",
+                "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 "cwd": "/tmp",
                 "transcript_path": "/path",
                 "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
