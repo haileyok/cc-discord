@@ -11,6 +11,38 @@ from bridge.cli import cli
 from bridge.secrets import Secrets, write_secrets
 
 
+class TestCliPackageMetadata:
+    """Tests for CLI package metadata and entrypoint."""
+
+    def test_package_name_is_claude_code_bridge(self) -> None:
+        """Verify package name in pyproject.toml is 'claude-code-bridge'."""
+        pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+        assert pyproject_path.exists(), "pyproject.toml not found"
+        content = pyproject_path.read_text()
+        assert 'name = "claude-code-bridge"' in content, "Package name should be 'claude-code-bridge'"
+
+    def test_entrypoint_is_cc_bridge(self) -> None:
+        """Verify CLI entrypoint in pyproject.toml is 'cc-bridge'."""
+        pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+        assert pyproject_path.exists(), "pyproject.toml not found"
+        content = pyproject_path.read_text()
+        assert 'cc-bridge = "bridge.cli:main"' in content, "Entrypoint should be 'cc-bridge = \"bridge.cli:main\"'"
+
+    def test_cc_bridge_help_command_works(self) -> None:
+        """Verify cc-bridge --help returns CLI help text with all commands."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--help"])
+
+        assert result.exit_code == 0
+        # CliRunner shows "Usage: cli" (the function name), not the installed entrypoint name
+        # but the help must show the actual commands available
+        assert "Commands:" in result.output
+        assert "init" in result.output
+        assert "serve" in result.output
+        assert "doctor" in result.output
+        assert "Claude Code <-> Discord bridge" in result.output
+
+
 class TestInitCommand:
     """Tests for `claude-discord-bridge init` subcommand."""
 
