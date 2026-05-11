@@ -2,7 +2,7 @@
 
 Localhost HTTP bridge between Claude Code sessions and Discord or Mattermost. Single-process Python daemon — `aiohttp` server and a `ChatPlatform` backend (Discord or Mattermost) share one asyncio event loop.
 
-Freshness: 2026-05-10
+Freshness: 2026-05-11
 
 ## Repo location and tooling
 
@@ -56,6 +56,14 @@ Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3
 The systemd unit at `packaging/cc-bridge.service` hardcodes `%h/.local/bin/cc-bridge` — it assumes `uv tool install .`, not `uv run`. The two install paths are not interchangeable.
 
 `systemctl --user` is **not** available on the coder workstation by default ("Operation not permitted"). The verified-working path is `scripts/run-foreground.sh` under tmux/nohup. To use real systemd, the user must first run `loginctl enable-linger $USER`.
+
+### Docker (qcluster-1 / headless)
+
+The Docker container runs the bridge as PID 1 *outside* zellij. Zellij is started in the background via `attach --create-background`. This means **`action write-chars` silently fails** — it returns 0 but doesn't deliver keystrokes because no terminal client is attached to the session. Initial prompts must be passed via `-p` flag in the KDL layout, not via `write_to_pane`. Follow-up thread messages (`maybe_route_message`) also use `write_to_pane` and are therefore broken in headless Docker — this is a known limitation.
+
+`MattermostMessageAdapter` (in `backends/mattermost/bot.py`) wraps Mattermost post dicts into `MessageLike`-compatible objects so the platform-agnostic dispatcher and task router can use attribute access. If you add new fields the dispatcher reads from messages, update the adapter too.
+
+Production integration testing against the live Mattermost instance is documented in `plans/mattermost-production-testing.md` — covers token creation, API calls, log interpretation, zellij diagnostics, and hotpatching.
 
 ## Architecture quick reference
 
