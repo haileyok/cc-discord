@@ -389,3 +389,58 @@ async def test_non_2xx_from_bridge(fake_bridge):
         # No exception, just silent exit
     finally:
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_env_passthrough_new_cc_bridge_task_id(fake_bridge):
+    """
+    When CC_BRIDGE_TASK_ID is set, it appears in env_passthrough.
+    """
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": "test-session-bridge",
+        "cwd": "/tmp/work",
+    }
+
+    result = await _run_hook(
+        payload,
+        bridge_url=fake_bridge["url"],
+        env_overrides={
+            "CC_BRIDGE_TASK_ID": "task-bridge-new",
+        },
+    )
+
+    assert result.returncode == 0
+    assert len(fake_bridge["seen"]) == 1
+    body = fake_bridge["seen"][0]
+    assert "env_passthrough" in body
+    assert body["env_passthrough"]["CC_BRIDGE_TASK_ID"] == "task-bridge-new"
+
+
+@pytest.mark.asyncio
+async def test_env_passthrough_both_old_and_new_task_ids(fake_bridge):
+    """
+    When both CC_BRIDGE_TASK_ID and CC_DISCORD_TASK_ID are set,
+    both appear in env_passthrough.
+    """
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": "test-session-both",
+        "cwd": "/tmp/work",
+    }
+
+    result = await _run_hook(
+        payload,
+        bridge_url=fake_bridge["url"],
+        env_overrides={
+            "CC_BRIDGE_TASK_ID": "task-new-var",
+            "CC_DISCORD_TASK_ID": "task-old-var",
+        },
+    )
+
+    assert result.returncode == 0
+    assert len(fake_bridge["seen"]) == 1
+    body = fake_bridge["seen"][0]
+    assert "env_passthrough" in body
+    assert body["env_passthrough"]["CC_BRIDGE_TASK_ID"] == "task-new-var"
+    assert body["env_passthrough"]["CC_DISCORD_TASK_ID"] == "task-old-var"

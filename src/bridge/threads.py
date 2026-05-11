@@ -6,6 +6,7 @@ from pathlib import Path
 import aiosqlite
 
 from bridge import state
+from bridge.platform import ChatPlatform
 
 
 class ThreadRegistry:
@@ -17,18 +18,18 @@ class ThreadRegistry:
     same session are rare, so contention is acceptable.
     """
 
-    def __init__(self, bot, conn: aiosqlite.Connection) -> None:
+    def __init__(self, bot: ChatPlatform, conn: aiosqlite.Connection) -> None:
         """Initialize the registry with a bot and database connection.
 
         Args:
-            bot: Bot instance with create_thread() and thread_alive() methods.
+            bot: ChatPlatform instance with create_thread() and thread_alive() methods.
             conn: Open aiosqlite.Connection to the sessions table.
         """
         self._bot = bot
         self._conn = conn
         self._lock = asyncio.Lock()
 
-    async def get_or_create_thread(self, session_id: str, cwd: str) -> int:
+    async def get_or_create_thread(self, session_id: str, cwd: str) -> str:
         """Get or create a thread for a session.
 
         If session is cached and thread still exists, return the cached thread_id.
@@ -40,7 +41,7 @@ class ThreadRegistry:
             cwd: Current working directory (used only in thread name).
 
         Returns:
-            The thread_id (int) for this session.
+            The thread_id (str) for this session.
         """
         async with self._lock:
             row = await state.get_session(self._conn, session_id)
@@ -57,7 +58,7 @@ class ThreadRegistry:
             await state.upsert_session(self._conn, session_id, cwd, thread_id)
             return thread_id
 
-    async def _thread_alive(self, thread_id: int) -> bool:
+    async def _thread_alive(self, thread_id: str) -> bool:
         """Check if a thread still exists.
 
         Returns:
@@ -66,7 +67,7 @@ class ThreadRegistry:
         """
         return await self._bot.thread_alive(thread_id)
 
-    async def _create_thread(self, session_id: str, cwd: str) -> int:
+    async def _create_thread(self, session_id: str, cwd: str) -> str:
         """Create a new thread off the configured channel.
 
         Args:

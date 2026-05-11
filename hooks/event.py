@@ -50,7 +50,7 @@ def main() -> None:
 
     # Augment with env passthrough
     env_passthrough = {}
-    for var in ("CC_DISCORD_TASK_ID", "CLAUDE_PROJECT_DIR"):
+    for var in ("CC_BRIDGE_TASK_ID", "CC_DISCORD_TASK_ID", "CLAUDE_PROJECT_DIR"):
         if var in os.environ:
             env_passthrough[var] = os.environ[var]
     if env_passthrough:

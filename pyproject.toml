@@ -1,5 +1,5 @@
 [project]
-name = "claude-discord-bridge"
+name = "claude-code-bridge"
 version = "0.1.0"
 description = "Localhost HTTP bridge between Claude Code sessions and Discord."
 requires-python = ">=3.12,<4"
@@ -8,10 +8,11 @@ dependencies = [
     "aiosqlite>=0.21",
     "click>=8.1",
     "discord.py>=2.4",
+    "websockets>=14",
 ]
 
 [project.scripts]
-claude-discord-bridge = "bridge.cli:main"
+cc-bridge = "bridge.cli:main"
 
 [dependency-groups]
 dev = [

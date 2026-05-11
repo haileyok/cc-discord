@@ -19,21 +19,21 @@ import discord
 
 import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
-from bridge.bot import BotNotReady
+from bridge.backends.discord.bot import BotNotReady
 from bridge.listener import MessageLike
+from bridge.platform import ChatPlatform, RichFormatter
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
 
 if TYPE_CHECKING:
     from bridge.approvals import ApprovalRouter
-    from bridge.bot import Bot
 
 logger = logging.getLogger(__name__)
 
 # Task-scoped settings directory
-TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "cc-bridge" / "task-settings"
 # Per-task attachment directory for files relayed from Discord.
-ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "attachments"
+ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "cc-bridge" / "attachments"
 
 # Hook scripts directory — resolved at import time for test monkeypatch support
 HOOKS_DIR = Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"
@@ -307,7 +307,7 @@ class _ToolSummaryAggregator:
     FLUSH_WINDOW = 1.0  # seconds
     SLOW_FLUSH_WINDOW = 5.0  # seconds (when rate-limited)
 
-    def __init__(self, bot: Bot, thread_id: int) -> None:
+    def __init__(self, bot: ChatPlatform, thread_id: str) -> None:
         self._bot = bot
         self._thread_id = thread_id
         self._lines: list[str] = []
@@ -370,7 +370,7 @@ class Task:
     """An in-memory task representation."""
 
     task_id: str
-    thread_id: int
+    thread_id: str
     zellij_pane_id: str | None
     cwd: str
     status: str
@@ -437,7 +437,7 @@ class TaskRegistry:
     def __init__(
         self,
         conn: aiosqlite.Connection,
-        bot: "Bot | None",
+        bot: ChatPlatform | None,
         zellij: ZellijManager,
         approval_router: "ApprovalRouter | None" = None,
     ) -> None:
@@ -450,10 +450,11 @@ class TaskRegistry:
         """
         self._conn = conn
         self._bot = bot
+        self._formatter: RichFormatter | None = None
         self._zellij = zellij
         self._approval_router = approval_router
         self._by_task_id: dict[str, Task] = {}
-        self._by_thread_id: dict[int, Task] = {}
+        self._by_thread_id: dict[str, Task] = {}
         self._by_session_id: dict[str, Task] = {}
         self._stop_futures: dict[str, asyncio.Future] = {}
         self._typing_tasks: dict[str, asyncio.Task] = {}
@@ -468,10 +469,15 @@ class TaskRegistry:
         # flush_startup_notices() once the bot is ready.
         self._pending_startup_notices: list[dict] = []
 
-    def bind_bot(self, bot: "Bot") -> None:
+    def bind_bot(self, bot: ChatPlatform) -> None:
         """Attach the Bot instance after construction. Called once by
         `server.serve` after the Bot is created."""
         self._bot = bot
+
+    def bind_formatter(self, formatter: RichFormatter) -> None:
+        """Attach the RichFormatter instance. Called once by `server.serve`
+        after the formatter is created."""
+        self._formatter = formatter
 
     @staticmethod
     def _notify_mention_prefix() -> str:
@@ -587,7 +593,7 @@ class TaskRegistry:
         """Get task by task_id."""
         return self._by_task_id.get(task_id)
 
-    def get_by_thread_id(self, thread_id: int) -> Task | None:
+    def get_by_thread_id(self, thread_id: str) -> Task | None:
         """Get task by thread_id."""
         return self._by_thread_id.get(thread_id)
 
@@ -639,7 +645,8 @@ class TaskRegistry:
         (which already carries PATH, HOME, etc).
         """
         return {
-            "CC_DISCORD_TASK_ID": task_id,
+            "CC_BRIDGE_TASK_ID": task_id,
+            "CC_DISCORD_TASK_ID": task_id,  # backward compat, remove in future release
             "BRIDGE_URL": os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787"),
         }
 
@@ -682,12 +689,12 @@ class TaskRegistry:
         # Clean up the task-scoped settings file
         _cleanup_task_artifacts(task.task_id)
 
-    async def _archive_thread(self, thread_id: int) -> None:
+    async def _archive_thread(self, thread_id: str) -> None:
         """Archive a Discord thread."""
         try:
             await self._bot.archive_thread(thread_id)
         except Exception:
-            logger.exception("Failed to archive thread %d", thread_id)
+            logger.exception("Failed to archive thread %s", thread_id)
 
     async def _start_typing(self, task: Task) -> None:
         """Start a typing indicator for a task. Cancels any prior typing task."""
@@ -733,7 +740,7 @@ class TaskRegistry:
         2. Generates a task_id UUID.
         3. Creates a Discord thread.
         4. Persists a row with status='spawning'.
-        5. Builds env with CC_DISCORD_TASK_ID and BRIDGE_URL.
+        5. Builds env with CC_BRIDGE_TASK_ID (and CC_DISCORD_TASK_ID for backward compat) and BRIDGE_URL.
         6. Spawns claude in zellij via ZellijManager.
         7. Updates row with zellij_pane_id.
         8. Indexes the task in memory.
@@ -860,11 +867,11 @@ class TaskRegistry:
         """If msg is in a task-bound thread, write to its zellij pane and return True.
         Otherwise return False so the caller falls through to the existing /v1/ask listener.
 
-        Attachments are downloaded to ~/.local/state/claude-discord-bridge/attachments/<task>/
+        Attachments are downloaded to ~/.local/state/cc-bridge/attachments/<task>/
         and their absolute paths are appended to the relayed text so Claude can read them
         with the Read tool (handles images, PDFs, JSON, plain text, etc.).
         """
-        thread_id = msg.channel.id
+        thread_id = str(msg.channel.id)
         task = self.get_by_thread_id(thread_id)
         if task is None:
             return False
@@ -1032,21 +1039,21 @@ class TaskRegistry:
         """Handle SessionStart event.
 
         Branches on matcher value:
-        - 'startup': first bind. Look up by CC_DISCORD_TASK_ID, populate session/transcript,
-          flip status to running, post '🟢 Task started' notice.
+        - 'startup': first bind. Look up by CC_BRIDGE_TASK_ID (or CC_DISCORD_TASK_ID for backward compat),
+          populate session/transcript, flip status to running, post '🟢 Task started' notice.
         - 'clear':   /clear inside TUI. Rebind same task to new session id, post '🧹' notice.
         - 'compact': /compact inside TUI. Rebind same task to new session id, post '🧰' notice.
         - 'resume':  claude --resume by /restart. Same as startup but no notice (user already
                      saw the /restart command's reply).
         - default:   unknown matcher → fall through to startup behavior (safest).
 
-        Per AC2.4: silently drops SessionStart events with no CC_DISCORD_TASK_ID.
+        Per AC2.4: silently drops SessionStart events with no CC_BRIDGE_TASK_ID or CC_DISCORD_TASK_ID.
         Also drops if session_id or transcript_path is missing.
         """
         session_id = body.get("session_id")
         transcript_path = body.get("transcript_path")
         env_passthrough = body.get("env_passthrough", {})
-        task_id = env_passthrough.get("CC_DISCORD_TASK_ID")
+        task_id = env_passthrough.get("CC_BRIDGE_TASK_ID") or env_passthrough.get("CC_DISCORD_TASK_ID")
         matcher = body.get("matcher") or "startup"
 
         logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}, matcher={matcher}")
@@ -1054,7 +1061,7 @@ class TaskRegistry:
         # AC2.4: drop SessionStart without task_id, session_id, or transcript_path
         if not task_id or not session_id or not transcript_path:
             if not task_id:
-                logger.debug("SessionStart: no CC_DISCORD_TASK_ID in env_passthrough")
+                logger.debug("SessionStart: no CC_BRIDGE_TASK_ID or CC_DISCORD_TASK_ID in env_passthrough")
             elif not session_id:
                 logger.warning("SessionStart: no session_id in body")
             elif not transcript_path:
@@ -1346,11 +1353,12 @@ class TaskRegistry:
             try:
                 channel = await self._bot.fetch_messageable(task.thread_id)
                 last_id = getattr(channel, "last_message_id", None)
-                if last_id == task.last_task_list_message_id:
-                    await self._bot.edit_message(
+                if last_id == task.last_task_list_message_id and self._formatter:
+                    await self._formatter.edit_rich(
                         task.thread_id,
                         task.last_task_list_message_id,
-                        embed=embed,
+                        "task_list",
+                        {"embed": embed},
                     )
                     return
             except BotNotReady:
@@ -1362,8 +1370,10 @@ class TaskRegistry:
                 )
 
         try:
-            task.last_task_list_message_id = await self._bot.post_embed(
-                embed, thread_id=task.thread_id
+            if not self._formatter:
+                return
+            task.last_task_list_message_id = await self._formatter.post_rich(
+                task.thread_id, "task_list", {"embed": embed}
             )
         except BotNotReady:
             return
@@ -1820,8 +1830,10 @@ class TaskRegistry:
             # refresh re-try as if fresh, instead of leaving a zombie block
             # whose `message_id is None` blocks future edits.
             try:
-                block.message_id = await self._bot.post_embed(
-                    embed, thread_id=task.thread_id
+                if not self._formatter:
+                    return
+                block.message_id = await self._formatter.post_rich(
+                    task.thread_id, "subagent_block", {"embed": embed}
                 )
             except BotNotReady:
                 logger.info(
@@ -1855,8 +1867,10 @@ class TaskRegistry:
             block, last_actions, total_actions, finished
         )
         try:
-            await self._bot.edit_message(
-                task.thread_id, block.message_id, embed=embed
+            if not self._formatter:
+                return
+            await self._formatter.edit_rich(
+                task.thread_id, block.message_id, "subagent_block", {"embed": embed}
             )
         except Exception:
             logger.exception(

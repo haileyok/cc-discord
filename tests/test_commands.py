@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,7 +11,8 @@ from typing import Any
 import pytest
 
 from bridge.tasks import TaskRegistry
-from tests.fakes import FakeBot, FakeZellij
+from tests.backends.discord.fakes import FakeDiscordBot
+from tests.fakes import FakeZellij
 
 
 @dataclass
@@ -57,8 +59,8 @@ class FakeInteraction:
 
 
 @pytest.fixture
-def fake_bot() -> FakeBot:
-    return FakeBot()
+def fake_bot() -> FakeDiscordBot:
+    return FakeDiscordBot()
 
 
 @pytest.fixture
@@ -72,8 +74,7 @@ class TestCommands:
 
     async def test_humanize_age_seconds(self) -> None:
         """_humanize_age formats seconds correctly."""
-        from bridge.commands import _humanize_age
-        import time
+        from bridge.command_handlers import _humanize_age
 
         now = int(time.time())
 
@@ -97,7 +98,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """_wait_for_session_bind polls until session_id is set or timeout."""
-        from bridge.commands import _wait_for_session_bind
+        from bridge.command_handlers import _wait_for_session_bind
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -138,7 +139,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """_wait_for_session_bind raises asyncio.TimeoutError if session_id doesn't arrive."""
-        from bridge.commands import _wait_for_session_bind
+        from bridge.command_handlers import _wait_for_session_bind
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -163,8 +164,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """start command without prompt spawns task and replies with thread URL."""
-        from bridge.commands import build_tree
-        import tempfile
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -197,7 +197,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """start command replies with ❌ when spawn_task raises."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -222,7 +222,7 @@ class TestCommands:
 
     async def test_list_empty(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """list command with no tasks replies 'No active tasks.'"""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -242,7 +242,7 @@ class TestCommands:
 
     async def test_list_multi(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """list command shows all active tasks."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -279,7 +279,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """stop command outside a task thread replies with ❌."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -298,7 +298,7 @@ class TestCommands:
 
     async def test_stop_cleanly_stopped(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """stop command replies ✅ when stop_task returns True."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -341,7 +341,7 @@ class TestCommands:
 
     async def test_kill_happy_path(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """kill command replies 💥 after closing pane."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -376,7 +376,7 @@ class TestCommands:
 
     async def test_restart_happy_path(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """restart command replies 🔄."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -405,3 +405,153 @@ class TestCommands:
         assert len(interaction.followup._sends) >= 1
         reply = interaction.followup._sends[0]
         assert "🔄 Restarted" in reply["content"]
+
+
+@pytest.mark.asyncio
+class TestSharedCommandHandlers:
+    """Tests for platform-agnostic command handlers."""
+
+    async def test_command_result_dataclass_exists(self) -> None:
+        """CommandResult dataclass is importable and has expected fields."""
+        from bridge.command_handlers import CommandResult
+
+        result = CommandResult(success=True, message="test")
+        assert result.success is True
+        assert result.message == "test"
+        assert result.task is None
+        assert result.tasks is None
+        assert result.embed_data is None
+
+    async def test_handle_start_returns_command_result(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        """handle_start returns CommandResult with task data."""
+        from bridge.command_handlers import handle_start
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await handle_start(registry, cwd=tmpdir)
+
+            # Should return CommandResult
+            assert hasattr(result, "success")
+            assert hasattr(result, "message")
+            assert hasattr(result, "task")
+            # Successful start should have task data
+            assert result.success is True
+            assert result.task is not None
+
+    async def test_handle_list_returns_command_result(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        """handle_list returns CommandResult with tasks list."""
+        from bridge.command_handlers import handle_list
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        result = await handle_list(registry)
+
+        assert hasattr(result, "success")
+        assert hasattr(result, "message")
+        assert hasattr(result, "tasks")
+        assert result.success is True
+        assert isinstance(result.tasks, list)
+
+    async def test_humanize_age_in_handlers(self) -> None:
+        """_humanize_age is available in command_handlers module."""
+        from bridge.command_handlers import _humanize_age
+
+        now = int(time.time())
+        result = _humanize_age(now - 30)
+        assert "s ago" in result
+
+    async def test_wait_for_session_bind_in_handlers(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        """_wait_for_session_bind is available in command_handlers module."""
+        from bridge.command_handlers import _wait_for_session_bind
+        from bridge.state import upsert_task
+
+        now = int(time.time())
+        await upsert_task(
+            in_memory_db,
+            "task-123",
+            999,
+            "/tmp",
+            "spawning",
+            zellij_pane_id="terminal_1",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        async def simulate_bind() -> None:
+            await asyncio.sleep(0.1)
+            task = registry.get_by_task_id("task-123")
+            if task:
+                task.current_claude_session_id = "sess-abc"
+                await registry._index(task)
+
+        asyncio.create_task(simulate_bind())
+
+        # Should complete without error
+        await _wait_for_session_bind(registry, "task-123", timeout=2.0)
+
+    async def test_no_discord_imports_in_handlers(self) -> None:
+        """command_handlers module does not import discord."""
+        import inspect
+
+        import bridge.command_handlers as handlers_module
+
+        # Check the module source
+        source = inspect.getsource(handlers_module)
+        assert "import discord" not in source, "command_handlers should not import discord"
+        assert "from discord" not in source, "command_handlers should not import from discord"
+
+    async def test_handle_stop_happy_path(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        """handle_stop returns success when stop_task succeeds."""
+        from bridge.command_handlers import handle_stop
+        from bridge.state import upsert_task
+
+        now = int(time.time())
+        await upsert_task(
+            in_memory_db,
+            "task-stop",
+            2010,
+            "/tmp",
+            "running",
+            zellij_pane_id="pane_stop",
+            current_claude_session_id="sess-stop",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Simulate session end to trigger stop
+        async def simulate_stop():
+            result_task = asyncio.create_task(
+                handle_stop(registry, thread_id="2010", task_id=None)
+            )
+            await asyncio.sleep(0.05)
+            await registry._on_session_end({"session_id": "sess-stop"})
+            return await result_task
+
+        result = await simulate_stop()
+        assert result.success is True
+        assert "✅ Stopped" in result.message
+
+    async def test_handle_list_empty(self, in_memory_db, fake_bot, fake_zellij) -> None:
+        """handle_list returns empty tasks list when no tasks exist."""
+        from bridge.command_handlers import handle_list
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        result = await handle_list(registry)
+
+        assert result.success is True
+        assert "No active tasks" in result.message
+        assert result.tasks == []

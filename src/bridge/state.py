@@ -4,7 +4,7 @@ from pathlib import Path
 
 import aiosqlite
 
-DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "claude-discord-bridge" / "state.db"
+DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "cc-bridge" / "state.db"
 
 
 @dataclass(frozen=True)
@@ -13,7 +13,7 @@ class SessionRow:
 
     session_id: str
     cwd: str
-    thread_id: int
+    thread_id: str
     created_at: int
     last_activity: int
 
@@ -23,7 +23,7 @@ class TaskRow:
     """A task row from the database."""
 
     task_id: str
-    thread_id: int
+    thread_id: str
     zellij_pane_id: str | None
     cwd: str
     status: str
@@ -54,7 +54,7 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
             cwd TEXT NOT NULL,
-            thread_id INTEGER NOT NULL,
+            thread_id TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             last_activity INTEGER NOT NULL
         )
@@ -62,7 +62,7 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY,
-            thread_id INTEGER NOT NULL,
+            thread_id TEXT NOT NULL,
             zellij_pane_id TEXT,
             cwd TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -135,7 +135,7 @@ async def upsert_session(
     conn: aiosqlite.Connection,
     session_id: str,
     cwd: str,
-    thread_id: int,
+    thread_id: str,
     *,
     now: int | None = None,
 ) -> None:
@@ -182,7 +182,7 @@ async def get_task(conn: aiosqlite.Connection, task_id: str) -> TaskRow | None:
     )
 
 
-async def get_task_by_thread_id(conn: aiosqlite.Connection, thread_id: int) -> TaskRow | None:
+async def get_task_by_thread_id(conn: aiosqlite.Connection, thread_id: str) -> TaskRow | None:
     """Retrieve a task row by thread_id. Returns None if not found."""
     cursor = await conn.execute(
         "SELECT task_id, thread_id, zellij_pane_id, cwd, status, current_claude_session_id, current_transcript_path, created_at, last_activity FROM tasks WHERE thread_id = ?",
@@ -251,7 +251,7 @@ async def list_active_tasks(conn: aiosqlite.Connection) -> list[TaskRow]:
 async def upsert_task(
     conn: aiosqlite.Connection,
     task_id: str,
-    thread_id: int,
+    thread_id: str,
     cwd: str,
     status: str,
     *,

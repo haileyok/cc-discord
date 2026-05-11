@@ -1,6 +1,8 @@
 import json
 import stat
+import warnings
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -10,6 +12,7 @@ from bridge.secrets import (
     load_secrets,
     write_secrets,
     secrets_file_perms,
+    _resolve_secrets_path,
 )
 
 
@@ -168,3 +171,96 @@ class TestSecretsFilePerms:
 
         perms = secrets_file_perms(path=secrets_file)
         assert perms is None
+
+
+class TestBackwardCompatibility:
+    """Test backward-compatible fallback from old path to new path."""
+
+    def test_resolve_secrets_path_new_path_preferred(self, tmp_path: Path, monkeypatch) -> None:
+        """_resolve_secrets_path prefers new path if it exists."""
+        new_path = tmp_path / "cc-bridge" / "secrets.json"
+        old_path = tmp_path / "claude-discord-bridge" / "secrets.json"
+
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+
+        new_path.touch()
+        old_path.touch()
+
+        # Mock the home directory paths
+        with patch("bridge.secrets.SECRETS_FILE", new_path):
+            with patch("bridge.secrets._OLD_SECRETS_FILE", old_path):
+                result = _resolve_secrets_path()
+                assert result == new_path
+
+    def test_resolve_secrets_path_fallback_with_warning(self, tmp_path: Path, monkeypatch) -> None:
+        """_resolve_secrets_path falls back to old path with deprecation warning."""
+        new_path = tmp_path / "cc-bridge" / "secrets.json"
+        old_path = tmp_path / "claude-discord-bridge" / "secrets.json"
+
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.touch()
+
+        # Mock the home directory paths
+        with patch("bridge.secrets.SECRETS_FILE", new_path):
+            with patch("bridge.secrets._OLD_SECRETS_FILE", old_path):
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    result = _resolve_secrets_path()
+                    assert result == old_path
+                    assert len(w) == 1
+                    assert issubclass(w[0].category, DeprecationWarning)
+                    assert "deprecated path" in str(w[0].message)
+
+    def test_load_secrets_with_fallback(self, tmp_path: Path, monkeypatch) -> None:
+        """load_secrets works with fallback to old path."""
+        new_path = tmp_path / "cc-bridge" / "secrets.json"
+        old_path = tmp_path / "claude-discord-bridge" / "secrets.json"
+
+        old_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.write_text(json.dumps({
+            "DISCORD_BOT_TOKEN": "token",
+            "DISCORD_CHANNEL_ID": 12345
+        }))
+
+        # Mock the home directory paths
+        with patch("bridge.secrets.SECRETS_FILE", new_path):
+            with patch("bridge.secrets._OLD_SECRETS_FILE", old_path):
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    loaded = load_secrets()
+                    assert loaded.bot_token == "token"
+                    assert loaded.channel_id == 12345
+                    assert len(w) == 1
+                    assert issubclass(w[0].category, DeprecationWarning)
+
+    def test_resolve_secrets_path_env_override(self, tmp_path: Path, monkeypatch) -> None:
+        """_resolve_secrets_path respects BRIDGE_SECRETS_PATH env var."""
+        custom_path = tmp_path / "custom" / "secrets.json"
+        custom_path.parent.mkdir(parents=True, exist_ok=True)
+        custom_path.touch()
+
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(custom_path))
+
+        with patch("bridge.secrets.SECRETS_FILE", tmp_path / "cc-bridge" / "secrets.json"):
+            with patch("bridge.secrets._OLD_SECRETS_FILE", tmp_path / "claude-discord-bridge" / "secrets.json"):
+                result = _resolve_secrets_path()
+                assert result == custom_path
+
+    def test_state_path_updated(self) -> None:
+        """State database path is updated to cc-bridge."""
+        from bridge.state import DEFAULT_DB_PATH
+        assert "cc-bridge" in str(DEFAULT_DB_PATH)
+        assert "claude-discord-bridge" not in str(DEFAULT_DB_PATH)
+
+    def test_task_settings_path_updated(self) -> None:
+        """Task settings directory is updated to cc-bridge."""
+        from bridge.tasks import TASK_SETTINGS_DIR
+        assert "cc-bridge" in str(TASK_SETTINGS_DIR)
+        assert "claude-discord-bridge" not in str(TASK_SETTINGS_DIR)
+
+    def test_attachments_path_updated(self) -> None:
+        """Attachments directory is updated to cc-bridge."""
+        from bridge.tasks import ATTACHMENTS_DIR
+        assert "cc-bridge" in str(ATTACHMENTS_DIR)
+        assert "claude-discord-bridge" not in str(ATTACHMENTS_DIR)

@@ -112,7 +112,7 @@ def main(argv: list[str]) -> int:
         elif e.code == 503:
             # Bot not connected (AC5.3)
             print(
-                "bridge daemon is reachable but Discord bot is not connected; check `claude-discord-bridge serve` logs"
+                "bridge daemon is reachable but Discord bot is not connected; check `cc-bridge serve` logs"
             )
         else:
             # Other HTTP error
@@ -121,7 +121,7 @@ def main(argv: list[str]) -> int:
     except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout):
         # Bridge unreachable (AC5.3)
         print(
-            f"bridge daemon is not reachable at {url}; is `claude-discord-bridge serve` running?"
+            f"bridge daemon is not reachable at {url}; is `cc-bridge serve` running?"
         )
 
     except Exception as e:

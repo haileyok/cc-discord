@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Session name is configurable via env var so users can colocate bridge tasks
 # with their existing zellij session (e.g. the one their SSH RemoteCommand
-# attaches to). Defaults to `meow` to match Hailey's typical setup.
-SESSION_NAME = os.environ.get("BRIDGE_ZELLIJ_SESSION", "meow")
+# attaches to). Defaults to `cc-bridge-worker` to match the bridge's purpose.
+SESSION_NAME = os.environ.get("BRIDGE_ZELLIJ_SESSION", "cc-bridge-worker")
 
 
 def _session_already_exists(stderr: str) -> bool:

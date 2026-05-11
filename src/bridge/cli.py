@@ -15,7 +15,7 @@ from pathlib import Path
 import click
 
 import bridge
-from bridge.bot import Bot
+from bridge.backends.discord.bot import DiscordBot
 from bridge.secrets import SECRETS_FILE, SecretsError, load_secrets, write_secrets, Secrets, secrets_file_perms
 from bridge.server import serve as serve_server
 from bridge.zellij import SESSION_NAME as ZELLIJ_SESSION_NAME
@@ -27,12 +27,12 @@ _TOKEN_VALIDATION_TIMEOUT = 15
 
 
 async def _validate_token_and_post_test(secrets: Secrets) -> bool:
-    """Validate token by starting bot and posting a test message.
+    """Validate token by starting Discord bot and posting a test message.
 
     Returns True if validation succeeds (bot ready and message posted).
     Returns False if timeout waiting for bot to become ready.
     """
-    bot = Bot(secrets.bot_token, secrets.channel_id)
+    bot = DiscordBot(secrets.bot_token, secrets.channel_id)
     try:
         await bot.start()
 
@@ -41,7 +41,7 @@ async def _validate_token_and_post_test(secrets: Secrets) -> bool:
         while asyncio.get_running_loop().time() - start_time < _TOKEN_VALIDATION_TIMEOUT:
             if bot.is_ready:
                 # Post confirmation message to channel root (no thread)
-                await bot.post("✅ claude-discord-bridge init succeeded — you'll see future notifications here.")
+                await bot.post("✅ cc-bridge init succeeded — you'll see future notifications here.")
                 return True
             await asyncio.sleep(0.1)
 
@@ -57,16 +57,8 @@ def cli() -> None:
     pass
 
 
-@cli.command()
-def init() -> None:
-    """Interactive bootstrap: collect bot token and channel ID, write secrets file.
-
-    Prompts for:
-    - DISCORD_BOT_TOKEN (hidden input)
-    - DISCORD_CHANNEL_ID (validated as positive integer)
-
-    Writes to ~/.config/claude-discord-bridge/secrets.json (mode 0600).
-    """
+def _init_discord() -> None:
+    """Discord-specific init wizard."""
     click.echo("Welcome to the Claude Code <-> Discord bridge.")
     click.echo()
     click.echo(
@@ -125,7 +117,7 @@ def init() -> None:
     click.echo()
 
     # Write secrets
-    secrets = Secrets(bot_token=bot_token, channel_id=channel_id)
+    secrets = Secrets(bot_token=bot_token, channel_id=channel_id, platform="discord")
     write_secrets(secrets, path=secrets_path)
 
     # Verify mode
@@ -160,15 +152,117 @@ def init() -> None:
 
     click.echo()
     click.echo(
-        f"Wrote secrets to {secrets_path} (mode 0600). "
-        "Start the daemon with:"
+        f"✅ cc-bridge init succeeded — secrets written to {secrets_path}"
     )
-    click.echo("  claude-discord-bridge serve")
-    click.echo()
-    click.echo(
-        "Or use the systemd unit at:"
+
+
+def _init_mattermost() -> None:
+    """Mattermost-specific init wizard."""
+    click.echo("=== cc-bridge Mattermost setup ===\n")
+
+    # Resolve secrets path from env var for testability
+    secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
+
+    # Check if file already exists
+    if secrets_path.exists():
+        if not click.confirm(
+            f"Secrets file already exists at {secrets_path}. Overwrite?",
+            abort=True,
+        ):
+            return
+
+    server_url = click.prompt("Mattermost server URL (e.g., https://mm.example.com)")
+    bot_token = click.prompt("Bot access token", hide_input=True)
+    channel_id = click.prompt("Channel ID (26-char alphanumeric)")
+
+    allowed_ids_raw = click.prompt(
+        "Allowed user IDs (comma-separated, or 'all')",
+        default="all",
     )
-    click.echo("  packaging/claude-discord-bridge.service")
+    allowed_user_ids = (
+        None if allowed_ids_raw.strip().lower() == "all"
+        else [uid.strip() for uid in allowed_ids_raw.split(",")]
+    )
+
+    # Validate connection
+    click.echo("\nValidating connection...")
+    try:
+        import aiohttp
+        async def _validate():
+            async with aiohttp.ClientSession(
+                headers={"Authorization": f"Bearer {bot_token}"}
+            ) as session:
+                url = f"{server_url.rstrip('/')}/api/v4/users/me"
+                async with session.get(url) as resp:
+                    if resp.status == 401:
+                        click.echo("Error: Invalid bot token (401 Unauthorized).", err=True)
+                        raise SystemExit(2)
+                    resp.raise_for_status()
+                    me = await resp.json()
+                    click.echo(f"  Authenticated as: {me.get('username', 'unknown')}")
+
+                # Verify channel access
+                chan_url = f"{server_url.rstrip('/')}/api/v4/channels/{channel_id}"
+                async with session.get(chan_url) as resp:
+                    if resp.status == 404:
+                        click.echo(f"Error: Channel {channel_id} not found.", err=True)
+                        raise SystemExit(2)
+                    if resp.status == 403:
+                        click.echo(f"Error: Bot lacks access to channel {channel_id}.", err=True)
+                        raise SystemExit(2)
+                    resp.raise_for_status()
+                    chan = await resp.json()
+                    click.echo(f"  Channel: {chan.get('display_name', channel_id)}")
+
+        asyncio.run(_validate())
+    except aiohttp.ClientConnectorError:
+        click.echo(f"Error: Cannot connect to {server_url}.", err=True)
+        raise SystemExit(2)
+    except aiohttp.ClientSSLError:
+        click.echo(f"Error: SSL certificate verification failed for {server_url}.", err=True)
+        raise SystemExit(2)
+
+    # Write secrets
+    secrets = Secrets(
+        platform="mattermost",
+        server_url=server_url.rstrip("/"),
+        bot_token=bot_token,
+        channel_id=channel_id,
+        allowed_user_ids=allowed_user_ids,
+    )
+    write_secrets(secrets, path=secrets_path)
+
+    # Verify mode
+    perms = stat.S_IMODE(secrets_path.stat().st_mode)
+    if perms != 0o600:
+        secrets_path.unlink()
+        click.echo(
+            f"Error: file mode is {oct(perms)}, expected 0o600. "
+            f"Secrets file deleted. Please check your filesystem settings.",
+            err=True
+        )
+        sys.exit(1)
+
+    click.echo(f"\n✅ cc-bridge init succeeded — secrets written to {secrets_path}")
+
+
+@cli.command()
+@click.option(
+    "--platform",
+    type=click.Choice(["discord", "mattermost"]),
+    required=True,
+    help="Which chat platform to configure.",
+)
+def init(platform: str) -> None:
+    """Interactive setup for cc-bridge.
+
+    Choose platform (discord or mattermost) and follow the prompts to
+    configure the bridge for that platform.
+    """
+    if platform == "discord":
+        _init_discord()
+    elif platform == "mattermost":
+        _init_mattermost()
 
 
 @cli.command()
@@ -186,13 +280,32 @@ def init() -> None:
 def serve(host: str, port: int) -> None:
     """Run the bridge daemon.
 
-    Loads secrets from ~/.config/claude-discord-bridge/secrets.json and starts
-    the HTTP server + Discord bot.
+    Loads secrets from ~/.config/cc-bridge/secrets.json and starts
+    the HTTP server + selected chat platform backend (Discord or Mattermost).
+
+    Requires BRIDGE_PLATFORM environment variable set to 'discord' or 'mattermost'.
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+    # Read BRIDGE_PLATFORM from environment
+    platform = os.environ.get("BRIDGE_PLATFORM", "").lower()
+    if platform not in ("discord", "mattermost"):
+        if not platform:
+            click.echo(
+                "Error: BRIDGE_PLATFORM environment variable is required.\n"
+                "Set BRIDGE_PLATFORM=discord or BRIDGE_PLATFORM=mattermost",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"Error: Unknown platform '{platform}'.\n"
+                f"Valid values: discord, mattermost",
+                err=True,
+            )
+        raise SystemExit(2)
 
     # Resolve secrets path from env var for testability
     secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
@@ -203,7 +316,7 @@ def serve(host: str, port: int) -> None:
         click.echo(f"Error: {e}", err=True)
         sys.exit(2)
 
-    asyncio.run(serve_server(secrets, host=host, port=port))
+    asyncio.run(serve_server(secrets, host=host, port=port, platform=platform))
 
 
 @cli.command()
@@ -376,7 +489,7 @@ def doctor() -> None:
         warned = True
 
     # Check 8: task-settings dir writable
-    task_settings_dir = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+    task_settings_dir = Path.home() / ".local" / "state" / "cc-bridge" / "task-settings"
     try:
         task_settings_dir.mkdir(parents=True, exist_ok=True)
         # Try to write a temp file
@@ -430,6 +543,99 @@ def doctor() -> None:
     except Exception as e:
         click.echo(f"[warn] claude CLI — error: {e}", err=True)
         warned = True
+
+    # Load secrets once and determine platform
+    secrets = None
+    platform_from_secrets = None
+    if secrets_path.exists():
+        try:
+            secrets = load_secrets(path=secrets_path)
+            platform_from_secrets = secrets.platform
+        except SecretsError:
+            pass
+
+    # Fall back to BRIDGE_PLATFORM env var if available
+    platform = platform_from_secrets or os.environ.get("BRIDGE_PLATFORM", "discord").lower()
+
+    # Platform-specific checks
+    if platform == "discord":
+        # Check 11: Discord channel_id is valid integer
+        if secrets:
+            if isinstance(secrets.channel_id, int):
+                click.echo(f"[ok] Discord channel_id — {secrets.channel_id}")
+            else:
+                try:
+                    int(secrets.channel_id)
+                    click.echo(f"[ok] Discord channel_id — {secrets.channel_id}")
+                except (ValueError, TypeError):
+                    click.echo(f"[fail] Discord channel_id — not a valid integer", err=True)
+                    failed = True
+
+    elif platform == "mattermost":
+        if secrets:
+            # Check 11: Mattermost server reachable
+            if secrets.server_url:
+                try:
+                    ping_url = f"{secrets.server_url.rstrip('/')}/api/v4/system/ping"
+                    req = urllib.request.Request(ping_url)
+                    response = urllib.request.urlopen(req, timeout=2)
+                    if response.status == 200:
+                        click.echo(f"[ok] Mattermost server — {secrets.server_url} reachable")
+                    else:
+                        click.echo(f"[fail] Mattermost server — {secrets.server_url} returned status {response.status}", err=True)
+                        failed = True
+                except Exception as e:
+                    click.echo(f"[fail] Mattermost server — {secrets.server_url} unreachable ({type(e).__name__})", err=True)
+                    failed = True
+
+            # Check 12: Mattermost bot token valid
+            if secrets.server_url and secrets.bot_token:
+                try:
+                    headers = {"Authorization": f"Bearer {secrets.bot_token}"}
+                    req = urllib.request.Request(
+                        f"{secrets.server_url.rstrip('/')}/api/v4/users/me",
+                        headers=headers
+                    )
+                    response = urllib.request.urlopen(req, timeout=2)
+                    if response.status == 200:
+                        data = json.loads(response.read().decode("utf-8"))
+                        username = data.get("username", "unknown")
+                        click.echo(f"[ok] Mattermost bot token — authenticated as {username}")
+                    elif response.status == 401:
+                        click.echo(f"[fail] Mattermost bot token — invalid (401 Unauthorized)", err=True)
+                        failed = True
+                    else:
+                        click.echo(f"[fail] Mattermost bot token — status {response.status}", err=True)
+                        failed = True
+                except Exception as e:
+                    click.echo(f"[fail] Mattermost bot token — error ({type(e).__name__})", err=True)
+                    failed = True
+
+            # Check 13: Mattermost channel accessible
+            if secrets.server_url and secrets.bot_token and secrets.channel_id:
+                try:
+                    headers = {"Authorization": f"Bearer {secrets.bot_token}"}
+                    req = urllib.request.Request(
+                        f"{secrets.server_url.rstrip('/')}/api/v4/channels/{secrets.channel_id}",
+                        headers=headers
+                    )
+                    response = urllib.request.urlopen(req, timeout=2)
+                    if response.status == 200:
+                        data = json.loads(response.read().decode("utf-8"))
+                        display_name = data.get("display_name", secrets.channel_id)
+                        click.echo(f"[ok] Mattermost channel — {display_name}")
+                    elif response.status == 404:
+                        click.echo(f"[fail] Mattermost channel — {secrets.channel_id} not found", err=True)
+                        failed = True
+                    elif response.status == 403:
+                        click.echo(f"[fail] Mattermost channel — bot lacks access to {secrets.channel_id}", err=True)
+                        failed = True
+                    else:
+                        click.echo(f"[fail] Mattermost channel — status {response.status}", err=True)
+                        failed = True
+                except Exception as e:
+                    click.echo(f"[fail] Mattermost channel — error ({type(e).__name__})", err=True)
+                    failed = True
 
     # Final summary
     click.echo()
