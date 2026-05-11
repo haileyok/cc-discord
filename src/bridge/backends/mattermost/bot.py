@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import aiohttp
 
+from bridge import voice
 from bridge.backends.mattermost.api import MattermostAPI, RateLimitError, MAX_MESSAGE_LENGTH
 from bridge.backends.mattermost.ws import MattermostWebSocket
 
@@ -185,6 +187,19 @@ class MattermostBot:
             # Only handle posts in our channel
             if post.get("channel_id") != self._channel_id:
                 return
+
+            # Process audio attachments and integrate transcriptions into message
+            if post.get("file_ids"):
+                voice_blocks, file_refs = await _process_post_files(post, self._api)
+                # Reconstruct message with transcriptions and file refs
+                text_parts: list[str] = []
+                if post.get("message"):
+                    text_parts.append(post["message"])
+                text_parts.extend(voice_blocks)
+                for file_ref in file_refs:
+                    text_parts.append(f"[attached: {file_ref['id']}]")
+                post["message"] = " ".join(text_parts)
+
             if self._on_message:
                 await self._on_message(post)
 
@@ -243,3 +258,66 @@ def _emoji_to_mattermost(emoji: str) -> str:
         "👎": "thumbsdown",
     }
     return mapping.get(emoji, emoji)
+
+
+def _is_audio_mime_type(mime_type: str) -> bool:
+    """Check if a MIME type represents audio."""
+    return mime_type.startswith("audio/")
+
+
+async def _process_post_files(
+    post: dict[str, Any], api: MattermostAPI
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Process file_ids in a Mattermost post.
+
+    Returns a tuple of:
+    - List of voice memo blocks (strings to include in message)
+    - List of file reference dicts for non-audio files
+    """
+    file_ids = post.get("file_ids", [])
+    if not file_ids:
+        return [], []
+
+    voice_blocks: list[str] = []
+    file_refs: list[dict[str, Any]] = []
+
+    for file_id in file_ids:
+        try:
+            file_info = await api.get_file_info(file_id)
+        except Exception as e:
+            logger.warning("Failed to get file info for %s: %s", file_id, e)
+            continue
+
+        mime_type = file_info.get("mime_type", "")
+
+        if _is_audio_mime_type(mime_type):
+            # Download and transcribe audio
+            try:
+                audio_data = await api.download_file(file_id)
+                # Save to temp file for transcription
+                with tempfile.NamedTemporaryFile(
+                    suffix=Path(file_info.get("name", f"{file_id}.bin")).suffix,
+                    delete=False,
+                ) as tmp:
+                    tmp.write(audio_data)
+                    tmp_path = Path(tmp.name)
+
+                transcript_text = await voice.transcribe(tmp_path)
+                if transcript_text:
+                    voice_blocks.append(f"[voice memo] {transcript_text}")
+                else:
+                    voice_blocks.append(
+                        "[voice memo received — transcription unavailable; "
+                        f"raw file: {tmp_path}]"
+                    )
+            except Exception as e:
+                logger.warning("Failed to transcribe audio file %s: %s", file_id, e)
+                voice_blocks.append(
+                    "[voice memo received — transcription unavailable; "
+                    f"raw file: (download failed: {file_id})]"
+                )
+        else:
+            # Non-audio file reference
+            file_refs.append(file_info)
+
+    return voice_blocks, file_refs

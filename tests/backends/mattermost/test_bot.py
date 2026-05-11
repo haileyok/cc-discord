@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 
 from bridge.backends.mattermost.api import RateLimitError
-from bridge.backends.mattermost.bot import MattermostBot, _chunk, _emoji_to_mattermost
+from bridge.backends.mattermost.bot import MattermostBot, _chunk, _emoji_to_mattermost, _process_post_files
 
 
 class TestChunkFunction:
@@ -578,3 +578,173 @@ class TestMattermostBotEventHandling:
         await bot._handle_event("reaction_added", {"reaction": reaction})
 
         handler.assert_not_called()
+
+
+class TestAudioProcessing:
+    """Tests for audio file handling and transcription."""
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_no_files(self):
+        """Test processing post with no files returns empty lists."""
+        post = {"message": "hello", "file_ids": []}
+        api = mock.AsyncMock()
+
+        voice_blocks, file_refs = await _process_post_files(post, api)
+
+        assert voice_blocks == []
+        assert file_refs == []
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_non_audio_file(self):
+        """Test non-audio files are returned as file references."""
+        post = {
+            "message": "hello",
+            "file_ids": ["file1"],
+        }
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "file1",
+                "name": "document.pdf",
+                "mime_type": "application/pdf",
+            }
+        )
+
+        voice_blocks, file_refs = await _process_post_files(post, api)
+
+        assert voice_blocks == []
+        assert len(file_refs) == 1
+        assert file_refs[0]["id"] == "file1"
+        assert file_refs[0]["name"] == "document.pdf"
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_audio_file_successful_transcription(self):
+        """Test audio files are transcribed successfully."""
+        post = {
+            "message": "hello",
+            "file_ids": ["audio1"],
+        }
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "audio1",
+                "name": "memo.wav",
+                "mime_type": "audio/wav",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"fake audio data")
+
+        with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
+            mock_transcribe.return_value = "hello world"
+
+            voice_blocks, file_refs = await _process_post_files(post, api)
+
+        assert len(voice_blocks) == 1
+        assert "[voice memo] hello world" in voice_blocks[0]
+        assert file_refs == []
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_audio_file_transcription_failure(self):
+        """Test audio transcription failure gracefully falls back."""
+        post = {
+            "message": "hello",
+            "file_ids": ["audio1"],
+        }
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "audio1",
+                "name": "memo.wav",
+                "mime_type": "audio/wav",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"fake audio data")
+
+        with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
+            mock_transcribe.return_value = None
+
+            voice_blocks, file_refs = await _process_post_files(post, api)
+
+        assert len(voice_blocks) == 1
+        assert "[voice memo received — transcription unavailable" in voice_blocks[0]
+        assert file_refs == []
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_mixed_audio_and_non_audio(self):
+        """Test mixed audio and non-audio files are handled correctly."""
+        post = {
+            "message": "check these",
+            "file_ids": ["audio1", "file2", "audio3"],
+        }
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            side_effect=[
+                {
+                    "id": "audio1",
+                    "name": "memo.m4a",
+                    "mime_type": "audio/mp4",
+                },
+                {
+                    "id": "file2",
+                    "name": "report.docx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                },
+                {
+                    "id": "audio3",
+                    "name": "note.wav",
+                    "mime_type": "audio/wav",
+                },
+            ]
+        )
+        api.download_file = mock.AsyncMock(return_value=b"fake data")
+
+        with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
+            mock_transcribe.side_effect = ["memo transcription", "note transcription"]
+
+            voice_blocks, file_refs = await _process_post_files(post, api)
+
+        assert len(voice_blocks) == 2
+        assert "[voice memo] memo transcription" in voice_blocks[0]
+        assert "[voice memo] note transcription" in voice_blocks[1]
+        assert len(file_refs) == 1
+        assert file_refs[0]["id"] == "file2"
+
+    @pytest.mark.asyncio
+    async def test_handle_event_includes_transcription_in_message(self):
+        """Test that posted events with audio include transcriptions."""
+        handler = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=handler,
+        )
+        bot._bot_user_id = "bot123"
+        bot._api = mock.AsyncMock()
+        bot._api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "audio1",
+                "name": "memo.wav",
+                "mime_type": "audio/wav",
+            }
+        )
+        bot._api.download_file = mock.AsyncMock(return_value=b"fake audio")
+
+        post = {
+            "id": "msg1",
+            "message": "check this",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "file_ids": ["audio1"],
+        }
+
+        with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
+            mock_transcribe.return_value = "audio transcription"
+
+            await bot._handle_event("posted", {"post": post})
+
+        handler.assert_called_once()
+        called_post = handler.call_args[0][0]
+        # The post should be modified with transcription blocks
+        assert "check this" in called_post.get("message", "")
+        assert "[voice memo]" in called_post.get("message", "")
