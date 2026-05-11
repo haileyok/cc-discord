@@ -639,7 +639,8 @@ class TaskRegistry:
         (which already carries PATH, HOME, etc).
         """
         return {
-            "CC_DISCORD_TASK_ID": task_id,
+            "CC_BRIDGE_TASK_ID": task_id,
+            "CC_DISCORD_TASK_ID": task_id,  # backward compat, remove in future release
             "BRIDGE_URL": os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787"),
         }
 
@@ -733,7 +734,7 @@ class TaskRegistry:
         2. Generates a task_id UUID.
         3. Creates a Discord thread.
         4. Persists a row with status='spawning'.
-        5. Builds env with CC_DISCORD_TASK_ID and BRIDGE_URL.
+        5. Builds env with CC_BRIDGE_TASK_ID (and CC_DISCORD_TASK_ID for backward compat) and BRIDGE_URL.
         6. Spawns claude in zellij via ZellijManager.
         7. Updates row with zellij_pane_id.
         8. Indexes the task in memory.
@@ -1032,21 +1033,21 @@ class TaskRegistry:
         """Handle SessionStart event.
 
         Branches on matcher value:
-        - 'startup': first bind. Look up by CC_DISCORD_TASK_ID, populate session/transcript,
-          flip status to running, post '🟢 Task started' notice.
+        - 'startup': first bind. Look up by CC_BRIDGE_TASK_ID (or CC_DISCORD_TASK_ID for backward compat),
+          populate session/transcript, flip status to running, post '🟢 Task started' notice.
         - 'clear':   /clear inside TUI. Rebind same task to new session id, post '🧹' notice.
         - 'compact': /compact inside TUI. Rebind same task to new session id, post '🧰' notice.
         - 'resume':  claude --resume by /restart. Same as startup but no notice (user already
                      saw the /restart command's reply).
         - default:   unknown matcher → fall through to startup behavior (safest).
 
-        Per AC2.4: silently drops SessionStart events with no CC_DISCORD_TASK_ID.
+        Per AC2.4: silently drops SessionStart events with no CC_BRIDGE_TASK_ID or CC_DISCORD_TASK_ID.
         Also drops if session_id or transcript_path is missing.
         """
         session_id = body.get("session_id")
         transcript_path = body.get("transcript_path")
         env_passthrough = body.get("env_passthrough", {})
-        task_id = env_passthrough.get("CC_DISCORD_TASK_ID")
+        task_id = env_passthrough.get("CC_BRIDGE_TASK_ID") or env_passthrough.get("CC_DISCORD_TASK_ID")
         matcher = body.get("matcher") or "startup"
 
         logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}, matcher={matcher}")
@@ -1054,7 +1055,7 @@ class TaskRegistry:
         # AC2.4: drop SessionStart without task_id, session_id, or transcript_path
         if not task_id or not session_id or not transcript_path:
             if not task_id:
-                logger.debug("SessionStart: no CC_DISCORD_TASK_ID in env_passthrough")
+                logger.debug("SessionStart: no CC_BRIDGE_TASK_ID or CC_DISCORD_TASK_ID in env_passthrough")
             elif not session_id:
                 logger.warning("SessionStart: no session_id in body")
             elif not transcript_path:

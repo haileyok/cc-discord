@@ -3644,3 +3644,135 @@ class TestTaskSettingsIntegration:
 
         # Verify task was auto-removed from tracking
         assert task.task_id not in registry._tui_handler_tasks
+
+
+@pytest.mark.asyncio
+class TestEnvVarBackwardCompatibility:
+    """Test backward-compatible env var support for CC_BRIDGE_TASK_ID."""
+
+    async def test_build_spawn_env_includes_both_task_id_vars(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_build_spawn_env includes both CC_BRIDGE_TASK_ID and CC_DISCORD_TASK_ID."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        env = registry._build_spawn_env("test-task-id")
+
+        assert env["CC_BRIDGE_TASK_ID"] == "test-task-id"
+        assert env["CC_DISCORD_TASK_ID"] == "test-task-id"
+        assert "BRIDGE_URL" in env
+
+    async def test_session_start_with_new_env_var(
+        self, fake_bot, fake_zellij, in_memory_db, tmp_path
+    ) -> None:
+        """SessionStart event can use CC_BRIDGE_TASK_ID env var."""
+        transcript_path = tmp_path / "transcript.jsonl"
+        transcript_path.write_text("")
+
+        # Pre-create the task
+        await upsert_task(
+            in_memory_db,
+            "task-new-var",
+            5001,
+            "/tmp",
+            "spawning",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Use a valid UUID format for session_id
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001"
+
+        # Simulate SessionStart with new env var name
+        await registry._on_session_start({
+            "session_id": session_id,
+            "transcript_path": str(transcript_path),
+            "env_passthrough": {
+                "CC_BRIDGE_TASK_ID": "task-new-var",  # New var name
+                "CLAUDE_PROJECT_DIR": "/tmp",
+            },
+            "matcher": "startup",
+        })
+
+        # Task should be bound to the session
+        task = registry.get_by_task_id("task-new-var")
+        assert task is not None
+        assert task.current_claude_session_id == session_id
+
+    async def test_session_start_with_old_env_var(
+        self, fake_bot, fake_zellij, in_memory_db, tmp_path
+    ) -> None:
+        """SessionStart event still works with CC_DISCORD_TASK_ID env var (backward compat)."""
+        transcript_path = tmp_path / "transcript.jsonl"
+        transcript_path.write_text("")
+
+        # Pre-create the task
+        await upsert_task(
+            in_memory_db,
+            "task-old-var",
+            5002,
+            "/tmp",
+            "spawning",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Use a valid UUID format for session_id
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002"
+
+        # Simulate SessionStart with old env var name
+        await registry._on_session_start({
+            "session_id": session_id,
+            "transcript_path": str(transcript_path),
+            "env_passthrough": {
+                "CC_DISCORD_TASK_ID": "task-old-var",  # Old var name
+                "CLAUDE_PROJECT_DIR": "/tmp",
+            },
+            "matcher": "startup",
+        })
+
+        # Task should still be bound to the session
+        task = registry.get_by_task_id("task-old-var")
+        assert task is not None
+        assert task.current_claude_session_id == session_id
+
+    async def test_session_start_prefers_new_over_old_env_var(
+        self, fake_bot, fake_zellij, in_memory_db, tmp_path
+    ) -> None:
+        """SessionStart prefers CC_BRIDGE_TASK_ID when both vars are present."""
+        transcript_path = tmp_path / "transcript.jsonl"
+        transcript_path.write_text("")
+
+        # Pre-create the task
+        await upsert_task(
+            in_memory_db,
+            "task-new-var",
+            5003,
+            "/tmp",
+            "spawning",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Use a valid UUID format for session_id
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0003"
+
+        # Simulate SessionStart with both vars present
+        await registry._on_session_start({
+            "session_id": session_id,
+            "transcript_path": str(transcript_path),
+            "env_passthrough": {
+                "CC_BRIDGE_TASK_ID": "task-new-var",  # New var (preferred)
+                "CC_DISCORD_TASK_ID": "task-wrong-var",  # Old var (ignored)
+                "CLAUDE_PROJECT_DIR": "/tmp",
+            },
+            "matcher": "startup",
+        })
+
+        # Task should use the new var's value
+        task = registry.get_by_task_id("task-new-var")
+        assert task is not None
+        assert task.current_claude_session_id == session_id

@@ -35,7 +35,7 @@ def main() -> None:
         _emit("deny", "approval bridge received malformed input")
         return
 
-    task_id = os.environ.get("CC_DISCORD_TASK_ID")
+    task_id = os.environ.get("CC_BRIDGE_TASK_ID") or os.environ.get("CC_DISCORD_TASK_ID")
     if not task_id:
         # Not a bridge-driven session — fall through to default Claude permission UI.
         # Emit "ask" to keep behavior identical to no-hook.
