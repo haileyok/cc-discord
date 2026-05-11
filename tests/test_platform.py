@@ -157,3 +157,45 @@ async def test_fake_platform_start_close() -> None:
 
     await fake.close()
     assert fake.is_ready is True  # No-op, still ready
+
+
+def _has_protocol_methods(cls: type) -> bool:
+    """Check that cls has all ChatPlatform protocol methods.
+
+    Verifies that a class structurally conforms to the ChatPlatform protocol
+    by checking for the presence of all required methods.
+    """
+    import inspect
+
+    protocol_methods = [
+        name
+        for name, member in inspect.getmembers(ChatPlatform, predicate=inspect.isfunction)
+        if not name.startswith("_")
+    ]
+    for method in protocol_methods:
+        if not hasattr(cls, method):
+            return False
+    return True
+
+
+def test_discord_bot_satisfies_protocol() -> None:
+    """DiscordBot structurally conforms to ChatPlatform.
+
+    Note: We cannot instantiate DiscordBot without Discord credentials,
+    so we use structural checks (hasattr/inspect) on the class itself.
+    """
+    from bridge.backends.discord.bot import DiscordBot
+
+    assert _has_protocol_methods(DiscordBot)
+
+
+def test_mattermost_bot_satisfies_protocol() -> None:
+    """MattermostBot structurally conforms to ChatPlatform."""
+    from bridge.backends.mattermost.bot import MattermostBot
+
+    assert _has_protocol_methods(MattermostBot)
+
+
+def test_fake_platform_satisfies_protocol() -> None:
+    """FakePlatform structurally conforms to ChatPlatform."""
+    assert _has_protocol_methods(FakePlatform)
