@@ -45,7 +45,7 @@ class TestCliPackageMetadata:
 
 
 class TestInitCommand:
-    """Tests for `claude-discord-bridge init` subcommand."""
+    """Tests for `cc-bridge init` subcommand."""
 
     def _get_ready_fake_bot(self):
         """Create a fake bot that becomes ready immediately."""
@@ -241,7 +241,7 @@ class TestInitCommand:
 
 
 class TestDoctorCommand:
-    """Tests for `claude-discord-bridge doctor` subcommand."""
+    """Tests for `cc-bridge doctor` subcommand."""
 
     def test_doctor_all_ok(self, tmp_path: Path, monkeypatch) -> None:
         """doctor with all checks passing exits 0 and shows [ok] for each line."""
@@ -394,7 +394,7 @@ class TestDoctorCommand:
 
 
 class TestServeCommand:
-    """Tests for `claude-discord-bridge serve` subcommand."""
+    """Tests for `cc-bridge serve` subcommand."""
 
     def test_serve_help_prints_help_text(self) -> None:
         """serve --help prints the help text."""

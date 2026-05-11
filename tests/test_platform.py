@@ -169,7 +169,7 @@ def _has_protocol_methods(cls: type) -> bool:
 
     protocol_methods = [
         name
-        for name, member in inspect.getmembers(ChatPlatform, predicate=inspect.isfunction)
+        for name, _ in inspect.getmembers(ChatPlatform, predicate=inspect.isfunction)
         if not name.startswith("_")
     ]
     for method in protocol_methods:
