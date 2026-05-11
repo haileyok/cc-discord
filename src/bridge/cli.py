@@ -41,7 +41,7 @@ async def _validate_token_and_post_test(secrets: Secrets) -> bool:
         while asyncio.get_running_loop().time() - start_time < _TOKEN_VALIDATION_TIMEOUT:
             if bot.is_ready:
                 # Post confirmation message to channel root (no thread)
-                await bot.post("✅ claude-discord-bridge init succeeded — you'll see future notifications here.")
+                await bot.post("✅ cc-bridge init succeeded — you'll see future notifications here.")
                 return True
             await asyncio.sleep(0.1)
 
@@ -65,7 +65,7 @@ def init() -> None:
     - DISCORD_BOT_TOKEN (hidden input)
     - DISCORD_CHANNEL_ID (validated as positive integer)
 
-    Writes to ~/.config/claude-discord-bridge/secrets.json (mode 0600).
+    Writes to ~/.config/cc-bridge/secrets.json (mode 0600).
     """
     click.echo("Welcome to the Claude Code <-> Discord bridge.")
     click.echo()
@@ -163,12 +163,12 @@ def init() -> None:
         f"Wrote secrets to {secrets_path} (mode 0600). "
         "Start the daemon with:"
     )
-    click.echo("  claude-discord-bridge serve")
+    click.echo("  cc-bridge serve")
     click.echo()
     click.echo(
         "Or use the systemd unit at:"
     )
-    click.echo("  packaging/claude-discord-bridge.service")
+    click.echo("  packaging/cc-bridge.service")
 
 
 @cli.command()
@@ -186,7 +186,7 @@ def init() -> None:
 def serve(host: str, port: int) -> None:
     """Run the bridge daemon.
 
-    Loads secrets from ~/.config/claude-discord-bridge/secrets.json and starts
+    Loads secrets from ~/.config/cc-bridge/secrets.json and starts
     the HTTP server + Discord bot.
     """
     logging.basicConfig(
@@ -376,7 +376,7 @@ def doctor() -> None:
         warned = True
 
     # Check 8: task-settings dir writable
-    task_settings_dir = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+    task_settings_dir = Path.home() / ".local" / "state" / "cc-bridge" / "task-settings"
     try:
         task_settings_dir.mkdir(parents=True, exist_ok=True)
         # Try to write a temp file
