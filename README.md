@@ -1,4 +1,4 @@
-# claude-discord-bridge
+# cc-bridge
 
 Localhost HTTP bridge between Claude Code sessions and Discord. Long turns ping your phone, permission prompts surface in a thread, Claude can `/ask-discord <question>` when it's blocked, and you can drive whole Claude sessions from Discord slash commands without ever attaching to the terminal.
 
@@ -38,13 +38,13 @@ A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallba
 ### 2. Bridge daemon
 
 ```bash
-git clone https://github.com/haileyok/cc-discord.git claude-discord-bridge
-cd claude-discord-bridge
+git clone https://github.com/haileyok/cc-discord.git
+cd cc-discord
 uv sync
-uv run claude-discord-bridge init
+uv run cc-bridge init
 ```
 
-`init` prompts for the bot token and channel ID, writes `~/.config/claude-discord-bridge/secrets.json` at mode `0600`, validates the token by connecting to Discord (15s timeout), and posts a confirmation message to your channel. If the token's wrong it exits 2 and leaves the secrets file so you can fix and retry.
+`init` prompts for the bot token and channel ID, writes `~/.config/cc-bridge/secrets.json` at mode `0600`, validates the token by connecting to Discord (15s timeout), and posts a confirmation message to your channel. If the token's wrong it exits 2 and leaves the secrets file so you can fix and retry.
 
 ### 3. Wire Claude Code hooks
 
@@ -56,14 +56,14 @@ The Stop and Notification hooks are referenced by absolute path from `~/.claude/
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "python3 /home/<you>/claude-discord-bridge/hooks/notify-stop.py", "async": true }
+          { "type": "command", "command": "python3 /home/<you>/cc-discord/hooks/notify-stop.py", "async": true }
         ]
       }
     ],
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": "python3 /home/<you>/claude-discord-bridge/hooks/notify-notification.py", "async": true }
+          { "type": "command", "command": "python3 /home/<you>/cc-discord/hooks/notify-notification.py", "async": true }
         ]
       }
     ]
@@ -71,7 +71,7 @@ The Stop and Notification hooks are referenced by absolute path from `~/.claude/
 }
 ```
 
-Replace `/home/<you>/claude-discord-bridge` with the actual repo path. Validate with `python3 -m json.tool ~/.claude/settings.json > /dev/null`.
+Replace `/home/<you>/cc-discord` with the actual repo path. Validate with `python3 -m json.tool ~/.claude/settings.json > /dev/null`.
 
 If you already use `~/.claude/hooks/notify-long-task.sh` (or any other Stop hook), keep it on disk as rollback insurance — both hooks can coexist; this one just supersedes it.
 
@@ -103,26 +103,26 @@ When the daemon's down, the Stop and Notification hooks fall back to this webhoo
 
 **Foreground (simplest):**
 ```bash
-uv run claude-discord-bridge serve
+uv run cc-bridge serve
 ```
 Wait for `Bot ready as <name>, watching #<channel>`. Use `tmux` or `nohup` if you want it to outlive the shell.
 
 **systemd user unit (survives reboots):**
 ```bash
-uv tool install .                      # places `claude-discord-bridge` at ~/.local/bin/
+uv tool install .                      # places `cc-bridge` at ~/.local/bin/
 bash scripts/install-systemd-user.sh   # copies the unit file into ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now claude-discord-bridge
+systemctl --user enable --now cc-bridge
 ```
 If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl enable-linger $USER` first.
 
 **macOS launchd user agent (survives reboots and login):**
 
 ```bash
-uv tool install .   # places `claude-discord-bridge` at ~/.local/bin/
+uv tool install .   # places `cc-bridge` at ~/.local/bin/
 ```
 
-Write `~/Library/LaunchAgents/local.claude-discord-bridge.plist`, replacing `<you>` with your home dir leaf:
+Write `~/Library/LaunchAgents/local.cc-bridge.plist`, replacing `<you>` with your home dir leaf:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -130,18 +130,18 @@ Write `~/Library/LaunchAgents/local.claude-discord-bridge.plist`, replacing `<yo
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>local.claude-discord-bridge</string>
+    <string>local.cc-bridge</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/<you>/.local/bin/claude-discord-bridge</string>
+        <string>/Users/<you>/.local/bin/cc-bridge</string>
         <string>serve</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key>
-    <string>/Users/<you>/Library/Logs/claude-discord-bridge.log</string>
+    <string>/Users/<you>/Library/Logs/cc-bridge.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/<you>/Library/Logs/claude-discord-bridge.log</string>
+    <string>/Users/<you>/Library/Logs/cc-bridge.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -153,15 +153,15 @@ Write `~/Library/LaunchAgents/local.claude-discord-bridge.plist`, replacing `<yo
 
 Load it:
 ```bash
-launchctl load -w ~/Library/LaunchAgents/local.claude-discord-bridge.plist
+launchctl load -w ~/Library/LaunchAgents/local.cc-bridge.plist
 ```
 
-`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Tail the log with `tail -f ~/Library/Logs/claude-discord-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/local.claude-discord-bridge.plist`.
+`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Tail the log with `tail -f ~/Library/Logs/cc-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/local.cc-bridge.plist`.
 
 ### 7. Verify
 
 ```bash
-uv run claude-discord-bridge doctor
+uv run cc-bridge doctor
 ```
 You should see `[ok]` for each check: secrets file present + 0600, daemon health, settings.json hooks, `/ask-discord` skill symlink, `zellij` installed, bridge session reachable, task-settings dir writable, hook scripts present, `claude` on PATH. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
 
@@ -178,7 +178,7 @@ Once the daemon is running, these surfaces work without further intervention:
 | Manual `POST /v1/ask` | Same, but `/v1/ask` with a `question` field; blocks for the reply (default 15 min, capped at 60) |
 | Manual `GET /v1/health` | `curl http://127.0.0.1:8787/v1/health` |
 
-Threads are named `cc · <cwd-leaf> · <session-prefix>`. Same `session_id` always routes to the same thread; different sessions get different threads. Mappings persist in SQLite at `~/.local/state/claude-discord-bridge/state.db` and survive daemon restarts. Archived/deleted threads recreate transparently.
+Threads are named `cc · <cwd-leaf> · <session-prefix>`. Same `session_id` always routes to the same thread; different sessions get different threads. Mappings persist in SQLite at `~/.local/state/cc-bridge/state.db` and survive daemon restarts. Archived/deleted threads recreate transparently.
 
 ## Discord-driven sessions
 
@@ -207,7 +207,7 @@ Commands without an explicit `thread:` argument operate on the task whose thread
 - Subagent activity rolls up into one live-edited embed per agent (yellow while running → green when finished).
 - `AskUserQuestion` posts each question with reaction-based options (single- or multi-select); `ExitPlanMode` posts the plan with ✅/❌. Free-text replies in the thread also work.
 - Voice memos are transcribed (Wispr Flow API if `WISPR_FLOW_API_TOKEN` is set, otherwise local `whisper` CLI) and inlined as `[voice memo] <text>` in the relayed prompt.
-- Discord file attachments are saved under `~/.local/state/claude-discord-bridge/attachments/<task_id>/` and their absolute paths are appended to the prompt, one per line.
+- Discord file attachments are saved under `~/.local/state/cc-bridge/attachments/<task_id>/` and their absolute paths are appended to the prompt, one per line.
 - Token / cost / context-fill summary posts after every `Stop`.
 
 ### One-time setup
@@ -220,12 +220,12 @@ Commands without an explicit `thread:` argument operate on the task whose thread
    ```
    Verify: `zellij --version`
 
-2. **Pick a session name** (optional). The bridge defaults to `meow`; override by exporting `BRIDGE_ZELLIJ_SESSION=<name>` before starting the daemon. To attach and watch tabs:
+2. **Pick a session name** (optional). The bridge defaults to `cc-bridge-worker`; override by exporting `BRIDGE_ZELLIJ_SESSION=<name>` before starting the daemon. To attach and watch tabs:
    ```bash
-   zellij attach meow
+   zellij attach cc-bridge-worker
    ```
 
-3. **State directories** are auto-created under `~/.local/state/claude-discord-bridge/` (task-settings, attachments, the SQLite db). No manual setup needed.
+3. **State directories** are auto-created under `~/.local/state/cc-bridge/` (task-settings, attachments, the SQLite db). No manual setup needed.
 
 4. **Optional: get `@`-mentioned when claude is stuck**. Export `BRIDGE_NOTIFY_USER_ID=<your-discord-user-id>` so AskUserQuestion / ExitPlanMode / free-text-stall prompts prefix with a mention.
 
@@ -234,7 +234,7 @@ Commands without an explicit `thread:` argument operate on the task whose thread
 | Variable | Default | Purpose |
 |---|---|---|
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Where hooks POST events. Override only if you run the daemon on a non-default port. |
-| `BRIDGE_ZELLIJ_SESSION` | `meow` | zellij session name the bridge spawns task tabs into. |
+| `BRIDGE_ZELLIJ_SESSION` | `cc-bridge-worker` | zellij session name the bridge spawns task tabs into. |
 | `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
 | `BRIDGE_CONTEXT_LIMIT` | _(model default)_ | Override the per-model context window for `/stats` math (e.g. `1000000` for `[1m]`). |
@@ -245,7 +245,7 @@ Commands without an explicit `thread:` argument operate on the task whose thread
 ### Verify setup
 
 ```bash
-uv run claude-discord-bridge doctor
+uv run cc-bridge doctor
 ```
 
 Runs ten checks: secrets file present + 0600, daemon health, settings.json hooks (Stop/Notification), `/ask-discord` skill symlink, `zellij` installed, bridge session reachable, task-settings dir writable, all hook scripts present, `claude` on PATH.

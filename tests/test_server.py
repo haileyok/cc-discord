@@ -1137,7 +1137,7 @@ class TestHookEvent:
                 "session_id": "sess-abc",
                 "cwd": "/tmp",
                 "transcript_path": "/path",
-                "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+                "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
             },
         )
         assert resp.status == 200

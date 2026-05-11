@@ -861,7 +861,7 @@ class TaskRegistry:
         """If msg is in a task-bound thread, write to its zellij pane and return True.
         Otherwise return False so the caller falls through to the existing /v1/ask listener.
 
-        Attachments are downloaded to ~/.local/state/claude-discord-bridge/attachments/<task>/
+        Attachments are downloaded to ~/.local/state/cc-bridge/attachments/<task>/
         and their absolute paths are appended to the relayed text so Claude can read them
         with the Read tool (handles images, PDFs, JSON, plain text, etc.).
         """

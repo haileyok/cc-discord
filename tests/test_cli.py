@@ -493,7 +493,7 @@ class TestServeCommand:
             if cmd[0] == "zellij" and "list-sessions" in cmd:
                 result = MagicMock()
                 result.returncode = 0
-                result.stdout = "bridge\nother\n"
+                result.stdout = "cc-bridge-worker\nother\n"
                 return result
             elif cmd[0] == "zellij":
                 result = MagicMock()
@@ -511,7 +511,7 @@ class TestServeCommand:
                 runner = CliRunner()
                 result = runner.invoke(cli, ["doctor"])
 
-        assert "[ok] bridge zellij session" in result.output
+        assert "[ok] zellij session" in result.output
 
     def test_doctor_bridge_session_not_running(self, tmp_path: Path, monkeypatch) -> None:
         """doctor warns when bridge zellij session is not running."""
@@ -545,7 +545,7 @@ class TestServeCommand:
                 runner = CliRunner()
                 result = runner.invoke(cli, ["doctor"])
 
-        assert "[warn] bridge zellij session" in result.output
+        assert "[warn] zellij session" in result.output
 
     def test_doctor_task_settings_dir_writable(self, tmp_path: Path, monkeypatch) -> None:
         """doctor reports ok when task-settings dir is writable."""

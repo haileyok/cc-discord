@@ -2,4 +2,4 @@
 # Foreground runner. Use under tmux/nohup if you want it to survive your shell.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec uv run claude-discord-bridge serve "$@"
+exec uv run cc-bridge serve "$@"
