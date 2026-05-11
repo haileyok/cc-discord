@@ -74,8 +74,7 @@ class TestCommands:
 
     async def test_humanize_age_seconds(self) -> None:
         """_humanize_age formats seconds correctly."""
-        from bridge.commands import _humanize_age
-        import time
+        from bridge.command_handlers import _humanize_age
 
         now = int(time.time())
 
@@ -99,7 +98,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """_wait_for_session_bind polls until session_id is set or timeout."""
-        from bridge.commands import _wait_for_session_bind
+        from bridge.command_handlers import _wait_for_session_bind
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -140,7 +139,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """_wait_for_session_bind raises asyncio.TimeoutError if session_id doesn't arrive."""
-        from bridge.commands import _wait_for_session_bind
+        from bridge.command_handlers import _wait_for_session_bind
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -165,8 +164,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """start command without prompt spawns task and replies with thread URL."""
-        from bridge.commands import build_tree
-        import tempfile
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -199,7 +197,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """start command replies with ❌ when spawn_task raises."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -224,7 +222,7 @@ class TestCommands:
 
     async def test_list_empty(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """list command with no tasks replies 'No active tasks.'"""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -244,7 +242,7 @@ class TestCommands:
 
     async def test_list_multi(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """list command shows all active tasks."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -281,7 +279,7 @@ class TestCommands:
         self, in_memory_db, fake_bot, fake_zellij
     ) -> None:
         """stop command outside a task thread replies with ❌."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         tree = build_tree(fake_bot, registry)
@@ -300,7 +298,7 @@ class TestCommands:
 
     async def test_stop_cleanly_stopped(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """stop command replies ✅ when stop_task returns True."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -343,7 +341,7 @@ class TestCommands:
 
     async def test_kill_happy_path(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """kill command replies 💥 after closing pane."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())
@@ -378,7 +376,7 @@ class TestCommands:
 
     async def test_restart_happy_path(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """restart command replies 🔄."""
-        from bridge.commands import build_tree
+        from bridge.backends.discord.commands import build_tree
         from bridge.state import upsert_task
 
         now = int(time.time())

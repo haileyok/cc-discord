@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from bridge.tasks import TaskNotFound, TaskRestartError, TaskSpawnError
-
 if TYPE_CHECKING:
     from bridge.tasks import TaskRegistry
 
@@ -96,6 +94,8 @@ async def handle_start(
     Returns:
         CommandResult with task object on success
     """
+    from bridge.tasks import TaskSpawnError
+
     try:
         task = await registry.spawn_task(cwd=cwd, prompt=None)
     except TaskSpawnError as e:
@@ -131,6 +131,8 @@ async def handle_stop(
     Returns:
         CommandResult indicating success or failure
     """
+    from bridge.tasks import TaskNotFound
+
     task = _resolve_task(registry, thread_id, task_id)
     if task is None:
         return CommandResult(
@@ -170,6 +172,8 @@ async def handle_kill(
     Returns:
         CommandResult indicating success or failure
     """
+    from bridge.tasks import TaskNotFound
+
     task = _resolve_task(registry, thread_id, task_id)
     if task is None:
         return CommandResult(
@@ -235,6 +239,8 @@ async def handle_restart(
     Returns:
         CommandResult indicating success or failure
     """
+    from bridge.tasks import TaskNotFound, TaskRestartError
+
     task = _resolve_task(registry, thread_id, task_id)
     if task is None:
         return CommandResult(
@@ -361,6 +367,8 @@ async def handle_skill(
     Returns:
         CommandResult indicating success or failure
     """
+    from bridge.tasks import TaskNotFound, TaskSpawnError
+
     task = _resolve_task(registry, thread_id, None)
     if task is None:
         return CommandResult(
