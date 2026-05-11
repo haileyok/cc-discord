@@ -55,6 +55,10 @@ class MattermostBot:
         """Whether the bot is ready."""
         return self._ready
 
+    @property
+    def channel_id(self) -> str:
+        return self._channel_id
+
     def bind_registry(self, registry: TaskRegistry) -> None:
         """Bind a TaskRegistry for text command handling.
 

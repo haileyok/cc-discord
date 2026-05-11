@@ -88,6 +88,13 @@ class MattermostWebSocket:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+            except Exception:
+                logger.exception(
+                    "Unexpected error in WebSocket loop — reconnecting in %.1fs",
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
             finally:
                 self._ws = None
 
