@@ -1,6 +1,6 @@
 # cc-bridge
 
-Localhost HTTP bridge between Claude Code sessions and Discord. Long turns ping your phone, permission prompts surface in a thread, Claude can `/ask-discord <question>` when it's blocked, and you can drive whole Claude sessions from Discord slash commands without ever attaching to the terminal.
+Localhost HTTP bridge between Claude Code sessions and Discord or Mattermost. Long turns ping your phone, permission prompts surface in a thread, Claude can ask questions when it's blocked, and you can drive whole Claude sessions from chat slash commands or text commands without ever attaching to the terminal.
 
 ## What it does
 
@@ -23,7 +23,8 @@ A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallba
 ## Prereqs
 
 - Python 3.12 managed by [uv](https://github.com/astral-sh/uv) (the repo pins it via `.python-version`).
-- A Discord application with a bot, message-content intent enabled, invited to a guild you control, with permission to view + send messages + create public threads in one channel.
+- **Discord** (optional): A Discord application with a bot, message-content intent enabled, invited to a guild you control, with permission to view + send messages + create public threads in one channel.
+- **Mattermost** (optional): A Mattermost server with a bot account, authorized to post to at least one channel, and an API token.
 - [Claude Code](https://docs.claude.com/claude-code) installed.
 
 ## Setup
@@ -35,7 +36,7 @@ A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallba
 3. **OAuth2 → URL Generator** → scopes: `bot` → bot permissions: `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Read Message History` → open the generated URL → invite the bot to your server.
 4. In the Discord client: User Settings → Advanced → enable **Developer Mode** → right-click the target channel → **Copy Channel ID**.
 
-### 2. Bridge daemon
+### 2. Bridge daemon setup
 
 ```bash
 git clone https://github.com/haileyok/cc-discord.git
@@ -44,7 +45,22 @@ uv sync
 uv run cc-bridge init
 ```
 
+#### Discord setup
+
 `init` prompts for the bot token and channel ID, writes `~/.config/cc-bridge/secrets.json` at mode `0600`, validates the token by connecting to Discord (15s timeout), and posts a confirmation message to your channel. If the token's wrong it exits 2 and leaves the secrets file so you can fix and retry.
+
+Set `BRIDGE_PLATFORM=discord` before starting the daemon (default).
+
+#### Mattermost setup
+
+`init` also supports Mattermost. When prompted, choose Mattermost and provide:
+- **Server URL** — e.g., `https://mattermost.example.com`
+- **Bot token** — Personal Access Token (PAT) with `post:channels` permission
+- **Channel ID** — Channel where the bridge will post messages (you can find this in Mattermost's channel detail view)
+
+The bridge will validate the token and channel by posting a test message. Secrets are stored at `~/.config/cc-bridge/secrets.json` (mode `0600`).
+
+Set `BRIDGE_PLATFORM=mattermost` before starting the daemon.
 
 ### 3. Wire Claude Code hooks
 
@@ -169,22 +185,24 @@ You should see `[ok]` for each check: secrets file present + 0600, daemon health
 
 Once the daemon is running, these surfaces work without further intervention:
 
-| Surface | Trigger |
-|---|---|
-| Long turn ping | Run any Claude Code turn that takes >10 minutes |
-| Permission prompt ping | Run any Claude Code action that needs your approval |
-| `/ask-discord` from inside Claude | Ask Claude to use `/ask-discord` when it's blocked |
-| Manual `POST /v1/notify` | `curl -X POST http://127.0.0.1:8787/v1/notify -H 'Content-Type: application/json' -d '{"session_id":"...","cwd":"...","message":"..."}'` |
-| Manual `POST /v1/ask` | Same, but `/v1/ask` with a `question` field; blocks for the reply (default 15 min, capped at 60) |
-| Manual `GET /v1/health` | `curl http://127.0.0.1:8787/v1/health` |
+| Surface | Discord | Mattermost |
+|---|---|---|
+| Long turn ping | Posts to thread | Posts to channel |
+| Permission prompt ping | Posts to thread | Posts to channel |
+| `/ask-discord` skill | Posts question, waits for reply | N/A (use slash commands instead) |
+| Manual `POST /v1/notify` | `curl http://127.0.0.1:8787/v1/notify ...` | Same |
+| Manual `POST /v1/ask` | Same, blocks for reply | Same |
+| Manual `GET /v1/health` | `curl http://127.0.0.1:8787/v1/health` | Same |
 
-Threads are named `cc · <cwd-leaf> · <session-prefix>`. Same `session_id` always routes to the same thread; different sessions get different threads. Mappings persist in SQLite at `~/.local/state/cc-bridge/state.db` and survive daemon restarts. Archived/deleted threads recreate transparently.
+**Discord:** Threads are named `cc · <cwd-leaf> · <session-prefix>`. Same `session_id` always routes to the same thread; different sessions get different threads. Mappings persist in SQLite at `~/.local/state/cc-bridge/state.db` and survive daemon restarts. Archived/deleted threads recreate transparently.
 
-## Discord-driven sessions
+**Mattermost:** Messages post to the configured channel. The bridge does not create separate threads in Mattermost.
 
-Spawning Claude Code sessions directly from Discord slash commands. Each task is one zellij tab in a shared session; the bridge injects task-scoped hooks via `claude --settings <path>` so it can mirror everything back to a per-task thread.
+## Chat-driven sessions
 
-### Slash commands
+Spawning Claude Code sessions directly from Discord slash commands or Mattermost text commands. Each task is one zellij tab in a shared session; the bridge injects task-scoped hooks via `claude --settings <path>` so it can mirror everything back to the chat.
+
+### Discord slash commands
 
 | Command | What it does |
 |---|---|
@@ -199,6 +217,22 @@ Spawning Claude Code sessions directly from Discord slash commands. Each task is
 | `/tasks [thread:<#thread>]` | Show the session's `TaskCreate`/`TaskUpdate` mirror as an embed. |
 
 Commands without an explicit `thread:` argument operate on the task whose thread you're invoking from.
+
+### Mattermost text commands
+
+| Command | What it does |
+|---|---|
+| `!start <cwd> [prompt]` | Spawn a new Claude session in `cwd`, optionally with initial prompt. |
+| `!list` | List active tasks with status, cwd leaf, and age. |
+| `!stop [task_id]` | Graceful stop — writes `/exit` to the pane. Omit `task_id` to stop the most recent. |
+| `!kill [task_id]` | Force-close the pane — marks the task crashed. Omit `task_id` to kill the most recent. |
+| `!restart [task_id]` | Resume a stopped task via `claude --resume <session_id>`. Omit `task_id` to restart the most recent. |
+| `!skill <name> [args]` | Type `/<name> [args]` into the running session. |
+| `!rename [name]` | Rename the task; omit `name` to auto-generate via `claude -p` against the transcript. |
+| `!stats [task_id]` | Token / cost / context-fill stats for the task. |
+| `!tasks [task_id]` | Show the session's `TaskCreate`/`TaskUpdate` mirror. |
+
+Commands without a task_id argument operate on the most recently started task for that user.
 
 ### What gets mirrored to the thread
 
@@ -233,9 +267,10 @@ Commands without an explicit `thread:` argument operate on the task whose thread
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `BRIDGE_PLATFORM` | `discord` | Which backend to use: `discord` or `mattermost`. |
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Where hooks POST events. Override only if you run the daemon on a non-default port. |
 | `BRIDGE_ZELLIJ_SESSION` | `cc-bridge-worker` | zellij session name the bridge spawns task tabs into. |
-| `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. |
+| `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. (Discord only) |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
 | `BRIDGE_CONTEXT_LIMIT` | _(model default)_ | Override the per-model context window for `/stats` math (e.g. `1000000` for `[1m]`). |
 | `WISPR_FLOW_API_TOKEN` | _(unset)_ | If set, voice memos use Wispr Flow's API; otherwise local `whisper`. |
@@ -252,19 +287,24 @@ Runs ten checks: secrets file present + 0600, daemon health, settings.json hooks
 
 ## Architecture
 
-Single-process Python daemon. `aiohttp.web.AppRunner` and `discord.py` share one asyncio event loop. Per-session thread mapping lives in SQLite (WAL). Reply routing uses a per-thread `asyncio.Lock` (FIFO) plus a sliding 3-second coalescing window so multi-message replies fold into one response.
+Single-process Python daemon. `aiohttp.web.AppRunner` and a `ChatPlatform` backend (Discord or Mattermost) share one asyncio event loop. Per-session thread/post mapping lives in SQLite (WAL). Reply routing uses per-thread/task `asyncio.Lock` (FIFO) plus a sliding 3-second coalescing window so multi-message replies fold into one response.
+
+The bridge abstracts across Discord and Mattermost via the `ChatPlatform` protocol, allowing both backends to be used interchangeably. Platform-specific implementations live in `src/bridge/backends/`.
 
 | File | Role |
 |---|---|
+| `src/bridge/platform.py` | `ChatPlatform` protocol — abstraction for Discord and Mattermost |
 | `src/bridge/server.py` | aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse` |
-| `src/bridge/bot.py` | discord.py wrapper — chunked send, retries on 5xx, `on_message` dispatch, embed edits |
-| `src/bridge/threads.py` | session_id → thread_id with create-on-miss + recreate-on-404 |
+| `src/bridge/backends/discord/bot.py` | discord.py wrapper — chunked send, retries on 5xx, `on_message` dispatch, embed edits |
+| `src/bridge/backends/mattermost/bot.py` | Mattermost WebSocket client + REST API — message posting, reaction handling, command routing |
+| `src/bridge/threads.py` | session_id → thread_id (Discord) or post_id (Mattermost), with create-on-miss + recreate-on-404 |
 | `src/bridge/listener.py` | Pending-ask state, sliding coalescing window, future lifecycle |
 | `src/bridge/state.py` | aiosqlite — `sessions`, `tasks`, `approval_log` tables |
-| `src/bridge/secrets.py` | 0600 JSON loader/writer |
-| `src/bridge/cli.py` | click CLI: `init`, `serve`, `doctor` |
-| `src/bridge/commands.py` | discord.py slash-command tree (`/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`) |
-| `src/bridge/tasks.py` | `TaskRegistry`: Discord-driven task lifecycle, hook-event dispatch, transcript streaming, subagent block management, task-list mirror |
+| `src/bridge/secrets.py` | 0600 JSON loader/writer for both Discord and Mattermost credentials |
+| `src/bridge/cli.py` | click CLI: `init`, `serve`, `doctor` (handles both platforms) |
+| `src/bridge/commands.py` | Discord slash-command tree |
+| `src/bridge/backends/mattermost/commands.py` | Mattermost command handler (HTTP endpoint + text command parser) |
+| `src/bridge/tasks.py` | `TaskRegistry`: Chat-driven task lifecycle, hook-event dispatch, transcript streaming, subagent block management, task-list mirror |
 | `src/bridge/zellij.py` | Async wrapper around the `zellij` CLI (≥ 0.44 recommended) |
 | `src/bridge/tool_summary.py` | One-liner formatter + fenced diff/code/checklist blocks per tool name |
 | `src/bridge/transcript.py` | Bounded utf-8 JSONL reader for claude transcripts |
@@ -274,9 +314,9 @@ Single-process Python daemon. `aiohttp.web.AppRunner` and `discord.py` share one
 | `src/bridge/approvals.py` | `ApprovalRouter` — PreToolUse and TUI-prompt round-trips via reactions/text |
 | `hooks/notify-stop.py` | Standalone-mode Stop hook (long-turn ping) |
 | `hooks/notify-notification.py` | Standalone-mode Notification hook (permission/idle ping) |
-| `hooks/event.py` | Discord-driven mode multi-event dispatcher (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`, `SessionEnd`, `PreCompact`) |
-| `hooks/pretooluse-approve.py` | Discord-driven mode PreToolUse approval wrapper (fail-closed, used selectively for `AskUserQuestion` / `ExitPlanMode`) |
-| `skills/SKILL.md` | `/ask-discord` skill instructions for Claude (symlinked into `~/.claude/skills/ask-discord/`) |
+| `hooks/event.py` | Chat-driven mode multi-event dispatcher (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`, `SessionEnd`, `PreCompact`) |
+| `hooks/pretooluse-approve.py` | Chat-driven mode PreToolUse approval wrapper (fail-closed, used selectively for `AskUserQuestion` / `ExitPlanMode`) |
+| `skills/SKILL.md` | `/ask-discord` skill instructions for Claude (symlinked into `~/.claude/skills/ask-discord/` and `~/.claude/skills/ask-bridge/`) |
 
 See `CLAUDE.md` for the full set of gotchas and invariants — start there before adding features.
 

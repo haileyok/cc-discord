@@ -1,12 +1,12 @@
 # cc-bridge
 
-Localhost HTTP bridge between Claude Code sessions and Discord. Single-process Python daemon — `aiohttp` server and `discord.py` client share one asyncio event loop.
+Localhost HTTP bridge between Claude Code sessions and Discord or Mattermost. Single-process Python daemon — `aiohttp` server and a `ChatPlatform` backend (Discord or Mattermost) share one asyncio event loop.
 
-Freshness: 2026-05-09
+Freshness: 2026-05-10
 
 ## Repo location and tooling
 
-This repo lives at `/home/discord/cc-discord`, **outside** the `/home/discord/discord` monorepo. `clyde`, `clint`, the monorepo's pre-commit hooks, and Buildkite CI do not apply here. Don't import from or symlink into the monorepo.
+This repo lives at `/home/discord/cc-discord` (or locally at the user's clone). **Outside** the `/home/discord/discord` monorepo if running on the coder workstation. `clyde`, `clint`, the monorepo's pre-commit hooks, and Buildkite CI do not apply here. Don't import from or symlink into the monorepo.
 
 Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3.10 — always invoke through uv:
 
@@ -15,7 +15,20 @@ Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3
 
 ## Gotchas
 
-- **`MESSAGE_CONTENT` privileged intent.** `bot.py` sets `intents.message_content = True` because reply routing reads message text. The bot user in the Discord Developer Portal must have this intent enabled, or `on_message` payloads arrive empty. The `init` wizard prints a reminder; agents adding new gateway features should not forget it.
+### Discord-specific
+
+- **`MESSAGE_CONTENT` privileged intent.** `src/bridge/backends/discord/bot.py` sets `intents.message_content = True` because reply routing reads message text. The bot user in the Discord Developer Portal must have this intent enabled, or `on_message` payloads arrive empty. The `init` wizard prints a reminder; agents adding new gateway features should not forget it.
+
+### Mattermost-specific
+
+- **WebSocket double-encoding.** Mattermost's WebSocket API can send some payloads twice for high-frequency events (e.g. rapid reactions). The bridge uses message ID deduplication to avoid processing duplicates twice. Check `backends/mattermost/bot.py` for the `_seen_messages` cache.
+- **Emoji name ↔ Unicode mapping.** Mattermost uses emoji names (e.g., `:+1:`) while the bridge internally uses Unicode strings (e.g., `👍`). The mapping is in `backends/mattermost/emoji.py`; keep it in sync if adding new reaction types.
+- **Markdown formatting differences.** Mattermost's markdown is slightly different from Discord. The bridge uses `backends/mattermost/formatting.py` to convert Claude's Markdown. Some features like fancy embeds don't map 1:1.
+- **Token-based auth, not intents.** Mattermost uses a Personal Access Token (PAT) in the `Authorization: Bearer <token>` header, not OAuth intents. PATs can be scoped; the minimum scope for the bridge is `post:channels`.
+
+### Platform-agnostic
+
+
 - **Hooks must always exit 0.** `hooks/notify-stop.py` and `hooks/notify-notification.py` wrap `main()` in `try/except: pass; finally: sys.exit(0)` on purpose — a Claude Code Stop/Notification hook that fails non-zero degrades the user's session. Preserve that contract when editing.
 - **FIFO ordering for `/v1/ask` is enforced by `AskLockMap`, not `Listener`.** `Listener.register()` raises `RuntimeError` if a thread already has a pending ask — this is an invariant guard, not the queueing mechanism. The per-thread `asyncio.Lock` in `server.AskLockMap` must be acquired *before* posting the question and *released* after `unregister`. Any new `/v1/ask`-style endpoint must follow the same lock-then-register pattern.
 - **Single event loop, shared by aiohttp + discord.py.** Long blocking work (sync DB calls, `time.sleep`, `requests`) inside any handler starves both the HTTP server and the Discord gateway. Use the async equivalents (`aiosqlite`, `asyncio.sleep`, `aiohttp` client).
@@ -47,16 +60,42 @@ The systemd unit at `packaging/cc-bridge.service` hardcodes `%h/.local/bin/cc-br
 
 ## Architecture quick reference
 
-- `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse`. `AskLockMap` lives here.
-- `src/bridge/bot.py` — `discord.py` wrapper. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes. `_with_retry` wraps every `fetch_channel` / `target.send` call with bounded backoff (4 attempts) on `DiscordServerError` / `ClientConnectionError` so transient Discord 5xx waves don't drop user-facing posts (incl. AskUserQuestion notifications).
-- `src/bridge/threads.py` — `ThreadRegistry` owns session_id→thread_id mapping with 404 recovery. Single global lock is intentional (per-session contention is rare).
-- `src/bridge/listener.py` — sliding-window coalescing for `/v1/ask` replies. `GRACE_SECS = 3.0` default; tests override.
-- `src/bridge/state.py` — aiosqlite, WAL mode. Tables: `sessions`, `tasks`, `approval_log`.
-- `src/bridge/tasks.py` — `TaskRegistry` for Discord-driven sessions. Owns task lifecycle, hook-event dispatch, typing/tool-summary/transcript relay, startup reconciliation against zellij.
+### Platform abstraction
+
+- `src/bridge/platform.py` — `ChatPlatform` protocol defines the interface both Discord and Mattermost backends must implement. Methods: `connect()`, `disconnect()`, `post_message()`, `edit_message()`, `delete_message()`, `add_reaction()`, etc. Structured to allow swapping backends at runtime via `BRIDGE_PLATFORM` env var.
+
+### Server and state
+
+- `src/bridge/server.py` — aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse`. `AskLockMap` lives here. Platform-agnostic.
+- `src/bridge/state.py` — aiosqlite, WAL mode. Tables: `sessions`, `tasks`, `approval_log`. Platform-agnostic.
+- `src/bridge/threads.py` — `ThreadRegistry` owns session_id→thread_id (Discord) or post_id (Mattermost) mapping with 404 recovery. Single global lock is intentional (per-session contention is rare).
+- `src/bridge/listener.py` — sliding-window coalescing for `/v1/ask` replies. `GRACE_SECS = 3.0` default; tests override. Platform-agnostic.
+- `src/bridge/secrets.py` — 0600 JSON at `~/.config/cc-bridge/secrets.json`. Holds both Discord token and Mattermost PAT depending on platform.
+
+### Task and command handling
+
+- `src/bridge/tasks.py` — `TaskRegistry` for chat-driven sessions. Owns task lifecycle, hook-event dispatch, typing/tool-summary/transcript relay, startup reconciliation against zellij. Platform-agnostic.
+- `src/bridge/commands.py` — Discord slash-command tree (discord.py dispatcher).
+- `src/bridge/backends/mattermost/commands.py` — Mattermost command handler (HTTP endpoint + text command parser).
+
+### Backend implementations
+
+- `src/bridge/backends/discord/bot.py` — `discord.py` wrapper. `DiscordBot` implements `ChatPlatform`. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes. `_with_retry` wraps every `fetch_channel` / `target.send` call with bounded backoff (4 attempts) on `DiscordServerError` / `ClientConnectionError` so transient Discord 5xx waves don't drop user-facing posts (incl. AskUserQuestion notifications).
+- `src/bridge/backends/mattermost/bot.py` — `MattermostBot` implements `ChatPlatform`. WebSocket client + REST API wrapper. Handles incoming events (messages, reactions) and outgoing posts/edits.
+- `src/bridge/backends/mattermost/emoji.py` — Emoji name ↔ Unicode mapping for reaction handling.
+- `src/bridge/backends/mattermost/formatting.py` — Markdown formatting converter (Claude Markdown → Mattermost Markdown).
+
+### Common utilities
+
 - `src/bridge/zellij.py` — async wrapper around the `zellij` CLI (≥ 0.44 recommended; 0.43 still works in degraded mode). Each task is a named tab in the configured session, opened via `new-tab --layout <kdl>` so the tab spawns with claude as its only pane (no default shell). `tasks._write_task_layout` generates the per-task KDL file at `~/.local/state/cc-bridge/task-settings/<task_id>.kdl` with `env K=V ... claude <args>` baked into the layout (env vars can't be passed via `zellij run` because zellij is client-server — the spawned process inherits the *server's* env); `_kdl_quote` strips control bytes from interpolated values so a malformed env/argv field can't smuggle a literal newline / NUL / ESC through the parser. `write_to_pane` types content via `action write-chars` per segment; multi-line content is wrapped in bracketed paste (`ESC[200~ … ESC[201~`) so embedded newlines don't submit, LF (`10`) separates segments inside the paste, and trailing CR (`13`) submits the prompt. Single-line bodies that start with `-` are auto-routed through paste-mode by `write_to_pane`, because zellij's argparse otherwise eats `-`-leading args as flags — but **anyone calling `action write-chars` directly still needs to avoid leading `-`** (e.g. raw paste segments inside `_action_write_bytes`). The body is also stripped of C0/C1 control bytes (except LF/TAB) before sending so a hostile Discord message can't terminate paste mode early or smuggle CSI/OSC sequences. `list_panes` uses zellij 0.44's `action list-panes --json --state --tab` to report real `exited` status per tab; on older zellij it falls back to `query-tab-names` and `exited` is hardcoded False.
-- `src/bridge/approvals.py` — `ApprovalRouter` for PreToolUse round-trips (Discord reactions/text → hook decision) and `Notification` TUI prompts (AskUserQuestion / ExitPlanMode / free-text).
-- `src/bridge/secrets.py` — 0600 JSON at `~/.config/cc-bridge/secrets.json`.
+- `src/bridge/approvals.py` — `ApprovalRouter` for PreToolUse round-trips (reactions/text → hook decision, platform-agnostic) and `Notification` TUI prompts (AskUserQuestion / ExitPlanMode / free-text).
 - `src/bridge/usage.py` — token-usage / cost stats from transcript. Hardcoded `MODEL_PRICES` (Anthropic list rates) and `MODEL_CONTEXT` maps; refresh when prices or models change. `[1m]` alias in `~/.claude/settings.json` auto-detected at module import as the default 1M context limit (overrides per-model defaults). `BRIDGE_CONTEXT_LIMIT` env var always wins. Footer posts after Stop; `/stats` slash command shows on demand.
-- `src/bridge/skills.py` — enumerates available skills (user-level under `~/.claude/skills/` plus enabled-plugin skills resolved from `~/.claude/plugins/installed_plugins.json`) for the `/skill` slash command's autocomplete. Plugin skills are exposed as `<plugin>:<skill>` to match Claude Code's own naming.
-- `hooks/` — Claude Code hooks. `notify-stop.py` / `notify-notification.py` are the standalone-bridge hooks. `event.py` (multi-event dispatcher) and `pretooluse-approve.py` (fail-closed approval wrapper) are the Discord-driven-session hooks injected via `--settings`. All post to `BRIDGE_URL` (default `http://127.0.0.1:8787`); the notify hooks fall back to a Discord webhook URL at `~/.claude/discord-notify-webhook` if the bridge is down.
-- `skills/` — `/ask-discord` skill. `SKILL.md` is symlinked into `~/.claude/skills/ask-discord/`.
+- `src/bridge/skills.py` — enumerates available skills (user-level under `~/.claude/skills/` plus enabled-plugin skills resolved from `~/.claude/plugins/installed_plugins.json`) for autocomplete. Plugin skills are exposed as `<plugin>:<skill>` to match Claude Code's own naming.
+- `src/bridge/tool_summary.py` — One-liner formatter + fenced diff/code/checklist blocks. Platform-agnostic.
+- `src/bridge/transcript.py` — Bounded utf-8 JSONL reader for claude transcripts. Platform-agnostic.
+- `src/bridge/voice.py` — Audio transcription (Wispr Flow API or local `whisper` CLI). Platform-agnostic.
+
+### Hooks and skills
+
+- `hooks/` — Claude Code hooks. `notify-stop.py` / `notify-notification.py` are the standalone-bridge hooks. `event.py` (multi-event dispatcher) and `pretooluse-approve.py` (fail-closed approval wrapper) are the chat-driven-session hooks injected via `--settings`. All post to `BRIDGE_URL` (default `http://127.0.0.1:8787`); the notify hooks fall back to a Discord webhook URL at `~/.claude/discord-notify-webhook` if the bridge is down and Discord is the platform.
+- `skills/` — `/ask-discord` skill. `SKILL.md` is symlinked into `~/.claude/skills/ask-discord/` and `~/.claude/skills/ask-bridge/` (for backward compatibility).

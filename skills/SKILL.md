@@ -1,11 +1,13 @@
 ---
 name: ask-discord
-description: Ask the user a question via Discord and wait for their reply. Use when blocked >5 minutes on a decision and the user is away from the keyboard. Times out gracefully.
+description: Ask the user a question via Discord/Mattermost and wait for their reply. Use when blocked >5 minutes on a decision and the user is away from the keyboard. Times out gracefully.
 ---
 
-# Ask the user via Discord
+# Ask the user via Discord or Mattermost
 
-Use this when you are blocked on a decision and the user is plausibly away from the workstation. The bridge daemon (`cc-bridge`) posts the question to a Discord thread tied to the current session and waits up to 15 minutes for a reply. The user's reply (or a graceful fallback string on timeout / bridge-down) is returned to you to use as conversation context.
+Use this when you are blocked on a decision and the user is plausibly away from the workstation. The bridge daemon (`cc-bridge`) posts the question to a Discord thread or Mattermost channel tied to the current session and waits up to 15 minutes for a reply. The user's reply (or a graceful fallback string on timeout / bridge-down) is returned to you to use as conversation context.
+
+**Note:** This skill works with both Discord and Mattermost backends. The platform is selected via the `BRIDGE_PLATFORM` environment variable when the daemon starts (default: Discord).
 
 ## When to use
 
