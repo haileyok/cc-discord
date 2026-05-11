@@ -64,8 +64,8 @@ class TestInitCommand:
             async def close(self) -> None:
                 pass
 
-            async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
-                return [123]
+            async def post(self, message: str, *, thread_id: str | None = None) -> list[str]:
+                return ["123"]
 
         return FakeBot
 
@@ -73,7 +73,7 @@ class TestInitCommand:
         """init with simulated stdin writes a secrets file at the expected location."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
+        monkeypatch.setattr("bridge.cli.DiscordBot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -87,7 +87,7 @@ class TestInitCommand:
         """init writes a secrets file with exactly 0o600 permissions."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
+        monkeypatch.setattr("bridge.cli.DiscordBot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -102,7 +102,7 @@ class TestInitCommand:
         """init rejects a non-integer channel ID by reprompting."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
+        monkeypatch.setattr("bridge.cli.DiscordBot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         # Input: first bad channel ID, then a good one
@@ -135,7 +135,7 @@ class TestInitCommand:
         """init prompts interactively for bot token and channel ID."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
+        monkeypatch.setattr("bridge.cli.DiscordBot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -150,7 +150,7 @@ class TestInitCommand:
         """init prints a success message mentioning secrets.json and 0600."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
+        monkeypatch.setattr("bridge.cli.DiscordBot", self._get_ready_fake_bot())
 
         runner = CliRunner()
         result = runner.invoke(
@@ -186,7 +186,7 @@ class TestInitCommand:
 
         # Monkeypatch the timeout to fail quickly instead of waiting 15s
         monkeypatch.setattr("bridge.cli._TOKEN_VALIDATION_TIMEOUT", 0.1)
-        monkeypatch.setattr("bridge.cli.Bot", FakeBot)
+        monkeypatch.setattr("bridge.cli.DiscordBot", FakeBot)
 
         runner = CliRunner()
         result = runner.invoke(
@@ -226,7 +226,7 @@ class TestInitCommand:
                 posted_messages.append({"message": message, "thread_id": thread_id})
                 return [123]
 
-        monkeypatch.setattr("bridge.cli.Bot", FakeBot)
+        monkeypatch.setattr("bridge.cli.DiscordBot", FakeBot)
 
         runner = CliRunner()
         result = runner.invoke(

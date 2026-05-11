@@ -11,7 +11,7 @@ from aiohttp import test_utils
 
 from bridge import state
 from bridge.approvals import ApprovalRouter
-from bridge.bot import BotNotReady
+from bridge.backends.discord.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
     build_app, _clamp_timeout, _format_question,
