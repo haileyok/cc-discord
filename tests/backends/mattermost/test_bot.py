@@ -748,3 +748,152 @@ class TestAudioProcessing:
         # The post should be modified with transcription blocks
         assert "check this" in called_post.get("message", "")
         assert "[voice memo]" in called_post.get("message", "")
+
+
+class TestMattermostBotTextCommands:
+    """Tests for text command handling in bot."""
+
+    @pytest.mark.asyncio
+    async def test_handle_event_text_command_start(self):
+        """Test that !start commands are intercepted and dispatched."""
+        registry = mock.MagicMock()
+        task = mock.MagicMock()
+        task.task_id = "task123abc"
+        registry.spawn_task = mock.AsyncMock(return_value=task)
+        registry.get_by_task_id = mock.MagicMock(return_value=task)
+
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+        )
+        bot._bot_user_id = "bot123"
+        bot._registry = registry
+        bot.post = mock.AsyncMock(return_value=["msg1"])
+
+        post = {
+            "id": "msg1",
+            "message": "!start /tmp",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": None,
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # Command should be intercepted, not passed to on_message
+        bot.post.assert_called_once()
+        registry.spawn_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_event_text_command_in_thread(self):
+        """Test that text commands work in threads."""
+        registry = mock.MagicMock()
+        registry.stop_task = mock.AsyncMock(return_value=True)
+
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+        )
+        bot._bot_user_id = "bot123"
+        bot._registry = registry
+        bot.post = mock.AsyncMock(return_value=["msg1"])
+
+        post = {
+            "id": "msg2",
+            "message": "!stop",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": "msg1",  # Thread parent
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # Should post response to the thread
+        bot.post.assert_called_once()
+        call_args = bot.post.call_args
+        assert call_args[1].get("thread_id") == "msg1"
+
+    @pytest.mark.asyncio
+    async def test_handle_event_non_command_message(self):
+        """Test that non-command messages pass to on_message."""
+        on_msg = mock.AsyncMock()
+        registry = mock.MagicMock()
+
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+        bot._registry = registry
+
+        post = {
+            "id": "msg1",
+            "message": "hello world",  # No ! prefix
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": None,
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # Should pass through to on_message callback
+        on_msg.assert_called_once_with(post)
+
+    @pytest.mark.asyncio
+    async def test_handle_event_own_messages_ignored(self):
+        """Test that bot ignores its own messages."""
+        on_msg = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=on_msg,
+        )
+        bot._bot_user_id = "bot123"
+
+        post = {
+            "id": "msg1",
+            "message": "!start /tmp",
+            "user_id": "bot123",  # Bot's own message
+            "channel_id": "channel-id",
+            "root_id": None,
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # Should ignore completely
+        on_msg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_event_command_result_posted(self):
+        """Test that command result is posted back to thread."""
+        registry = mock.MagicMock()
+        registry.list_tasks = mock.AsyncMock(return_value=[])
+
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+        )
+        bot._bot_user_id = "bot123"
+        bot._registry = registry
+        bot.post = mock.AsyncMock(return_value=["msg1"])
+
+        post = {
+            "id": "msg1",
+            "message": "!list",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "root_id": "thread1",
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        # Result should be posted
+        bot.post.assert_called_once()
+        result_msg = bot.post.call_args[0][0]
+        assert "No active tasks" in result_msg or "Active" in result_msg

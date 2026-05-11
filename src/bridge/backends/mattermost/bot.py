@@ -6,13 +6,17 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import aiohttp
 
 from bridge import voice
 from bridge.backends.mattermost.api import MattermostAPI, RateLimitError
+from bridge.backends.mattermost.commands import dispatch_text_command, parse_text_command
 from bridge.backends.mattermost.ws import MattermostWebSocket
+
+if TYPE_CHECKING:
+    from bridge.tasks import TaskRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +46,20 @@ class MattermostBot:
         self._ws: MattermostWebSocket | None = None
         self._ready = False
         self._bot_user_id: str | None = None
+        self._registry: TaskRegistry | None = None
 
     @property
     def is_ready(self) -> bool:
         """Whether the bot is ready."""
         return self._ready
+
+    def bind_registry(self, registry: TaskRegistry) -> None:
+        """Bind a TaskRegistry for text command handling.
+
+        Args:
+            registry: TaskRegistry instance for dispatching commands
+        """
+        self._registry = registry
 
     async def start(self) -> None:
         """Start the bot."""
@@ -201,6 +214,19 @@ class MattermostBot:
                 for file_ref in file_refs:
                     text_parts.append(f"[attached: {file_ref['id']}]")
                 post["message"] = " ".join(text_parts)
+
+            # Check for text commands (!command syntax)
+            message = post.get("message", "")
+            if self._registry:
+                parsed = parse_text_command(message)
+                if parsed:
+                    command, args = parsed
+                    thread_id = post.get("root_id") or post.get("id")
+                    result = await dispatch_text_command(
+                        command, args, self._registry, thread_id
+                    )
+                    await self.post(result.message, thread_id=thread_id)
+                    return
 
             if self._on_message:
                 await self._on_message(post)
