@@ -1,10 +1,11 @@
 [Unit]
-Description=Claude Code <-> Discord bridge
+Description=Claude Code <-> Chat bridge (Discord/Mattermost)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=BRIDGE_PLATFORM=discord
 ExecStart=%h/.local/bin/cc-bridge serve
 Restart=on-failure
 RestartSec=5s
