@@ -4,7 +4,7 @@ from pathlib import Path
 
 import aiosqlite
 
-DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "claude-discord-bridge" / "state.db"
+DEFAULT_DB_PATH = Path.home() / ".local" / "state" / "cc-bridge" / "state.db"
 
 
 @dataclass(frozen=True)

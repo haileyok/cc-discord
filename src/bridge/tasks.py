@@ -31,9 +31,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Task-scoped settings directory
-TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "cc-bridge" / "task-settings"
 # Per-task attachment directory for files relayed from Discord.
-ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "attachments"
+ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "cc-bridge" / "attachments"
 
 # Hook scripts directory — resolved at import time for test monkeypatch support
 HOOKS_DIR = Path(_bridge_pkg.__file__).parent.parent.parent / "hooks"

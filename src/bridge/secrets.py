@@ -2,14 +2,18 @@ import json
 import logging
 import os
 import stat
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SECRETS_DIR = Path.home() / ".config" / "claude-discord-bridge"
+SECRETS_DIR = Path.home() / ".config" / "cc-bridge"
 SECRETS_FILE = SECRETS_DIR / "secrets.json"
 REQUIRED_KEYS = ("DISCORD_BOT_TOKEN", "DISCORD_CHANNEL_ID")
+
+_OLD_SECRETS_DIR = Path.home() / ".config" / "claude-discord-bridge"
+_OLD_SECRETS_FILE = _OLD_SECRETS_DIR / "secrets.json"
 
 
 class SecretsError(RuntimeError):
@@ -24,20 +28,43 @@ class Secrets:
     channel_id: int
 
 
-def load_secrets(path: Path = SECRETS_FILE) -> Secrets:
+def _resolve_secrets_path() -> Path:
+    """Return the secrets file path, falling back to the old location with a warning."""
+    override = os.environ.get("BRIDGE_SECRETS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if SECRETS_FILE.exists():
+        return SECRETS_FILE
+    if _OLD_SECRETS_FILE.exists():
+        warnings.warn(
+            f"Loading secrets from deprecated path {_OLD_SECRETS_FILE}. "
+            f"Move to {SECRETS_FILE} to silence this warning.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return _OLD_SECRETS_FILE
+    return SECRETS_FILE  # default (will error on read if missing)
+
+
+def load_secrets(path: Path | None = None) -> Secrets:
     """Load secrets from JSON file.
 
     Reads the secrets file, validates required keys are present and non-empty,
     and coerces DISCORD_CHANNEL_ID to int.
 
+    If path is None, resolves the path with fallback to old location.
+
     Raises SecretsError if the file is missing, unreadable, malformed JSON,
     missing keys, or has non-int channel ID. Error messages point users at
-    'claude-discord-bridge init'.
+    'cc-bridge init'.
     """
+    if path is None:
+        path = _resolve_secrets_path()
+
     if not path.exists():
         raise SecretsError(
             f"Secrets file not found at {path}. "
-            f"Run 'claude-discord-bridge init' to create it."
+            f"Run 'cc-bridge init' to create it."
         )
 
     try:
@@ -45,12 +72,12 @@ def load_secrets(path: Path = SECRETS_FILE) -> Secrets:
     except json.JSONDecodeError as e:
         raise SecretsError(
             f"Secrets file at {path} contains invalid JSON: {e}. "
-            f"Run 'claude-discord-bridge init' to recreate it."
+            f"Run 'cc-bridge init' to recreate it."
         ) from e
     except OSError as e:
         raise SecretsError(
             f"Cannot read secrets file at {path}: {e}. "
-            f"Run 'claude-discord-bridge init' to recreate it."
+            f"Run 'cc-bridge init' to recreate it."
         ) from e
 
     # Validate required keys are present and non-empty
@@ -58,14 +85,14 @@ def load_secrets(path: Path = SECRETS_FILE) -> Secrets:
     if not bot_token:
         raise SecretsError(
             f"DISCORD_BOT_TOKEN missing or empty in {path}. "
-            f"Run 'claude-discord-bridge init' to set it."
+            f"Run 'cc-bridge init' to set it."
         )
 
     channel_id_val = data.get("DISCORD_CHANNEL_ID")
     if channel_id_val is None or channel_id_val == "":
         raise SecretsError(
             f"DISCORD_CHANNEL_ID missing or empty in {path}. "
-            f"Run 'claude-discord-bridge init' to set it."
+            f"Run 'cc-bridge init' to set it."
         )
 
     try:
@@ -73,7 +100,7 @@ def load_secrets(path: Path = SECRETS_FILE) -> Secrets:
     except (ValueError, TypeError) as e:
         raise SecretsError(
             f"DISCORD_CHANNEL_ID must be a number; got {channel_id_val!r} in {path}. "
-            f"Run 'claude-discord-bridge init' to fix it."
+            f"Run 'cc-bridge init' to fix it."
         ) from e
 
     logger.info("loaded secrets from %s", path)
