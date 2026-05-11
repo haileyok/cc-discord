@@ -10,7 +10,8 @@ from typing import Any
 import pytest
 
 from bridge.tasks import TaskRegistry
-from tests.fakes import FakeBot, FakeZellij
+from tests.backends.discord.fakes import FakeDiscordBot
+from tests.fakes import FakeZellij
 
 
 @dataclass
@@ -57,8 +58,8 @@ class FakeInteraction:
 
 
 @pytest.fixture
-def fake_bot() -> FakeBot:
-    return FakeBot()
+def fake_bot() -> FakeDiscordBot:
+    return FakeDiscordBot()
 
 
 @pytest.fixture

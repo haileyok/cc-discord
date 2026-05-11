@@ -9,12 +9,13 @@ import pytest
 from bridge.state import TaskRow, upsert_task
 from bridge.tasks import Task, TaskRegistry, TaskSpawnError, _ToolSummaryAggregator
 from bridge.zellij import ZellijError, ZellijManager
-from tests.fakes import FakeBot, FakeZellij
+from tests.backends.discord.fakes import FakeDiscordBot
+from tests.fakes import FakeZellij
 
 
 @pytest.fixture
 async def fake_bot():
-    return FakeBot()
+    return FakeDiscordBot()
 
 
 @pytest.fixture
@@ -1943,7 +1944,7 @@ class TestTaskRegistryPhase3:
         # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
 
         now = 1000
         await upsert_task(
@@ -1983,7 +1984,7 @@ class TestTaskRegistryPhase3:
         """write_initial_prompt logs warning if task is missing."""
         # FakeBot and FakeZellij already imported at top
 
-        registry = TaskRegistry(in_memory_db, FakeBot(), FakeZellij())
+        registry = TaskRegistry(in_memory_db, FakeDiscordBot(), FakeZellij())
 
         # Attempt to write to non-existent task
         await registry.write_initial_prompt("nonexistent", "hello")
@@ -2011,7 +2012,7 @@ class TestTaskRegistryPhase3:
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, FakeBot(), fake_zellij)
+        registry = TaskRegistry(in_memory_db, FakeDiscordBot(), fake_zellij)
         await registry.load_from_db()
 
         # Manually set status to stopped
@@ -2047,7 +2048,7 @@ class TestTaskRegistryPhase3:
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, FakeBot(), fake_zellij)
+        registry = TaskRegistry(in_memory_db, FakeDiscordBot(), fake_zellij)
         await registry.load_from_db()
 
         # Manually set status to crashed
@@ -2069,7 +2070,7 @@ class TestTaskRegistryPhase3:
         # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
 
         now = 1000
         await upsert_task(
@@ -2107,7 +2108,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_user_prompt_submit_starts_typing(self, in_memory_db) -> None:
         """_on_user_prompt_submit starts typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2138,7 +2139,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_cancels_typing(self, in_memory_db) -> None:
         """_on_stop cancels the typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2169,7 +2170,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_notification_cancels_typing(self, in_memory_db) -> None:
         """_on_notification cancels the typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2199,7 +2200,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_session_end_cancels_typing(self, in_memory_db) -> None:
         """_on_session_end cancels the typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2229,7 +2230,7 @@ class TestTaskRegistryPhase3:
 
     async def test_typing_context_manager_is_entered_and_exited(self, in_memory_db) -> None:
         """Verify that channel.typing() context manager is actually entered and exited."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2267,7 +2268,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_user_prompt_submit_unknown_session_is_noop(self, in_memory_db) -> None:
         """_on_user_prompt_submit silently drops unknown session IDs."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
@@ -2283,7 +2284,7 @@ class TestTaskRegistryPhase3:
         self, in_memory_db
     ) -> None:
         """Calling _on_user_prompt_submit twice cancels the first typing task."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2322,7 +2323,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_post_tool_use_appends_to_aggregator(self, in_memory_db) -> None:
         """_on_post_tool_use appends formatted summary to aggregator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2356,7 +2357,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_post_tool_use_failure(self, in_memory_db) -> None:
         """_on_post_tool_use_failure appends failure summary and updates task."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2398,7 +2399,7 @@ class TestTaskRegistryPhase3:
 
     async def test_aggregator_coalesces_within_window(self, in_memory_db, monkeypatch) -> None:
         """Multiple PostToolUse events within 1s window produce one post."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2446,7 +2447,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_flushes_aggregator(self, in_memory_db, monkeypatch) -> None:
         """_on_stop immediately flushes the aggregator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2486,7 +2487,7 @@ class TestTaskRegistryPhase3:
 
     async def test_aggregator_preserves_lines_on_cancellation(self, in_memory_db) -> None:
         """_flush_after_window preserves lines if cancelled during bot.post."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
 
         agg = _ToolSummaryAggregator(fake_bot, 999)
         agg._lines = ["✓ Bash: echo test"]
@@ -2552,7 +2553,7 @@ class TestTaskRegistryPhase3:
         """_on_stop streams every assistant text block from the current turn."""
         import json
 
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2626,7 +2627,7 @@ class TestTaskRegistryPhase3:
         """_on_stop does not post when transcript has no assistant text."""
         import json
 
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2674,7 +2675,7 @@ class TestTaskRegistryPhase3:
         """_on_stop flushes tool summaries before posting the final turn."""
         import json
 
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2750,7 +2751,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_handles_missing_transcript_path(self, in_memory_db) -> None:
         """_on_stop does not crash if transcript_path is missing."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2776,7 +2777,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_handles_nonexistent_transcript(self, in_memory_db) -> None:
         """_on_stop does not crash if the transcript file doesn't exist."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2810,7 +2811,7 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -2900,7 +2901,7 @@ async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -2982,7 +2983,7 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3052,7 +3053,7 @@ async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
     """_on_user_prompt_submit cancels pending TUI prompts via sentinel."""
     from bridge.approvals import ApprovalRouter
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3107,7 +3108,7 @@ async def test_on_notification_returns_immediately_with_pending_tui(in_memory_db
     import json
     import time
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3189,7 +3190,7 @@ async def test_kill_task_cancels_pending_tui_handler(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3269,7 +3270,7 @@ async def test_race_cancel_before_request_registers(in_memory_db):
     """Race condition: cancel_thread_tui fires before request_tui_answer registers pending."""
     from bridge.approvals import ApprovalRouter
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
     thread_id = 5001

@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from bridge import state
-from tests.fakes import FakeBot
+from tests.backends.discord.fakes import FakeDiscordBot
 
 
 @pytest.mark.asyncio
@@ -17,7 +17,7 @@ async def test_approval_router_allow_via_reaction(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     # Create a test task first
     await state.upsert_task(
@@ -63,7 +63,7 @@ async def test_approval_router_deny_via_reaction(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-2", 1002, "/tmp", "running")
 
@@ -100,7 +100,7 @@ async def test_approval_router_deny_via_text(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-3", 1003, "/tmp", "running")
 
@@ -133,7 +133,7 @@ async def test_approval_router_timeout(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-4", 1004, "/tmp", "running")
 
@@ -161,7 +161,7 @@ async def test_approval_router_logs_decision(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-5", 1005, "/tmp", "running")
 
@@ -203,7 +203,7 @@ async def test_approval_router_filters_bot_reactions(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-6", 1006, "/tmp", "running")
 
@@ -244,7 +244,7 @@ async def test_approval_router_concurrent_approvals(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-7", 1007, "/tmp", "running")
 
@@ -318,7 +318,7 @@ async def test_resolve_by_text_returns_false_on_empty_input(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-8", 1008, "/tmp", "running")
 
@@ -369,11 +369,11 @@ async def test_resolve_by_text_returns_false_on_empty_input(tmp_path):
 async def test_request_permission_add_reactions_failure(tmp_path):
     """request_permission returns ('deny', 'failed to add approval reactions...') when add_reactions raises."""
     from bridge.approvals import ApprovalRouter
-    from tests.fakes import FakeBot
+    from tests.backends.discord.fakes import FakeDiscordBot
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     # Extend FakeBot to raise on add_reactions
     async def failing_add_reactions(*args: any, **kwargs: any) -> None:
@@ -415,7 +415,7 @@ async def test_request_tui_answer_ask_question_reaction(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-1", 2001, "/tmp", "running")
 
@@ -458,7 +458,7 @@ async def test_request_tui_answer_exit_plan_approve(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-2", 2002, "/tmp", "running")
 
@@ -498,7 +498,7 @@ async def test_request_tui_answer_exit_plan_reject(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-3", 2003, "/tmp", "running")
 
@@ -538,7 +538,7 @@ async def test_request_tui_answer_free_text_reply(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-4", 2004, "/tmp", "running")
 
@@ -574,7 +574,7 @@ async def test_request_tui_answer_timeout(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-5", 2005, "/tmp", "running")
 
@@ -606,7 +606,7 @@ async def test_request_tui_answer_cancelled(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-6", 2006, "/tmp", "running")
 
@@ -646,7 +646,7 @@ async def test_cancel_thread_tui(tmp_path):
 
     db_path = tmp_path / "test.db"
     conn = await state.open_db(db_path)
-    bot = FakeBot()
+    bot = FakeDiscordBot()
 
     await state.upsert_task(conn, "task-7", 2007, "/tmp", "running")
 
