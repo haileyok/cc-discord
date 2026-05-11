@@ -21,8 +21,7 @@ Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3
 
 ### Mattermost-specific
 
-- **WebSocket double-encoding.** Mattermost's WebSocket API can send some payloads twice for high-frequency events (e.g. rapid reactions). The bridge uses message ID deduplication to avoid processing duplicates twice. Check `backends/mattermost/bot.py` for the `_seen_messages` cache.
-- **Emoji name ↔ Unicode mapping.** Mattermost uses emoji names (e.g., `:+1:`) while the bridge internally uses Unicode strings (e.g., `👍`). The mapping is in `backends/mattermost/emoji.py`; keep it in sync if adding new reaction types.
+- **Emoji name ↔ Unicode mapping.** Mattermost uses emoji names (e.g., `+1`) while the bridge internally uses Unicode strings (e.g., `👍`). The mapping is inline in `backends/mattermost/bot.py` (`_emoji_to_mattermost` / `_mattermost_to_emoji`); keep it in sync if adding new reaction types.
 - **Markdown formatting differences.** Mattermost's markdown is slightly different from Discord. The bridge uses `backends/mattermost/formatting.py` to convert Claude's Markdown. Some features like fancy embeds don't map 1:1.
 - **Token-based auth, not intents.** Mattermost uses a Personal Access Token (PAT) in the `Authorization: Bearer <token>` header, not OAuth intents. PATs can be scoped; the minimum scope for the bridge is `post:channels`.
 
@@ -62,7 +61,7 @@ The systemd unit at `packaging/cc-bridge.service` hardcodes `%h/.local/bin/cc-br
 
 ### Platform abstraction
 
-- `src/bridge/platform.py` — `ChatPlatform` protocol defines the interface both Discord and Mattermost backends must implement. Methods: `connect()`, `disconnect()`, `post_message()`, `edit_message()`, `delete_message()`, `add_reaction()`, etc. Structured to allow swapping backends at runtime via `BRIDGE_PLATFORM` env var.
+- `src/bridge/platform.py` — `ChatPlatform` protocol defines the interface both Discord and Mattermost backends must implement. Methods: `connect()`, `disconnect()`, `post_message()`, `edit_message()`, `delete_message()`, `add_reaction()`, etc. Structured to allow swapping backends at runtime via `BRIDGE_PLATFORM` env var. All IDs (`thread_id`, `message_id`) are `str` at the protocol boundary — Discord's backend converts to/from `int` internally.
 
 ### Server and state
 
@@ -75,15 +74,18 @@ The systemd unit at `packaging/cc-bridge.service` hardcodes `%h/.local/bin/cc-br
 ### Task and command handling
 
 - `src/bridge/tasks.py` — `TaskRegistry` for chat-driven sessions. Owns task lifecycle, hook-event dispatch, typing/tool-summary/transcript relay, startup reconciliation against zellij. Platform-agnostic.
-- `src/bridge/commands.py` — Discord slash-command tree (discord.py dispatcher).
-- `src/bridge/backends/mattermost/commands.py` — Mattermost command handler (HTTP endpoint + text command parser).
+- `src/bridge/command_handlers.py` — Shared command logic (start, stop, rename, restart, stats, etc.) used by both backend command dispatchers.
+- `src/bridge/backends/discord/commands.py` — Discord slash-command tree (discord.py `app_commands` dispatcher). Delegates to `command_handlers`.
+- `src/bridge/backends/mattermost/commands.py` — Mattermost command handler (text command parser). Delegates to `command_handlers`.
 
 ### Backend implementations
 
 - `src/bridge/backends/discord/bot.py` — `discord.py` wrapper. `DiscordBot` implements `ChatPlatform`. `_chunk()` and `_extract_images()` are lifted verbatim from `/home/discord/victrola/src/discord_bot/bot.py` — keep them in sync if upstream changes. `_with_retry` wraps every `fetch_channel` / `target.send` call with bounded backoff (4 attempts) on `DiscordServerError` / `ClientConnectionError` so transient Discord 5xx waves don't drop user-facing posts (incl. AskUserQuestion notifications).
 - `src/bridge/backends/mattermost/bot.py` — `MattermostBot` implements `ChatPlatform`. WebSocket client + REST API wrapper. Handles incoming events (messages, reactions) and outgoing posts/edits.
-- `src/bridge/backends/mattermost/emoji.py` — Emoji name ↔ Unicode mapping for reaction handling.
 - `src/bridge/backends/mattermost/formatting.py` — Markdown formatting converter (Claude Markdown → Mattermost Markdown).
+- `src/bridge/backends/mattermost/rich_formatter.py` — `MattermostRichFormatter`: renders rich content (task lists, subagent blocks, todos) as Mattermost markdown.
+- `src/bridge/backends/mattermost/ws.py` — WebSocket client for Mattermost real-time events.
+- `src/bridge/backends/mattermost/api.py` — REST API wrapper for Mattermost HTTP endpoints.
 
 ### Common utilities
 

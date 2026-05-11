@@ -2868,7 +2868,25 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     registry._PRE_PROMPT_FLUSH_SECS = 0.0
     await registry.load_from_db()
 
-    # Trigger notification (returns immediately, spawns handler task)
+    # Trigger PreToolUse (spawns the structured AskUserQuestion handler)
+    await registry._on_pre_tool_use({
+        "session_id": "12345678-1234-5678-1234-567812345678",
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu_ask",
+        "tool_input": {
+            "questions": [
+                {
+                    "question": "Which option?",
+                    "options": [
+                        {"label": "A", "description": "Option A"},
+                        {"label": "B", "description": "Option B"},
+                    ],
+                }
+            ]
+        },
+    })
+
+    # Notification arrives after PreToolUse; should no-op since handler is already in flight
     await registry._on_notification({
         "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
@@ -2877,10 +2895,10 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     # Brief wait for handler to register the pending TUI
     await asyncio.sleep(0.05)
 
-    # Verify post was made (generic notification without question content)
+    # Verify post was made with structured question content
     posts = fake_bot.get_post_calls()
     assert len(posts) > 0
-    assert "waiting for input" in posts[0]["content"].lower()
+    assert "Which option?" in posts[0]["content"]
 
     # Now resolve the TUI by reaction (option 1 = emoji "1️⃣")
     message_id = approval_router._tui_by_message_id
@@ -2950,7 +2968,17 @@ async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
     registry._PRE_PROMPT_FLUSH_SECS = 0.0
     await registry.load_from_db()
 
-    # Trigger notification (returns immediately, spawns handler task)
+    # Trigger PreToolUse (spawns the structured ExitPlanMode handler)
+    await registry._on_pre_tool_use({
+        "session_id": "12345678-1234-5678-1234-567812345678",
+        "tool_name": "ExitPlanMode",
+        "tool_use_id": "toolu_exit",
+        "tool_input": {
+            "plan": "## Step 1\n## Step 2",
+        },
+    })
+
+    # Notification arrives after PreToolUse; should no-op since handler is already in flight
     await registry._on_notification({
         "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
@@ -3039,7 +3067,7 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
     assert "waiting for input" in posts[0]["content"]
 
     # Resolve by text reply
-    resolved = await approval_router.resolve_tui_by_text(3003, "my answer", author_is_bot=False)
+    resolved = await approval_router.resolve_tui_by_text("3003", "my answer", author_is_bot=False)
     assert resolved is True
 
     # Grab and await the handler task
@@ -3080,7 +3108,7 @@ async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
         answer, source = await approval_router.request_tui_answer(
             request_id="req-tui-test",
             task_id="task-tui-4",
-            thread_id=3004,
+            thread_id="3004",
             pane_id="pane_4",
             kind="free_text",
             prompt_body="Waiting...",
