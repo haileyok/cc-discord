@@ -8,6 +8,7 @@ dependencies = [
     "aiosqlite>=0.21",
     "click>=8.1",
     "discord.py>=2.4",
+    "websockets>=14",
 ]
 
 [project.scripts]
