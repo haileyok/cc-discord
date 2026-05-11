@@ -502,7 +502,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     logger.info("listening on http://%s:%d", host, port)
 
     # Build and sync the slash command tree
-    from bridge.commands import build_tree
+    from bridge.backends.discord.commands import build_tree
 
     tree = build_tree(bot, task_registry)
     # Wait for bot to be ready before syncing commands
