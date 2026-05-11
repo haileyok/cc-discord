@@ -1,0 +1,13 @@
+services:
+  cc-bridge:
+    build: .
+    image: cc-bridge:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${BRIDGE_PORT:-8787}:8787"
+    volumes:
+      - ${CLAUDE_HOME_DIR:-/opt/cc-bridge/claude-home}:/home/claude/.claude
+      - ${BRIDGE_CONFIG_DIR:-/opt/cc-bridge/config}:/home/claude/.config/cc-bridge
+      - ${BRIDGE_STATE_DIR:-/opt/cc-bridge/state}:/home/claude/.local/state/cc-bridge
+      - ${WORKSPACE_DIR:-/opt/cc-bridge/workspace}:/workspace
