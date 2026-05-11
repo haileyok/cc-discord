@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 
 from bridge import voice
-from bridge.backends.mattermost.api import MattermostAPI, RateLimitError, MAX_MESSAGE_LENGTH
+from bridge.backends.mattermost.api import MattermostAPI, RateLimitError
 from bridge.backends.mattermost.ws import MattermostWebSocket
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,8 @@ class MattermostBot:
         on_reaction: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         allowed_user_ids: list[str] | None = None,
     ) -> None:
+        self._server_url = server_url
+        self._token = token
         self._api = MattermostAPI(server_url, token)
         self._channel_id = channel_id
         self._on_message = on_message
@@ -52,7 +54,7 @@ class MattermostBot:
         me = await self._api.get_me()
         self._bot_user_id = me["id"]
         self._ws = MattermostWebSocket(
-            self._api.base_url, self._api._token, self._handle_event
+            self._server_url, self._token, self._handle_event
         )
         await self._ws.start()
         self._ready = True
