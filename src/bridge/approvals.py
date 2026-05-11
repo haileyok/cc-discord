@@ -19,7 +19,7 @@ from typing import Any
 import aiosqlite
 
 from bridge import state
-from bridge.bot import Bot
+from bridge.platform import ChatPlatform
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ class _PendingTuiAnswer:
 class ApprovalRouter:
     def __init__(
         self,
-        bot: Bot | None,
+        bot: ChatPlatform | None,
         conn: aiosqlite.Connection,
         *,
         timeout: float = DEFAULT_APPROVAL_TIMEOUT,
@@ -88,7 +88,7 @@ class ApprovalRouter:
     ) -> None:
         # `bot` may be None at construction time (server.serve constructs the
         # router before the Bot exists, then calls `bind_bot` once it does)
-        # — this avoids a chicken-and-egg between Bot's reaction callback and
+        # — this avoids a chicken-and-egg between ChatPlatform's reaction callback and
         # the router that callback dispatches to.
         self._bot = bot
         self._conn = conn
@@ -102,9 +102,9 @@ class ApprovalRouter:
         self._recently_cancelled_threads: dict[str, float] = {}  # thread_id -> cancel_timestamp
         self._lock = asyncio.Lock()
 
-    def bind_bot(self, bot: Bot) -> None:
-        """Attach the Bot instance after construction. Called once by
-        `server.serve` after the Bot is created."""
+    def bind_bot(self, bot: ChatPlatform) -> None:
+        """Attach the ChatPlatform instance after construction. Called once by
+        `server.serve` after the platform is created."""
         self._bot = bot
 
     async def request_permission(

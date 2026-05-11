@@ -15,7 +15,7 @@ from pathlib import Path
 import click
 
 import bridge
-from bridge.bot import Bot
+from bridge.backends.discord.bot import DiscordBot
 from bridge.secrets import SECRETS_FILE, SecretsError, load_secrets, write_secrets, Secrets, secrets_file_perms
 from bridge.server import serve as serve_server
 from bridge.zellij import SESSION_NAME as ZELLIJ_SESSION_NAME
@@ -27,12 +27,12 @@ _TOKEN_VALIDATION_TIMEOUT = 15
 
 
 async def _validate_token_and_post_test(secrets: Secrets) -> bool:
-    """Validate token by starting bot and posting a test message.
+    """Validate token by starting Discord bot and posting a test message.
 
     Returns True if validation succeeds (bot ready and message posted).
     Returns False if timeout waiting for bot to become ready.
     """
-    bot = Bot(secrets.bot_token, secrets.channel_id)
+    bot = DiscordBot(secrets.bot_token, secrets.channel_id)
     try:
         await bot.start()
 

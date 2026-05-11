@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 
 from bridge import skills, usage
-from bridge.bot import Bot
+from bridge.backends.discord.bot import DiscordBot
 from bridge.tasks import Task, TaskNotFound, TaskRegistry, TaskRestartError, TaskSpawnError
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ class _NotInTaskThread(Exception):
     pass
 
 
-def build_tree(bot: Bot, registry: TaskRegistry) -> app_commands.CommandTree:
+def build_tree(bot: DiscordBot, registry: TaskRegistry) -> app_commands.CommandTree:
     """Construct and return the CommandTree (not yet synced; caller decides when)."""
     tree = app_commands.CommandTree(bot.client)
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import aiosqlite
 
 from bridge import state
+from bridge.platform import ChatPlatform
 
 
 class ThreadRegistry:
@@ -17,11 +18,11 @@ class ThreadRegistry:
     same session are rare, so contention is acceptable.
     """
 
-    def __init__(self, bot, conn: aiosqlite.Connection) -> None:
+    def __init__(self, bot: ChatPlatform, conn: aiosqlite.Connection) -> None:
         """Initialize the registry with a bot and database connection.
 
         Args:
-            bot: Bot instance with create_thread() and thread_alive() methods.
+            bot: ChatPlatform instance with create_thread() and thread_alive() methods.
             conn: Open aiosqlite.Connection to the sessions table.
         """
         self._bot = bot

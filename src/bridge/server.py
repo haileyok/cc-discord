@@ -8,12 +8,13 @@ import signal
 import time
 from datetime import datetime, timezone
 
-import discord
 from aiohttp import web
 
 from bridge.approvals import ApprovalRouter
-from bridge.bot import Bot, BotNotReady
+from bridge.backends.discord import DiscordBot, DiscordRichFormatter
+from bridge.backends.discord.bot import BotNotReady
 from bridge.listener import Listener, _PendingAsk
+from bridge.platform import ChatPlatform
 from bridge.secrets import Secrets
 from bridge import tasks as tasks_module
 from bridge.tasks import TaskRegistry
@@ -80,7 +81,7 @@ class AskLockMap:
 
 
 # Typed AppKey definitions to avoid NotAppKeyWarning
-BOT_KEY: web.AppKey[Bot] = web.AppKey("bot", Bot)
+BOT_KEY: web.AppKey[ChatPlatform] = web.AppKey("bot", object)  # Runtime type is DiscordBot
 THREADS_KEY: web.AppKey[ThreadRegistry] = web.AppKey("threads", ThreadRegistry)
 LISTENER_KEY: web.AppKey[Listener] = web.AppKey("listener", Listener)
 ASK_LOCKS_KEY: web.AppKey[AskLockMap] = web.AppKey("ask_locks", AskLockMap)
@@ -432,10 +433,10 @@ def make_message_dispatcher(
     return _dispatch_message
 
 
-async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
+async def build_app(platform: ChatPlatform, *, started_at: float | None = None) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
-    app[BOT_KEY] = bot
+    app[BOT_KEY] = platform
     app[STARTED_AT_KEY] = started_at if started_at is not None else time.monotonic()
     app.router.add_post("/v1/notify", _handle_notify)
     app.router.add_post("/v1/ask", _handle_ask)
@@ -451,6 +452,8 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     Binds to host:port, starts the Discord bot, and runs until SIGTERM/SIGINT.
     Opens the database for session persistence and instantiates ThreadRegistry.
     """
+    import discord
+
     listener = Listener()
     zellij = ZellijManager()
     await zellij.ensure_session_alive()
@@ -461,11 +464,11 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     await task_registry.load_from_db(reconcile_with_zellij=True)
 
     # Dispatcher closures call into approval_router/task_registry; both are
-    # available now. The Bot is constructed after these closures because Bot's
+    # available now. The DiscordBot is constructed after these closures because DiscordBot's
     # constructor wires the callbacks up to discord.py event handlers.
     _dispatch_message = make_message_dispatcher(approval_router, task_registry, listener)
 
-    bot_holder: dict[str, Bot] = {}
+    bot_holder: dict[str, DiscordBot] = {}
 
     async def _on_reaction_dispatch(payload: discord.RawReactionActionEvent) -> None:
         """Dispatch raw reaction events to approval and TUI resolvers."""
@@ -476,11 +479,13 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
             return
         await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
 
-    bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
+    bot = DiscordBot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
     bot_holder["bot"] = bot
+    formatter = DiscordRichFormatter(bot)
 
     approval_router.bind_bot(bot)
     task_registry.bind_bot(bot)
+    task_registry.bind_formatter(formatter)
     registry = ThreadRegistry(bot, conn)
     app = await build_app(bot)
     app[THREADS_KEY] = registry

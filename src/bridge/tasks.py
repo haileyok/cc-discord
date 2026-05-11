@@ -19,14 +19,14 @@ import discord
 
 import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
-from bridge.bot import BotNotReady
+from bridge.backends.discord.bot import BotNotReady
 from bridge.listener import MessageLike
+from bridge.platform import ChatPlatform, RichFormatter
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
 
 if TYPE_CHECKING:
     from bridge.approvals import ApprovalRouter
-    from bridge.bot import Bot
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +437,7 @@ class TaskRegistry:
     def __init__(
         self,
         conn: aiosqlite.Connection,
-        bot: "Bot | None",
+        bot: ChatPlatform | None,
         zellij: ZellijManager,
         approval_router: "ApprovalRouter | None" = None,
     ) -> None:
@@ -450,6 +450,7 @@ class TaskRegistry:
         """
         self._conn = conn
         self._bot = bot
+        self._formatter: RichFormatter | None = None
         self._zellij = zellij
         self._approval_router = approval_router
         self._by_task_id: dict[str, Task] = {}
@@ -468,10 +469,15 @@ class TaskRegistry:
         # flush_startup_notices() once the bot is ready.
         self._pending_startup_notices: list[dict] = []
 
-    def bind_bot(self, bot: "Bot") -> None:
+    def bind_bot(self, bot: ChatPlatform) -> None:
         """Attach the Bot instance after construction. Called once by
         `server.serve` after the Bot is created."""
         self._bot = bot
+
+    def bind_formatter(self, formatter: RichFormatter) -> None:
+        """Attach the RichFormatter instance. Called once by `server.serve`
+        after the formatter is created."""
+        self._formatter = formatter
 
     @staticmethod
     def _notify_mention_prefix() -> str:
@@ -1347,11 +1353,12 @@ class TaskRegistry:
             try:
                 channel = await self._bot.fetch_messageable(task.thread_id)
                 last_id = getattr(channel, "last_message_id", None)
-                if last_id == task.last_task_list_message_id:
-                    await self._bot.edit_message(
+                if last_id == task.last_task_list_message_id and self._formatter:
+                    await self._formatter.edit_rich(
                         task.thread_id,
                         task.last_task_list_message_id,
-                        embed=embed,
+                        "task_list",
+                        {"embed": embed},
                     )
                     return
             except BotNotReady:
@@ -1363,8 +1370,10 @@ class TaskRegistry:
                 )
 
         try:
-            task.last_task_list_message_id = await self._bot.post_embed(
-                embed, thread_id=task.thread_id
+            if not self._formatter:
+                return
+            task.last_task_list_message_id = await self._formatter.post_rich(
+                task.thread_id, "task_list", {"embed": embed}
             )
         except BotNotReady:
             return
@@ -1821,8 +1830,10 @@ class TaskRegistry:
             # refresh re-try as if fresh, instead of leaving a zombie block
             # whose `message_id is None` blocks future edits.
             try:
-                block.message_id = await self._bot.post_embed(
-                    embed, thread_id=task.thread_id
+                if not self._formatter:
+                    return
+                block.message_id = await self._formatter.post_rich(
+                    task.thread_id, "subagent_block", {"embed": embed}
                 )
             except BotNotReady:
                 logger.info(
@@ -1856,8 +1867,10 @@ class TaskRegistry:
             block, last_actions, total_actions, finished
         )
         try:
-            await self._bot.edit_message(
-                task.thread_id, block.message_id, embed=embed
+            if not self._formatter:
+                return
+            await self._formatter.edit_rich(
+                task.thread_id, block.message_id, "subagent_block", {"embed": embed}
             )
         except Exception:
             logger.exception(
