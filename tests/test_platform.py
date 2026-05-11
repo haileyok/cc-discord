@@ -12,25 +12,9 @@ from tests.fakes import FakePlatform
 
 
 def test_fake_platform_implements_protocol() -> None:
-    """Verify FakePlatform implements all ChatPlatform protocol methods."""
-    # Get all methods from the ChatPlatform protocol
-    platform_methods = {
-        name
-        for name, method in inspect.getmembers(ChatPlatform, predicate=inspect.isfunction)
-        if not name.startswith("_")
-    }
-    protocol_attrs = {
-        name
-        for name in dir(ChatPlatform)
-        if not name.startswith("_") and not inspect.ismethod(getattr(ChatPlatform, name))
-    }
-
-    # FakePlatform should implement all protocol members
+    """Verify FakePlatform satisfies ChatPlatform protocol via runtime_checkable."""
     fake = FakePlatform()
-    for attr in ["is_ready", "start", "close", "post", "post_with_attachments",
-                 "create_thread", "archive_thread", "rename_thread", "thread_alive",
-                 "download_attachment", "add_reactions", "edit_message", "fetch_messageable"]:
-        assert hasattr(fake, attr), f"FakePlatform missing {attr}"
+    assert isinstance(fake, ChatPlatform)
 
 
 @pytest.mark.asyncio

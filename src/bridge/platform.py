@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
+@runtime_checkable
 class ChatPlatform(Protocol):
     """Protocol for chat platform backends (Discord, Mattermost, etc.).
 
