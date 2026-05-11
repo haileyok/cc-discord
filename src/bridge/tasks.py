@@ -791,7 +791,10 @@ class TaskRegistry:
         # `env K=V ...`. `tab_name` matches what we'll use to address the
         # tab via `go-to-tab-name` later.
         tab_name = f"cc-{task_id[:8]}"
-        claude_argv = ["--settings", str(settings_path)]
+        claude_argv = [
+            "--settings", str(settings_path),
+            "--dangerously-skip-permissions",
+        ]
         layout_path = _write_task_layout(
             task_id,
             env=env,
