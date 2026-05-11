@@ -709,10 +709,10 @@ class TaskRegistry:
         """Run typing indicator in background. Lives until cancelled."""
         try:
             channel = await self._bot.fetch_messageable(task.thread_id)
+            if not hasattr(channel, "typing"):
+                return
             async with channel.typing():
-                # Sleep until cancelled (Stop/Notification cancels us). Discord.py auto-renews
-                # the indicator every 5s under the hood; we just need the context to stay open.
-                await asyncio.Future()  # never resolves; we live until cancelled
+                await asyncio.Future()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -746,10 +746,10 @@ class TaskRegistry:
         8. Indexes the task in memory.
         9. Returns the Task.
 
-        The `prompt` parameter is accepted but not used here — the slash-command
-        layer in `commands.py` waits for SessionStart binding and then calls
-        `write_initial_prompt` separately, since the pane isn't writable until
-        the per-task settings file is loaded by claude.
+        When `prompt` is provided, it's baked into the KDL layout as `-p <prompt>`
+        so claude starts in non-interactive mode and fires SessionStart immediately.
+        This avoids depending on zellij `write-chars` (which requires an attached
+        client to deliver keystrokes — not available in headless Docker deployments).
 
         Raises TaskSpawnError if cwd is not a directory or zellij spawn fails.
         """
@@ -789,10 +789,13 @@ class TaskRegistry:
         # `env K=V ...`. `tab_name` matches what we'll use to address the
         # tab via `go-to-tab-name` later.
         tab_name = f"cc-{task_id[:8]}"
+        claude_argv = ["--settings", str(settings_path)]
+        if prompt:
+            claude_argv.extend(["-p", prompt])
         layout_path = _write_task_layout(
             task_id,
             env=env,
-            claude_argv=["--settings", str(settings_path)],
+            claude_argv=claude_argv,
             tab_name=tab_name,
         )
 

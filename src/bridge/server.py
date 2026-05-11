@@ -492,14 +492,22 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
         formatter = DiscordRichFormatter(bot)
 
     elif platform == "mattermost":
-        from bridge.backends.mattermost.bot import MattermostBot
+        from bridge.backends.mattermost.bot import MattermostBot, MattermostMessageAdapter
         from bridge.backends.mattermost.rich_formatter import MattermostRichFormatter
 
         bot_holder_mm: dict[str, MattermostBot] = {}
 
         async def _on_message_dispatch_mm(msg: dict[str, str]) -> None:
-            """Dispatch Mattermost messages (passed as dict)."""
-            await _dispatch_message(msg)
+            """Dispatch Mattermost messages (passed as dict).
+
+            Wraps the raw dict in a MattermostMessageAdapter so the
+            platform-agnostic dispatcher can access .channel.id, .content,
+            .author.bot without crashing.
+            """
+            bot_self = bot_holder_mm.get("bot")
+            bot_uid = bot_self._bot_user_id if bot_self else None
+            adapted = MattermostMessageAdapter(msg, bot_user_id=bot_uid)
+            await _dispatch_message(adapted)
 
         async def _on_reaction_dispatch_mm(reaction: dict[str, str]) -> None:
             """Dispatch Mattermost reactions to approval router."""

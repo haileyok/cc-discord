@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -22,6 +23,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CHUNK_LIMIT = 3500  # soft limit, well under the 16383 hard limit
+
+
+class MattermostMessageAdapter:
+    """Wraps a Mattermost post dict to satisfy the MessageLike protocol.
+
+    Lets the platform-agnostic dispatcher and task router use attribute
+    access (.channel.id, .content, .author.bot, .attachments) without
+    knowing the message came from Mattermost.
+    """
+
+    class _Channel:
+        __slots__ = ("id",)
+        def __init__(self, thread_id: str) -> None:
+            self.id = thread_id
+
+    class _Author:
+        __slots__ = ("bot",)
+        def __init__(self, *, is_bot: bool) -> None:
+            self.bot = is_bot
+
+    __slots__ = ("channel", "content", "author", "attachments", "created_at", "id")
+
+    def __init__(self, post: dict[str, Any], *, bot_user_id: str | None = None) -> None:
+        thread_id = post.get("root_id") or post.get("id", "")
+        self.channel = self._Channel(thread_id)
+        self.content = post.get("message", "")
+        self.author = self._Author(is_bot=(post.get("user_id") == bot_user_id))
+        self.attachments = []
+        self.id = post.get("id")
+        create_at = post.get("create_at")
+        if create_at:
+            self.created_at = datetime.fromtimestamp(create_at / 1000, tz=timezone.utc)
+        else:
+            self.created_at = datetime.now(tz=timezone.utc)
 
 
 class MattermostBot:

@@ -97,17 +97,9 @@ async def handle_start(
     from bridge.tasks import TaskSpawnError
 
     try:
-        task = await registry.spawn_task(cwd=cwd, prompt=None)
+        task = await registry.spawn_task(cwd=cwd, prompt=prompt)
     except TaskSpawnError as e:
         return CommandResult(success=False, message=f"❌ {e}")
-
-    # If a prompt was provided, wait for SessionStart to bind, then write it.
-    if prompt:
-        try:
-            await _wait_for_session_bind(registry, task.task_id, timeout=10.0)
-            await registry.write_initial_prompt(task.task_id, prompt)
-        except asyncio.TimeoutError:
-            logger.warning("task %s did not bind within 10s", task.task_id)
 
     return CommandResult(
         success=True,
