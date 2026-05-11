@@ -832,27 +832,11 @@ class TestInitCommandWithPlatform:
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
 
-        # Mock Mattermost validation to avoid actual API calls
-        mock_session = MagicMock()
-        mock_resp_me = MagicMock()
-        mock_resp_me.status = 200
-        mock_resp_me.json = MagicMock(return_value={"id": "bot123", "username": "cc-bridge"})
+        # Mock asyncio.run to skip the network validation step
+        async def mock_validate():
+            pass
 
-        mock_resp_chan = MagicMock()
-        mock_resp_chan.status = 200
-        mock_resp_chan.json = MagicMock(return_value={"id": "chan123", "display_name": "Test Channel"})
-
-        async def mock_get(url):
-            if "/users/me" in url:
-                return mock_resp_me
-            elif "/channels/" in url:
-                return mock_resp_chan
-            return mock_resp_me
-
-        # Use async context manager mock
-        mock_session.__aenter__ = MagicMock(return_value=mock_session)
-        mock_session.__aexit__ = MagicMock(return_value=None)
-        mock_session.get = MagicMock(return_value=MagicMock(__aenter__=MagicMock(return_value=mock_resp_me), __aexit__=MagicMock(return_value=None)))
+        monkeypatch.setattr("asyncio.run", lambda coro: None)
 
         runner = CliRunner()
         result = runner.invoke(
@@ -860,28 +844,32 @@ class TestInitCommandWithPlatform:
             input="https://mm.example.com\nbot_token_xyz\nchannel_id_123\nall\n"
         )
 
-        # Check that prompts were shown
-        if result.exit_code == 0:
-            assert secrets_file.exists()
-            data = json.loads(secrets_file.read_text())
-            assert data.get("platform") == "mattermost"
+        # Check that the command succeeded and wrote secrets
+        assert result.exit_code == 0, f"Command failed: {result.output}"
+        assert secrets_file.exists()
+        data = json.loads(secrets_file.read_text())
+        assert data.get("platform") == "mattermost"
 
     def test_init_platform_mattermost_allowed_user_ids_optional(self, tmp_path: Path, monkeypatch) -> None:
         """init --platform mattermost allows 'all' for allowed_user_ids or comma-separated list."""
         secrets_file = tmp_path / "secrets.json"
         monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
 
-        # For this test, we just check the prompts are correct
+        # Mock asyncio.run to skip the network validation step
+        monkeypatch.setattr("asyncio.run", lambda coro: None)
+
         runner = CliRunner()
         result = runner.invoke(
             cli, ["init", "--platform", "mattermost"],
-            input="https://mm.example.com\nbot_token_xyz\nchannel_id_123\nall\n",
-            catch_exceptions=False
+            input="https://mm.example.com\nbot_token_xyz\nchannel_id_123\nall\n"
         )
 
-        # Should complete without exit code 0 due to mock issues, but verify
-        # that the command at least tried to run
-        assert "Mattermost" in result.output or "mattermost" in result.output.lower() or result.exit_code != 0
+        # Should complete successfully
+        assert result.exit_code == 0, f"Command failed: {result.output}"
+        assert secrets_file.exists()
+        data = json.loads(secrets_file.read_text())
+        # When 'all' is passed, allowed_user_ids should be None
+        assert data.get("allowed_user_ids") is None
 
 
 # Tests for Task 3: Doctor checks for platform-specific issues

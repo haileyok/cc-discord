@@ -502,9 +502,22 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
             await _dispatch_message(msg)
 
         async def _on_reaction_dispatch_mm(reaction: dict[str, str]) -> None:
-            """Dispatch Mattermost reactions."""
-            # Mattermost reactions are different; handle appropriately
-            pass
+            """Dispatch Mattermost reactions to approval router."""
+            bot_self = bot_holder_mm.get("bot")
+            if not bot_self:
+                return
+            # Extract reaction fields: post_id, user_id, emoji
+            post_id = reaction.get("post_id")
+            user_id = reaction.get("user_id")
+            emoji = reaction.get("emoji")
+            if not all([post_id, user_id, emoji]):
+                return
+            # Determine if reaction is from the bot itself
+            user_is_self_bot = user_id == bot_self._bot_user_id
+            # Route through approval router
+            if await approval_router.resolve_by_reaction(post_id, emoji, user_is_self_bot):
+                return
+            await approval_router.resolve_tui_by_reaction(post_id, emoji, user_is_self_bot)
 
         bot = MattermostBot(
             secrets.server_url,

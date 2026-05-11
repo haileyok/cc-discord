@@ -544,7 +544,8 @@ def doctor() -> None:
         click.echo(f"[warn] claude CLI — error: {e}", err=True)
         warned = True
 
-    # Determine platform and run platform-specific checks
+    # Load secrets once and determine platform
+    secrets = None
     platform_from_secrets = None
     if secrets_path.exists():
         try:
@@ -559,100 +560,82 @@ def doctor() -> None:
     # Platform-specific checks
     if platform == "discord":
         # Check 11: Discord channel_id is valid integer
-        if secrets_path.exists():
-            try:
-                secrets = load_secrets(path=secrets_path)
-                if isinstance(secrets.channel_id, int):
+        if secrets:
+            if isinstance(secrets.channel_id, int):
+                click.echo(f"[ok] Discord channel_id — {secrets.channel_id}")
+            else:
+                try:
+                    int(secrets.channel_id)
                     click.echo(f"[ok] Discord channel_id — {secrets.channel_id}")
-                else:
-                    try:
-                        int(secrets.channel_id)
-                        click.echo(f"[ok] Discord channel_id — {secrets.channel_id}")
-                    except (ValueError, TypeError):
-                        click.echo(f"[fail] Discord channel_id — not a valid integer", err=True)
-                        failed = True
-            except SecretsError:
-                pass
+                except (ValueError, TypeError):
+                    click.echo(f"[fail] Discord channel_id — not a valid integer", err=True)
+                    failed = True
 
     elif platform == "mattermost":
-        # Check 11: Mattermost server reachable
-        if secrets_path.exists():
-            try:
-                secrets = load_secrets(path=secrets_path)
-                if secrets.server_url:
-                    try:
-                        ping_url = f"{secrets.server_url.rstrip('/')}/api/v4/system/ping"
-                        req = urllib.request.Request(ping_url)
-                        response = urllib.request.urlopen(req, timeout=2)
-                        if response.status == 200:
-                            click.echo(f"[ok] Mattermost server — {secrets.server_url} reachable")
-                        else:
-                            click.echo(f"[fail] Mattermost server — {secrets.server_url} returned status {response.status}", err=True)
-                            failed = True
-                    except Exception as e:
-                        click.echo(f"[fail] Mattermost server — {secrets.server_url} unreachable ({type(e).__name__})", err=True)
+        if secrets:
+            # Check 11: Mattermost server reachable
+            if secrets.server_url:
+                try:
+                    ping_url = f"{secrets.server_url.rstrip('/')}/api/v4/system/ping"
+                    req = urllib.request.Request(ping_url)
+                    response = urllib.request.urlopen(req, timeout=2)
+                    if response.status == 200:
+                        click.echo(f"[ok] Mattermost server — {secrets.server_url} reachable")
+                    else:
+                        click.echo(f"[fail] Mattermost server — {secrets.server_url} returned status {response.status}", err=True)
                         failed = True
-            except SecretsError:
-                pass
+                except Exception as e:
+                    click.echo(f"[fail] Mattermost server — {secrets.server_url} unreachable ({type(e).__name__})", err=True)
+                    failed = True
 
-        # Check 12: Mattermost bot token valid
-        if secrets_path.exists():
-            try:
-                secrets = load_secrets(path=secrets_path)
-                if secrets.server_url and secrets.bot_token:
-                    try:
-                        headers = {"Authorization": f"Bearer {secrets.bot_token}"}
-                        req = urllib.request.Request(
-                            f"{secrets.server_url.rstrip('/')}/api/v4/users/me",
-                            headers=headers
-                        )
-                        response = urllib.request.urlopen(req, timeout=2)
-                        if response.status == 200:
-                            data = json.loads(response.read().decode("utf-8"))
-                            username = data.get("username", "unknown")
-                            click.echo(f"[ok] Mattermost bot token — authenticated as {username}")
-                        elif response.status == 401:
-                            click.echo(f"[fail] Mattermost bot token — invalid (401 Unauthorized)", err=True)
-                            failed = True
-                        else:
-                            click.echo(f"[fail] Mattermost bot token — status {response.status}", err=True)
-                            failed = True
-                    except Exception as e:
-                        click.echo(f"[fail] Mattermost bot token — error ({type(e).__name__})", err=True)
+            # Check 12: Mattermost bot token valid
+            if secrets.server_url and secrets.bot_token:
+                try:
+                    headers = {"Authorization": f"Bearer {secrets.bot_token}"}
+                    req = urllib.request.Request(
+                        f"{secrets.server_url.rstrip('/')}/api/v4/users/me",
+                        headers=headers
+                    )
+                    response = urllib.request.urlopen(req, timeout=2)
+                    if response.status == 200:
+                        data = json.loads(response.read().decode("utf-8"))
+                        username = data.get("username", "unknown")
+                        click.echo(f"[ok] Mattermost bot token — authenticated as {username}")
+                    elif response.status == 401:
+                        click.echo(f"[fail] Mattermost bot token — invalid (401 Unauthorized)", err=True)
                         failed = True
-            except SecretsError:
-                pass
+                    else:
+                        click.echo(f"[fail] Mattermost bot token — status {response.status}", err=True)
+                        failed = True
+                except Exception as e:
+                    click.echo(f"[fail] Mattermost bot token — error ({type(e).__name__})", err=True)
+                    failed = True
 
-        # Check 13: Mattermost channel accessible
-        if secrets_path.exists():
-            try:
-                secrets = load_secrets(path=secrets_path)
-                if secrets.server_url and secrets.bot_token and secrets.channel_id:
-                    try:
-                        headers = {"Authorization": f"Bearer {secrets.bot_token}"}
-                        req = urllib.request.Request(
-                            f"{secrets.server_url.rstrip('/')}/api/v4/channels/{secrets.channel_id}",
-                            headers=headers
-                        )
-                        response = urllib.request.urlopen(req, timeout=2)
-                        if response.status == 200:
-                            data = json.loads(response.read().decode("utf-8"))
-                            display_name = data.get("display_name", secrets.channel_id)
-                            click.echo(f"[ok] Mattermost channel — {display_name}")
-                        elif response.status == 404:
-                            click.echo(f"[fail] Mattermost channel — {secrets.channel_id} not found", err=True)
-                            failed = True
-                        elif response.status == 403:
-                            click.echo(f"[fail] Mattermost channel — bot lacks access to {secrets.channel_id}", err=True)
-                            failed = True
-                        else:
-                            click.echo(f"[fail] Mattermost channel — status {response.status}", err=True)
-                            failed = True
-                    except Exception as e:
-                        click.echo(f"[fail] Mattermost channel — error ({type(e).__name__})", err=True)
+            # Check 13: Mattermost channel accessible
+            if secrets.server_url and secrets.bot_token and secrets.channel_id:
+                try:
+                    headers = {"Authorization": f"Bearer {secrets.bot_token}"}
+                    req = urllib.request.Request(
+                        f"{secrets.server_url.rstrip('/')}/api/v4/channels/{secrets.channel_id}",
+                        headers=headers
+                    )
+                    response = urllib.request.urlopen(req, timeout=2)
+                    if response.status == 200:
+                        data = json.loads(response.read().decode("utf-8"))
+                        display_name = data.get("display_name", secrets.channel_id)
+                        click.echo(f"[ok] Mattermost channel — {display_name}")
+                    elif response.status == 404:
+                        click.echo(f"[fail] Mattermost channel — {secrets.channel_id} not found", err=True)
                         failed = True
-            except SecretsError:
-                pass
+                    elif response.status == 403:
+                        click.echo(f"[fail] Mattermost channel — bot lacks access to {secrets.channel_id}", err=True)
+                        failed = True
+                    else:
+                        click.echo(f"[fail] Mattermost channel — status {response.status}", err=True)
+                        failed = True
+                except Exception as e:
+                    click.echo(f"[fail] Mattermost channel — error ({type(e).__name__})", err=True)
+                    failed = True
 
     # Final summary
     click.echo()
