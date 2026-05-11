@@ -168,10 +168,8 @@ Remove these once the CI image at `forgejo.buttplug.haus/qdot/cc-bridge:latest` 
 
 ## Known issues and gotchas
 
-### zellij write-chars doesn't work without an attached client
-`action write-chars` and `action write` silently succeed but don't deliver keystrokes when no terminal client is attached to the zellij session. The bridge runs outside zellij (as PID 1 in the container), so headless `write-chars` is dead on arrival. This is why `!start` passes the prompt via `-p` in the KDL layout instead of using `write_initial_prompt` / `write-chars`.
-
-Implication: **follow-up messages in threads won't reach claude in the Docker deployment** because `maybe_route_message` uses `write_to_pane` (which calls `write-chars`). This works on Discord where someone is SSH'd into the machine with zellij attached; it does NOT work in the headless Docker container. Fixing this properly requires either running the bridge inside a zellij pane (needs TTY allocation) or finding an alternative input mechanism.
+### zellij write-chars requires an attached client
+`action write-chars` and `action write` silently succeed but don't deliver keystrokes when no terminal client is attached to the zellij session. The recommended deployment is bare-metal with a persistent zellij client attached via tmux: `tmux new -s zellij-client -d 'zellij attach cc-bridge-worker'`. Claude is spawned interactively; the initial prompt is delivered via `write_initial_prompt` after SessionStart, and follow-up messages use `write_to_pane`. Both require the attached client.
 
 ### dump-screen returns empty without an attached client
 Same root cause as above. Don't rely on `dump-screen` for diagnostics in the Docker deployment — the pane content is there but not captured. Check `/proc/*/cmdline` for process state instead.

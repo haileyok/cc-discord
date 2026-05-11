@@ -401,6 +401,9 @@ class Task:
     # string means "not set yet" (so the first state transition takes effect
     # even if the thread name happens to already start with a green dot).
     status_indicator: str = ""
+    # Prompt to deliver after SessionStart fires. Set by spawn_task when a
+    # prompt is provided; consumed by _on_session_start (startup matcher).
+    pending_prompt: str | None = None
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -746,10 +749,9 @@ class TaskRegistry:
         8. Indexes the task in memory.
         9. Returns the Task.
 
-        When `prompt` is provided, it's baked into the KDL layout as `-p <prompt>`
-        so claude starts in non-interactive mode and fires SessionStart immediately.
-        This avoids depending on zellij `write-chars` (which requires an attached
-        client to deliver keystrokes — not available in headless Docker deployments).
+        When `prompt` is provided, it's stored as `pending_prompt` on the Task
+        and delivered via `write_initial_prompt` after SessionStart fires. Claude
+        is always launched interactively so multi-turn conversation works.
 
         Raises TaskSpawnError if cwd is not a directory or zellij spawn fails.
         """
@@ -790,8 +792,6 @@ class TaskRegistry:
         # tab via `go-to-tab-name` later.
         tab_name = f"cc-{task_id[:8]}"
         claude_argv = ["--settings", str(settings_path)]
-        if prompt:
-            claude_argv.extend(["-p", prompt])
         layout_path = _write_task_layout(
             task_id,
             env=env,
@@ -861,6 +861,7 @@ class TaskRegistry:
             current_transcript_path=None,
             created_at=now,
             last_activity=now,
+            pending_prompt=prompt,
         )
         await self._index(task)
 
@@ -1134,6 +1135,12 @@ class TaskRegistry:
                 await self._bot.post(notice, thread_id=task.thread_id)
             except Exception:
                 logger.exception("failed to post session start notice")
+
+        # Deliver pending prompt now that Claude is ready
+        if task.pending_prompt and matcher in ("startup", None):
+            prompt = task.pending_prompt
+            task.pending_prompt = None
+            await self.write_initial_prompt(task.task_id, prompt)
 
     async def _on_user_prompt_submit(self, body: dict) -> None:
         """Handle UserPromptSubmit event. Start typing indicator and cancel pending TUI prompts."""

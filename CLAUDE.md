@@ -59,7 +59,7 @@ The systemd unit at `packaging/cc-bridge.service` hardcodes `%h/.local/bin/cc-br
 
 ### Docker (qcluster-1 / headless)
 
-The Docker container runs the bridge as PID 1 *outside* zellij. Zellij is started in the background via `attach --create-background`. This means **`action write-chars` silently fails** — it returns 0 but doesn't deliver keystrokes because no terminal client is attached to the session. Initial prompts must be passed via `-p` flag in the KDL layout, not via `write_to_pane`. Follow-up thread messages (`maybe_route_message`) also use `write_to_pane` and are therefore broken in headless Docker — this is a known limitation.
+The Docker container runs the bridge as PID 1 *outside* zellij. Zellij is started in the background via `attach --create-background`. This means **`action write-chars` silently fails** — it returns 0 but doesn't deliver keystrokes because no terminal client is attached to the session. The recommended deployment is bare-metal with a persistent zellij client (e.g. `tmux new -d 'zellij attach cc-bridge-worker'`). Claude is always spawned interactively; prompts from `!start` are delivered via `write_initial_prompt` after SessionStart fires. Both initial and follow-up messages require an attached zellij client.
 
 `MattermostMessageAdapter` (in `backends/mattermost/bot.py`) wraps Mattermost post dicts into `MessageLike`-compatible objects so the platform-agnostic dispatcher and task router can use attribute access. If you add new fields the dispatcher reads from messages, update the adapter too.
 
