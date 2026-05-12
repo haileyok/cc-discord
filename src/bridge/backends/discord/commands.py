@@ -15,6 +15,7 @@ from bridge.backends.discord.bot import DiscordBot
 from bridge.command_handlers import (
     handle_kill,
     handle_list,
+    handle_model,
     handle_rename,
     handle_restart,
     handle_skill,
@@ -132,6 +133,39 @@ def build_tree(bot: DiscordBot, registry: TaskRegistry) -> app_commands.CommandT
         await interaction.response.defer(ephemeral=True)
         thread_id = str(interaction.channel_id)
         result = await handle_skill(registry, thread_id=thread_id, skill_name=name, args=args)
+        await interaction.followup.send(result.message, ephemeral=True)
+
+    _KNOWN_MODELS = [
+        "opus",
+        "sonnet",
+        "haiku",
+        "claude-opus-4-6",
+        "claude-opus-4-6-1m",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ]
+
+    async def _model_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        cur = current.lower()
+        return [
+            app_commands.Choice(name=m, value=m)
+            for m in _KNOWN_MODELS
+            if cur in m
+        ][:25]
+
+    @tree.command(name="model", description="Switch the Claude model for a running task")
+    @app_commands.describe(name="Model name (e.g. opus, sonnet, haiku)")
+    @app_commands.autocomplete(name=_model_autocomplete)
+    async def model_cmd(
+        interaction: discord.Interaction,
+        name: str,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        thread_id = str(interaction.channel_id)
+        result = await handle_model(registry, thread_id=thread_id, model_name=name)
         await interaction.followup.send(result.message, ephemeral=True)
 
     @tree.command(

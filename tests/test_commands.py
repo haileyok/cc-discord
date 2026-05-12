@@ -544,6 +544,48 @@ class TestSharedCommandHandlers:
         assert result.success is True
         assert "✅ Stopped" in result.message
 
+    async def test_handle_model_happy_path(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        """handle_model sends /model to the task pane."""
+        from bridge.command_handlers import handle_model
+        from bridge.state import upsert_task
+
+        now = int(time.time())
+        await upsert_task(
+            in_memory_db,
+            "task-model",
+            3000,
+            "/tmp",
+            "running",
+            zellij_pane_id="pane_model",
+            current_claude_session_id="sess-model",
+            now=now,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        result = await handle_model(registry, thread_id="3000", model_name="sonnet")
+
+        assert result.success is True
+        assert "/model sonnet" in result.message
+        assert len(fake_zellij._write_calls) >= 1
+        assert fake_zellij._write_calls[0]["text"] == "/model sonnet\n"
+
+    async def test_handle_model_no_task(
+        self, in_memory_db, fake_bot, fake_zellij
+    ) -> None:
+        """handle_model fails when not in a task thread."""
+        from bridge.command_handlers import handle_model
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        result = await handle_model(registry, thread_id="9999", model_name="opus")
+
+        assert result.success is False
+        assert "❌" in result.message
+
     async def test_handle_list_empty(self, in_memory_db, fake_bot, fake_zellij) -> None:
         """handle_list returns empty tasks list when no tasks exist."""
         from bridge.command_handlers import handle_list

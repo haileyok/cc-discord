@@ -380,6 +380,35 @@ async def handle_skill(
     )
 
 
+async def handle_model(
+    registry: TaskRegistry,
+    thread_id: str,
+    model_name: str,
+) -> CommandResult:
+    """Switch the Claude model for a running task.
+
+    Sends `/model <model_name>` to the task's TUI pane.
+    """
+    from bridge.tasks import TaskNotFound, TaskSpawnError
+
+    task = _resolve_task(registry, thread_id, None)
+    if task is None:
+        return CommandResult(
+            success=False,
+            message="❌ This command must run in a task thread.",
+        )
+
+    try:
+        await registry.invoke_skill(task.task_id, "model", model_name)
+    except (TaskNotFound, TaskSpawnError) as e:
+        return CommandResult(success=False, message=f"❌ {e}")
+
+    return CommandResult(
+        success=True,
+        message=f"✅ Sent `/model {model_name}` to `{task.task_id[:8]}`",
+    )
+
+
 async def handle_tasks(
     registry: TaskRegistry,
     thread_id: str | None = None,

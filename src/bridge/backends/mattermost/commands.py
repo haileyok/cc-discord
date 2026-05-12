@@ -19,6 +19,7 @@ from bridge.command_handlers import (
     CommandResult,
     handle_kill,
     handle_list,
+    handle_model,
     handle_rename,
     handle_restart,
     handle_skill,
@@ -113,6 +114,17 @@ async def dispatch_text_command(
             )
         return await handle_skill(registry, thread_id, skill_name, args=skill_args)
 
+    elif command == "model":
+        if not args:
+            return CommandResult(
+                success=False, message="Usage: !model <name>"
+            )
+        if not thread_id:
+            return CommandResult(
+                success=False, message="!model must be used in a task thread"
+            )
+        return await handle_model(registry, thread_id=thread_id, model_name=args[0])
+
     elif command == "tasks":
         task_id = args[0] if args else None
         return await handle_tasks(registry, thread_id=thread_id, task_id=task_id)
@@ -143,6 +155,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "retitle": "Rename the task's thread",
     "stats": "Show model / token / cost stats for a task",
     "tasks": "Show claude's session task list",
+    "model": "Switch the Claude model for a running task",
 }
 
 SLASH_HINTS: dict[str, str] = {
@@ -155,6 +168,7 @@ SLASH_HINTS: dict[str, str] = {
     "retitle": "[name]",
     "stats": "[task_id]",
     "tasks": "[task_id]",
+    "model": "<name>",
 }
 
 
