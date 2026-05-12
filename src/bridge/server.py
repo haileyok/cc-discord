@@ -89,6 +89,7 @@ ZELLIJ_KEY: web.AppKey[ZellijManager] = web.AppKey("zellij", ZellijManager)
 APPROVAL_ROUTER_KEY: web.AppKey[ApprovalRouter] = web.AppKey("approval_router", ApprovalRouter)
 
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
+SECRETS_KEY: web.AppKey[Secrets] = web.AppKey("secrets", Secrets)
 
 
 async def _handle_notify(request: web.Request) -> web.Response:
@@ -432,7 +433,24 @@ def make_message_dispatcher(
     return _dispatch_message
 
 
-async def build_app(platform: ChatPlatform, *, started_at: float | None = None) -> web.Application:
+async def _handle_slash(request: web.Request) -> web.Response:
+    """Route Mattermost slash commands to the handler."""
+    from bridge.backends.mattermost.commands import handle_slash_request
+
+    command = request.match_info["command"]
+    registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
+    secrets: Secrets = request.app[SECRETS_KEY]
+    return await handle_slash_request(
+        request, command, registry, slash_token=secrets.slash_command_token,
+    )
+
+
+async def build_app(
+    platform: ChatPlatform,
+    *,
+    started_at: float | None = None,
+    is_mattermost: bool = False,
+) -> web.Application:
     """Build and configure the aiohttp Application."""
     app = web.Application()
     app[BOT_KEY] = platform
@@ -442,6 +460,8 @@ async def build_app(platform: ChatPlatform, *, started_at: float | None = None) 
     app.router.add_get("/v1/health", _handle_health)
     app.router.add_post("/v1/hook/event", _handle_hook_event)
     app.router.add_post("/v1/hook/pretooluse", _handle_pretooluse)
+    if is_mattermost:
+        app.router.add_post("/v1/slash/{command}", _handle_slash)
     return app
 
 
@@ -547,13 +567,14 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
     bot.bind_registry(task_registry)
     bot.bind_approval_router(approval_router)
     registry = ThreadRegistry(bot, conn)
-    app = await build_app(bot)
+    app = await build_app(bot, is_mattermost=(platform == "mattermost"))
     app[THREADS_KEY] = registry
     app[LISTENER_KEY] = listener
     app[ASK_LOCKS_KEY] = AskLockMap()
     app[TASK_REGISTRY_KEY] = task_registry
     app[ZELLIJ_KEY] = zellij
     app[APPROVAL_ROUTER_KEY] = approval_router
+    app[SECRETS_KEY] = secrets
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)

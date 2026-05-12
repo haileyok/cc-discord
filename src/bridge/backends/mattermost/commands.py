@@ -121,58 +121,83 @@ async def dispatch_text_command(
         return CommandResult(success=False, message=f"Unknown command: !{command}")
 
 
-async def slash_handler(
+def _slash_response(text: str, *, ephemeral: bool = False) -> web.Response:
+    """Build a Mattermost slash command JSON response."""
+    return web.Response(
+        text=json.dumps({
+            "text": text,
+            "response_type": "ephemeral" if ephemeral else "in_channel",
+        }),
+        content_type="application/json",
+        status=200,
+    )
+
+
+SLASH_COMMANDS: dict[str, str] = {
+    "start": "Start a new Claude task in a fresh thread",
+    "stop": "Gracefully stop a task",
+    "kill": "Immediately kill a task (close its pane)",
+    "list": "List active tasks",
+    "restart": "Restart a task with --resume",
+    "skill": "Invoke a Claude Code skill in the task's session",
+    "rename": "Rename the task's thread",
+    "stats": "Show model / token / cost stats for a task",
+    "tasks": "Show claude's session task list",
+}
+
+SLASH_HINTS: dict[str, str] = {
+    "start": "<cwd> [prompt]",
+    "stop": "[task_id]",
+    "kill": "[task_id]",
+    "list": "",
+    "restart": "[task_id]",
+    "skill": "<name> [args]",
+    "rename": "[name]",
+    "stats": "[task_id]",
+    "tasks": "[task_id]",
+}
+
+
+async def handle_slash_request(
     request: web.Request,
     command: str,
     registry: Any,
+    slash_token: str | None = None,
 ) -> web.Response:
     """HTTP handler for Mattermost slash commands.
 
-    Receives form-encoded request body with command, text, channel_id, etc.
-    Returns JSON response with text and response_type.
+    Each slash command (e.g. /start, /stop) is routed here with the command
+    name extracted from the URL path. Mattermost POSTs form-encoded data
+    with fields: command, text, channel_id, user_id, token, etc.
 
     Args:
         request: aiohttp Request object
-        command: Command name (e.g., "start")
+        command: Command name extracted from URL path (e.g., "start")
         registry: TaskRegistry instance
+        slash_token: Expected verification token (None to skip validation)
 
     Returns:
         JSON response with text and response_type fields
     """
     try:
         data = await request.post()
+
+        if slash_token and data.get("token") != slash_token:
+            return _slash_response("Unauthorized", ephemeral=True)
+
+        channel_id = data.get("channel_id", "")
         text = data.get("text", "")
-        args = shlex.split(text) if text else []
+        try:
+            args = shlex.split(text) if text else []
+        except ValueError:
+            args = text.split() if text else []
 
-        # Dispatch the command
-        result = await dispatch_text_command(command, args, registry, thread_id=None)
-
-        # Determine response type: ephemeral for errors, in_channel for success
-        response_type = "in_channel" if result.success else "ephemeral"
-
-        response_body = json.dumps(
-            {
-                "text": result.message,
-                "response_type": response_type,
-            }
+        result = await dispatch_text_command(
+            command, args, registry, thread_id=channel_id or None,
         )
 
-        return web.Response(
-            text=response_body,
-            content_type="application/json",
-            status=200,
-        )
+        return _slash_response(result.message, ephemeral=not result.success)
 
     except Exception as e:
-        logger.exception("slash_handler error for command %s", command)
-        error_body = json.dumps(
-            {
-                "text": f"❌ Internal error: {e}",
-                "response_type": "ephemeral",
-            }
-        )
-        return web.Response(
-            text=error_body,
-            content_type="application/json",
-            status=200,
-        )
+        logger.exception("slash handler error for /%s", command)
+        return _slash_response(f"Internal error: {e}", ephemeral=True)

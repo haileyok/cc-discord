@@ -650,6 +650,91 @@ def doctor() -> None:
         sys.exit(0)
 
 
+@cli.command("register-slash-commands")
+@click.option(
+    "--url",
+    envvar="BRIDGE_SLASH_URL",
+    default=None,
+    help="External URL where Mattermost can reach the bridge (e.g., http://host:8787).",
+)
+def register_slash_commands(url: str | None) -> None:
+    """Register Mattermost slash commands pointing at the bridge.
+
+    Creates /start, /stop, /kill, /list, /restart, /skill, /rename, /stats,
+    and /tasks slash commands in the Mattermost team that owns the configured channel.
+    """
+    secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
+    try:
+        secrets = load_secrets(path=secrets_path)
+    except SecretsError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(2)
+
+    if secrets.platform != "mattermost":
+        click.echo("Error: slash command registration is only for Mattermost.", err=True)
+        sys.exit(2)
+
+    if not url:
+        url = click.prompt(
+            "Bridge URL reachable from Mattermost "
+            "(e.g., http://localhost:8787 or https://bridge.example.com)"
+        )
+
+    url = url.rstrip("/")
+
+    asyncio.run(_register_slash_commands_async(secrets, url, secrets_path))
+
+
+async def _register_slash_commands_async(
+    secrets: Secrets, bridge_url: str, secrets_path: Path
+) -> None:
+    from bridge.backends.mattermost.api import MattermostAPI
+    from bridge.backends.mattermost.commands import SLASH_COMMANDS, SLASH_HINTS
+
+    api = MattermostAPI(secrets.server_url, secrets.bot_token)
+    await api.start()
+    try:
+        channel = await api.get_channel(str(secrets.channel_id))
+        team_id = channel["team_id"]
+
+        existing = await api.list_commands(team_id)
+        existing_triggers = {cmd["trigger"]: cmd["id"] for cmd in existing}
+
+        slash_token = None
+        for trigger, description in SLASH_COMMANDS.items():
+            if trigger in existing_triggers:
+                click.echo(f"  /{trigger} already registered — deleting and recreating")
+                await api.delete_command(existing_triggers[trigger])
+
+            result = await api.create_command(
+                team_id=team_id,
+                trigger=trigger,
+                url=f"{bridge_url}/v1/slash/{trigger}",
+                display_name=f"cc-bridge {trigger}",
+                description=description,
+                autocomplete_hint=SLASH_HINTS.get(trigger, ""),
+            )
+            if slash_token is None:
+                slash_token = result.get("token")
+            click.echo(f"  /{trigger} — registered")
+
+        if slash_token:
+            updated = Secrets(
+                bot_token=secrets.bot_token,
+                channel_id=secrets.channel_id,
+                platform=secrets.platform,
+                server_url=secrets.server_url,
+                allowed_user_ids=secrets.allowed_user_ids,
+                slash_command_token=slash_token,
+            )
+            write_secrets(updated, path=secrets_path)
+            click.echo(f"\nVerification token saved to {secrets_path}")
+
+        click.echo(f"\n✅ {len(SLASH_COMMANDS)} slash commands registered")
+    finally:
+        await api.close()
+
+
 def main() -> None:
     """Entry point for the CLI (referenced by pyproject.toml [project.scripts])."""
     cli()

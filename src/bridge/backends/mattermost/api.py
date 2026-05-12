@@ -127,6 +127,42 @@ class MattermostAPI:
         return await self._request("GET", f"/files/{file_id}/info")
 
 
+    async def get_channel(self, channel_id: str) -> dict:
+        return await self._request("GET", f"/channels/{channel_id}")
+
+    async def create_command(
+        self,
+        team_id: str,
+        trigger: str,
+        url: str,
+        *,
+        display_name: str = "",
+        description: str = "",
+        autocomplete_hint: str = "",
+    ) -> dict:
+        return await self._request(
+            "POST",
+            "/commands",
+            json={
+                "team_id": team_id,
+                "trigger": trigger,
+                "method": "P",
+                "url": url,
+                "display_name": display_name,
+                "description": description,
+                "auto_complete": True,
+                "auto_complete_hint": autocomplete_hint,
+                "auto_complete_desc": description,
+            },
+        )
+
+    async def list_commands(self, team_id: str) -> list[dict]:
+        return await self._request("GET", f"/commands?team_id={team_id}")
+
+    async def delete_command(self, command_id: str) -> None:
+        await self._request("DELETE", f"/commands/{command_id}")
+
+
 class RateLimitError(Exception):
     def __init__(self, retry_after: float) -> None:
         self.retry_after = retry_after

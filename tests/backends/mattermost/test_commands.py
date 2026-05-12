@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest import mock
 
 import pytest
@@ -268,16 +269,20 @@ class TestDispatchTextCommand:
 class TestSlashCommandHandlers:
     """Tests for HTTP slash command handlers."""
 
-    @pytest.mark.asyncio
-    async def test_slash_handler_success_response(self):
-        """Test slash handler returns correct JSON response on success."""
+    def _make_request(self, post_data):
+        """Build a mock aiohttp Request with form data."""
         from aiohttp import web
-        from bridge.backends.mattermost.commands import slash_handler
 
         request = mock.AsyncMock(spec=web.Request)
-        request.post = mock.AsyncMock(
-            return_value={"text": "/tmp", "channel_id": "ch123"}
-        )
+        request.post = mock.AsyncMock(return_value=post_data)
+        return request
+
+    @pytest.mark.asyncio
+    async def test_slash_start_dispatches(self):
+        """Test /start with cwd arg dispatches correctly."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({"text": "/tmp", "channel_id": "ch123"})
 
         registry = mock.MagicMock()
         task = mock.MagicMock()
@@ -285,44 +290,158 @@ class TestSlashCommandHandlers:
         registry.spawn_task = mock.AsyncMock(return_value=task)
         registry.get_by_task_id = mock.MagicMock(return_value=task)
 
-        response = await slash_handler(request, "start", registry)
+        response = await handle_slash_request(request, "start", registry)
 
         assert response.status == 200
-        data = response.body.decode()
-        assert "response_type" in data
-        assert "text" in data
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "in_channel"
+        assert "task123" in data["text"] or "Started" in data["text"]
 
     @pytest.mark.asyncio
-    async def test_slash_handler_error_response(self):
-        """Test slash handler returns ephemeral response on error."""
-        from aiohttp import web
-        from bridge.backends.mattermost.commands import slash_handler
+    async def test_slash_start_error_returns_ephemeral(self):
+        """Test /start without args returns ephemeral error."""
+        from bridge.backends.mattermost.commands import handle_slash_request
 
-        request = mock.AsyncMock(spec=web.Request)
-        request.post = mock.AsyncMock(return_value={"text": "", "channel_id": "ch123"})
-
+        request = self._make_request({"text": "", "channel_id": "ch123"})
         registry = mock.MagicMock()
 
-        response = await slash_handler(request, "start", registry)
+        response = await handle_slash_request(request, "start", registry)
 
         assert response.status == 200
-        data = response.body.decode()
-        assert "ephemeral" in data
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "ephemeral"
 
     @pytest.mark.asyncio
-    async def test_slash_handler_parses_text_args(self):
-        """Test slash handler parses text field correctly."""
-        from aiohttp import web
-        from bridge.backends.mattermost.commands import slash_handler
+    async def test_slash_stop_with_task_id(self):
+        """Test /stop with explicit task_id passes it through."""
+        from bridge.backends.mattermost.commands import handle_slash_request
 
-        request = mock.AsyncMock(spec=web.Request)
-        request.post = mock.AsyncMock(
-            return_value={
-                "text": "/tmp my prompt",
-                "channel_id": "ch123",
-                "command": "/start",
-            }
+        request = self._make_request({"text": "task123", "channel_id": "ch123"})
+
+        registry = mock.MagicMock()
+        registry.stop_task = mock.AsyncMock(return_value=True)
+
+        response = await handle_slash_request(request, "stop", registry)
+
+        assert response.status == 200
+        registry.stop_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_slash_stop_uses_channel_id_as_thread_id(self):
+        """Test /stop without args uses channel_id to resolve task."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({"text": "", "channel_id": "ch_abc"})
+
+        task = mock.MagicMock()
+        task.task_id = "resolved_task"
+        registry = mock.MagicMock()
+        registry.get_by_thread_id = mock.MagicMock(return_value=task)
+        registry.stop_task = mock.AsyncMock(return_value=True)
+
+        response = await handle_slash_request(request, "stop", registry)
+
+        assert response.status == 200
+        registry.get_by_thread_id.assert_called_with("ch_abc")
+
+    @pytest.mark.asyncio
+    async def test_slash_list_dispatches(self):
+        """Test /list returns task list."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({"text": "", "channel_id": "ch123"})
+        registry = mock.MagicMock()
+        registry.list_tasks = mock.AsyncMock(return_value=[])
+
+        response = await handle_slash_request(request, "list", registry)
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "in_channel"
+
+    @pytest.mark.asyncio
+    async def test_slash_token_validation_pass(self):
+        """Test valid token passes through to command dispatch."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({
+            "text": "",
+            "channel_id": "ch123",
+            "token": "secret123",
+        })
+        registry = mock.MagicMock()
+        registry.list_tasks = mock.AsyncMock(return_value=[])
+
+        response = await handle_slash_request(
+            request, "list", registry, slash_token="secret123",
         )
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "in_channel"
+
+    @pytest.mark.asyncio
+    async def test_slash_token_validation_fail(self):
+        """Test invalid token returns unauthorized."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({
+            "text": "",
+            "channel_id": "ch123",
+            "token": "wrong",
+        })
+        registry = mock.MagicMock()
+
+        response = await handle_slash_request(
+            request, "list", registry, slash_token="secret123",
+        )
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "ephemeral"
+        assert "Unauthorized" in data["text"]
+
+    @pytest.mark.asyncio
+    async def test_slash_token_skipped_when_unconfigured(self):
+        """Test no configured token skips validation."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({"text": "", "channel_id": "ch123"})
+        registry = mock.MagicMock()
+        registry.list_tasks = mock.AsyncMock(return_value=[])
+
+        response = await handle_slash_request(
+            request, "list", registry, slash_token=None,
+        )
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "in_channel"
+
+    @pytest.mark.asyncio
+    async def test_slash_unknown_command(self):
+        """Test unknown command returns error."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({"text": "", "channel_id": "ch123"})
+        registry = mock.AsyncMock()
+
+        response = await handle_slash_request(request, "nope", registry)
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "ephemeral"
+        assert "Unknown" in data["text"]
+
+    @pytest.mark.asyncio
+    async def test_slash_parses_quoted_args(self):
+        """Test slash handler handles quoted text args."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        request = self._make_request({
+            "text": '/tmp "my prompt"',
+            "channel_id": "ch123",
+        })
 
         registry = mock.MagicMock()
         task = mock.MagicMock()
@@ -330,6 +449,10 @@ class TestSlashCommandHandlers:
         registry.spawn_task = mock.AsyncMock(return_value=task)
         registry.get_by_task_id = mock.MagicMock(return_value=task)
 
-        response = await slash_handler(request, "start", registry)
+        response = await handle_slash_request(request, "start", registry)
 
         assert response.status == 200
+        registry.spawn_task.assert_called_once()
+        call_kwargs = registry.spawn_task.call_args
+        assert call_kwargs[1].get("prompt") == "my prompt" or \
+            (call_kwargs[1].get("prompt") and "my prompt" in call_kwargs[1]["prompt"])
