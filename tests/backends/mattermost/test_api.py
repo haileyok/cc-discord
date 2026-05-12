@@ -407,6 +407,18 @@ class TestMattermostAPI:
         assert result == b"binary"
 
     @pytest.mark.asyncio
+    async def test_list_commands_uses_custom_only(self):
+        """list_commands() filters to custom commands only."""
+        api = MattermostAPI("https://mm.example.com", "token")
+
+        with mock.patch.object(api, "_request") as mock_request:
+            mock_request.return_value = []
+            await api.list_commands("team123")
+            mock_request.assert_called_once_with(
+                "GET", "/commands?team_id=team123&custom_only=true"
+            )
+
+    @pytest.mark.asyncio
     async def test_request_raise_for_status(self):
         """Test _request() calls raise_for_status()."""
         api = MattermostAPI("https://mm.example.com", "token")
