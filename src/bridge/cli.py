@@ -704,7 +704,7 @@ async def _register_slash_commands_async(
             if cmd.get("id")
         }
 
-        slash_token = None
+        slash_tokens: list[str] = []
         failed: list[str] = []
         for trigger, description in SLASH_COMMANDS.items():
             try:
@@ -720,21 +720,22 @@ async def _register_slash_commands_async(
                     description=description,
                     autocomplete_hint=SLASH_HINTS.get(trigger, ""),
                 )
-                if slash_token is None:
-                    slash_token = result.get("token")
+                token = result.get("token")
+                if token:
+                    slash_tokens.append(token)
                 click.echo(f"  /{trigger} — registered")
             except Exception as exc:
                 failed.append(trigger)
                 click.echo(f"  /{trigger} — FAILED: {exc}", err=True)
 
-        if slash_token:
+        if slash_tokens:
             updated = Secrets(
                 bot_token=secrets.bot_token,
                 channel_id=secrets.channel_id,
                 platform=secrets.platform,
                 server_url=secrets.server_url,
                 allowed_user_ids=secrets.allowed_user_ids,
-                slash_command_token=slash_token,
+                slash_command_tokens=slash_tokens,
             )
             write_secrets(updated, path=secrets_path)
             click.echo(f"\nVerification token saved to {secrets_path}")

@@ -373,7 +373,7 @@ class TestSlashCommandHandlers:
         registry.list_tasks = mock.AsyncMock(return_value=[])
 
         response = await handle_slash_request(
-            request, "list", registry, slash_token="secret123",
+            request, "list", registry, slash_tokens=["secret123", "other456"],
         )
 
         assert response.status == 200
@@ -393,7 +393,7 @@ class TestSlashCommandHandlers:
         registry = mock.MagicMock()
 
         response = await handle_slash_request(
-            request, "list", registry, slash_token="secret123",
+            request, "list", registry, slash_tokens=["secret123", "other456"],
         )
 
         assert response.status == 200
@@ -411,7 +411,7 @@ class TestSlashCommandHandlers:
         registry.list_tasks = mock.AsyncMock(return_value=[])
 
         response = await handle_slash_request(
-            request, "list", registry, slash_token=None,
+            request, "list", registry, slash_tokens=None,
         )
 
         assert response.status == 200

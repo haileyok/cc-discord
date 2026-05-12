@@ -162,7 +162,7 @@ async def handle_slash_request(
     request: web.Request,
     command: str,
     registry: Any,
-    slash_token: str | None = None,
+    slash_tokens: list[str] | None = None,
 ) -> web.Response:
     """HTTP handler for Mattermost slash commands.
 
@@ -174,7 +174,7 @@ async def handle_slash_request(
         request: aiohttp Request object
         command: Command name extracted from URL path (e.g., "start")
         registry: TaskRegistry instance
-        slash_token: Expected verification token (None to skip validation)
+        slash_tokens: Valid verification tokens (None to skip validation)
 
     Returns:
         JSON response with text and response_type fields
@@ -182,7 +182,7 @@ async def handle_slash_request(
     try:
         data = await request.post()
 
-        if slash_token and data.get("token") != slash_token:
+        if slash_tokens and data.get("token") not in slash_tokens:
             return _slash_response("Unauthorized", ephemeral=True)
 
         channel_id = data.get("channel_id", "")

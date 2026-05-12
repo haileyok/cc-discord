@@ -441,7 +441,7 @@ async def _handle_slash(request: web.Request) -> web.Response:
     registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
     secrets: Secrets = request.app[SECRETS_KEY]
     return await handle_slash_request(
-        request, command, registry, slash_token=secrets.slash_command_token,
+        request, command, registry, slash_tokens=secrets.slash_command_tokens,
     )
 
 

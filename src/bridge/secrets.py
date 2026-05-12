@@ -31,7 +31,7 @@ class Secrets:
     # Mattermost-specific
     server_url: str | None = None
     allowed_user_ids: list[str] | None = None
-    slash_command_token: str | None = None
+    slash_command_tokens: list[str] | None = None
 
 
 def _resolve_secrets_path() -> Path:
@@ -148,7 +148,13 @@ def load_secrets(path: Path | None = None) -> Secrets:
                 f"Run 'cc-bridge init' to set it."
             )
         allowed_user_ids = data.get("allowed_user_ids")
-        slash_command_token = data.get("slash_command_token")
+        raw_tokens = data.get("slash_command_tokens") or data.get("slash_command_token")
+        if isinstance(raw_tokens, str):
+            slash_command_tokens = [raw_tokens]
+        elif isinstance(raw_tokens, list):
+            slash_command_tokens = raw_tokens
+        else:
+            slash_command_tokens = None
         logger.info("loaded secrets from %s (Mattermost format)", path)
         return Secrets(
             bot_token=bot_token,
@@ -156,7 +162,7 @@ def load_secrets(path: Path | None = None) -> Secrets:
             platform="mattermost",
             server_url=server_url,
             allowed_user_ids=allowed_user_ids,
-            slash_command_token=slash_command_token,
+            slash_command_tokens=slash_command_tokens,
         )
     else:
         raise SecretsError(
@@ -193,8 +199,8 @@ def write_secrets(secrets: Secrets, path: Path = SECRETS_FILE) -> None:
         data["server_url"] = secrets.server_url
         if secrets.allowed_user_ids:
             data["allowed_user_ids"] = secrets.allowed_user_ids
-        if secrets.slash_command_token:
-            data["slash_command_token"] = secrets.slash_command_token
+        if secrets.slash_command_tokens:
+            data["slash_command_tokens"] = secrets.slash_command_tokens
     elif secrets.platform == "discord":
         # For Discord, also keep the old field names for compatibility
         data["DISCORD_BOT_TOKEN"] = secrets.bot_token
