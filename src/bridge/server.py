@@ -483,7 +483,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
 
     conn = await state.open_db()
     approval_router = ApprovalRouter(None, conn)
-    task_registry = TaskRegistry(conn, None, zellij, approval_router)
+    task_registry = TaskRegistry(conn, None, zellij, approval_router, bind_host=host, bind_port=port)
     await task_registry.load_from_db(reconcile_with_zellij=True)
 
     # Dispatcher closures call into approval_router/task_registry; both are

@@ -460,6 +460,9 @@ class TaskRegistry:
         bot: ChatPlatform | None,
         zellij: ZellijManager,
         approval_router: "ApprovalRouter | None" = None,
+        *,
+        bind_host: str = "127.0.0.1",
+        bind_port: int = 8787,
     ) -> None:
         """Initialize with database connection, bot, zellij manager, and optional approval router.
 
@@ -467,12 +470,17 @@ class TaskRegistry:
         registry before the Bot exists (load_from_db must run before the HTTP
         server accepts requests, but the Bot logs in later) and calls
         `bind_bot` once the Bot is constructed.
+
+        `bind_host`/`bind_port` are the server's listen address, used to
+        infer BRIDGE_URL for spawned hooks when the env var isn't set.
         """
         self._conn = conn
         self._bot = bot
         self._formatter: RichFormatter | None = None
         self._zellij = zellij
         self._approval_router = approval_router
+        self._bind_host = bind_host
+        self._bind_port = bind_port
         self._by_task_id: dict[str, Task] = {}
         self._by_thread_id: dict[str, Task] = {}
         self._by_session_id: dict[str, Task] = {}
@@ -664,10 +672,14 @@ class TaskRegistry:
         `env(1)`, on top of whatever env the zellij server was started with
         (which already carries PATH, HOME, etc).
         """
+        bridge_url = os.environ.get("BRIDGE_URL")
+        if not bridge_url:
+            hook_host = "127.0.0.1" if self._bind_host == "0.0.0.0" else self._bind_host
+            bridge_url = f"http://{hook_host}:{self._bind_port}"
         return {
             "CC_BRIDGE_TASK_ID": task_id,
             "CC_DISCORD_TASK_ID": task_id,  # backward compat, remove in future release
-            "BRIDGE_URL": os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787"),
+            "BRIDGE_URL": bridge_url,
         }
 
     async def _is_pane_alive(self, pane_id: str) -> bool:
@@ -2337,7 +2349,8 @@ class TaskRegistry:
         """Write initial prompt to a task's zellij pane after session bind.
 
         Looks up the task by task_id. If pane_id is None or task is missing,
-        logs warning and returns. Otherwise writes prompt + newline and bumps last_activity.
+        logs warning and returns. Otherwise writes prompt + newline (with retry)
+        and bumps last_activity.
         """
         task = self.get_by_task_id(task_id)
         if task is None:
@@ -2346,7 +2359,8 @@ class TaskRegistry:
         if task.zellij_pane_id is None:
             logger.warning("write_initial_prompt: task %s has no pane_id", task_id)
             return
-        await self._zellij.write_to_pane(task.zellij_pane_id, prompt + "\n")
+        if not await self._write_with_retry(task, prompt + "\n"):
+            return
         task.last_activity = int(time.time())
         await self._persist(task)
 
