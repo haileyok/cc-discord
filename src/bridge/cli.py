@@ -698,25 +698,34 @@ async def _register_slash_commands_async(
         team_id = channel["team_id"]
 
         existing = await api.list_commands(team_id)
-        existing_triggers = {cmd["trigger"]: cmd["id"] for cmd in existing}
+        existing_triggers = {
+            cmd["trigger"]: cmd["id"]
+            for cmd in existing
+            if cmd.get("id")
+        }
 
         slash_token = None
+        failed: list[str] = []
         for trigger, description in SLASH_COMMANDS.items():
-            if trigger in existing_triggers:
-                click.echo(f"  /{trigger} already registered — deleting and recreating")
-                await api.delete_command(existing_triggers[trigger])
+            try:
+                if trigger in existing_triggers:
+                    click.echo(f"  /{trigger} already registered — deleting and recreating")
+                    await api.delete_command(existing_triggers[trigger])
 
-            result = await api.create_command(
-                team_id=team_id,
-                trigger=trigger,
-                url=f"{bridge_url}/v1/slash/{trigger}",
-                display_name=f"cc-bridge {trigger}",
-                description=description,
-                autocomplete_hint=SLASH_HINTS.get(trigger, ""),
-            )
-            if slash_token is None:
-                slash_token = result.get("token")
-            click.echo(f"  /{trigger} — registered")
+                result = await api.create_command(
+                    team_id=team_id,
+                    trigger=trigger,
+                    url=f"{bridge_url}/v1/slash/{trigger}",
+                    display_name=f"cc-bridge {trigger}",
+                    description=description,
+                    autocomplete_hint=SLASH_HINTS.get(trigger, ""),
+                )
+                if slash_token is None:
+                    slash_token = result.get("token")
+                click.echo(f"  /{trigger} — registered")
+            except Exception as exc:
+                failed.append(trigger)
+                click.echo(f"  /{trigger} — FAILED: {exc}", err=True)
 
         if slash_token:
             updated = Secrets(
@@ -730,7 +739,10 @@ async def _register_slash_commands_async(
             write_secrets(updated, path=secrets_path)
             click.echo(f"\nVerification token saved to {secrets_path}")
 
-        click.echo(f"\n✅ {len(SLASH_COMMANDS)} slash commands registered")
+        registered = len(SLASH_COMMANDS) - len(failed)
+        click.echo(f"\n{'✅' if not failed else '⚠️'} {registered}/{len(SLASH_COMMANDS)} slash commands registered")
+        if failed:
+            click.echo(f"  Failed: {', '.join('/' + t for t in failed)}", err=True)
     finally:
         await api.close()
 

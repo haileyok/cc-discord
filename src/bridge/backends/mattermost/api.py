@@ -157,7 +157,7 @@ class MattermostAPI:
         )
 
     async def list_commands(self, team_id: str) -> list[dict]:
-        return await self._request("GET", f"/commands?team_id={team_id}")
+        return await self._request("GET", f"/commands?team_id={team_id}&custom_only=true")
 
     async def delete_command(self, command_id: str) -> None:
         await self._request("DELETE", f"/commands/{command_id}")
