@@ -12,7 +12,7 @@ Runs as a small Python daemon (`aiohttp` + chat backend) on `127.0.0.1:8787`. Tw
 - **`/ask-discord` skill** — Claude calls this when blocked; the question lands in the thread, the daemon waits up to 15 min for your reply, and Claude continues.
 
 **Chat-driven mode** (`/start` or `!start` from chat spawns Claude in a zellij tab):
-- Commands manage the lifecycle: `/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks` (Discord slash commands) or `!start`, `!list`, etc. (Mattermost text commands).
+- Commands manage the lifecycle: `/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks` (slash commands on both Discord and Mattermost) or `!start`, `!list`, etc. (Mattermost text commands).
 - The bridge mirrors assistant text, tool use (with fenced diffs for Edit/Write), subagent activity (live-updated embed per agent), and the session's task list back to its thread/channel.
 - Chat replies relay into the pane; attachments are saved and their paths get inlined into the prompt so Claude reads them with the `Read` tool. Voice memos are auto-transcribed (Wispr Flow API or local `whisper`).
 - `AskUserQuestion` and `ExitPlanMode` round-trip through reactions / text replies — no need to attach to the pane to answer.
@@ -245,7 +245,35 @@ Spawning Claude Code sessions directly from Discord slash commands or Mattermost
 
 Commands without an explicit `thread:` argument operate on the task whose thread you're invoking from.
 
+### Mattermost slash commands
+
+Native Mattermost slash commands, registered via `cc-bridge register-slash-commands`. These mirror the Discord slash commands:
+
+| Command | What it does |
+|---|---|
+| `/start <cwd> [prompt]` | Spawn a new Claude session in `cwd`, optionally with initial prompt. |
+| `/list` | List active tasks with status, cwd leaf, and age. |
+| `/stop [task_id]` | Graceful stop — writes `/exit` to the pane. |
+| `/kill [task_id]` | Force-close the pane — marks the task crashed. |
+| `/restart [task_id]` | Resume a stopped task via `claude --resume <session_id>`. |
+| `/skill <name> [args]` | Type `/<name> [args]` into the running session. |
+| `/rename [name]` | Rename the task; omit `name` to auto-generate via `claude -p` against the transcript. |
+| `/stats [task_id]` | Token / cost / context-fill stats for the task. |
+| `/tasks [task_id]` | Show the session's `TaskCreate`/`TaskUpdate` mirror. |
+
+Mattermost slash commands don't carry thread context, so thread-scoped commands require an explicit `task_id` argument. Without one, the bridge attempts to resolve the task from the channel ID.
+
+**Setup:** The bridge must be reachable from the Mattermost server over HTTP. Register all 9 commands with:
+
+```bash
+cc-bridge register-slash-commands --url http://<bridge-host>:8787
+```
+
+This creates the commands in Mattermost via API, saves the verification token to `secrets.json`, and points each command at the bridge's `/v1/slash/<name>` endpoint. The bot account needs the `manage_slash_commands` permission (or System Admin role). Re-running the command is idempotent — it deletes and recreates existing commands.
+
 ### Mattermost text commands
+
+Text commands (`!`-prefixed) work in parallel with slash commands and don't require any registration:
 
 | Command | What it does |
 |---|---|
@@ -297,6 +325,7 @@ Commands without a task_id argument operate on the most recently started task fo
 | `WISPR_FLOW_API_TOKEN` | _(unset)_ | If set, voice memos use Wispr Flow's API; otherwise local `whisper`. |
 | `BRIDGE_WHISPER_BIN` | `whisper` | Override the local-whisper binary path. |
 | `BRIDGE_WHISPER_MODEL` | `base` | Whisper model size. |
+| `BRIDGE_SLASH_URL` | _(unset)_ | Bridge URL for `register-slash-commands` (avoids interactive prompt). |
 
 ### Verify setup
 
@@ -315,14 +344,14 @@ The bridge abstracts across Discord and Mattermost via the `ChatPlatform` protoc
 | File | Role |
 |---|---|
 | `src/bridge/platform.py` | `ChatPlatform` protocol — abstraction for Discord and Mattermost |
-| `src/bridge/server.py` | aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse` |
+| `src/bridge/server.py` | aiohttp app, endpoints `/v1/notify`, `/v1/ask`, `/v1/health`, `/v1/hook/event`, `/v1/hook/pretooluse`, `/v1/slash/{command}` (Mattermost only) |
 | `src/bridge/backends/discord/bot.py` | discord.py wrapper — chunked send, retries on 5xx, `on_message` dispatch, embed edits |
 | `src/bridge/backends/mattermost/bot.py` | Mattermost WebSocket client + REST API — message posting, reaction handling, command routing |
 | `src/bridge/threads.py` | session_id → thread_id (Discord) or post_id (Mattermost), with create-on-miss + recreate-on-404 |
 | `src/bridge/listener.py` | Pending-ask state, sliding coalescing window, future lifecycle |
 | `src/bridge/state.py` | aiosqlite — `sessions`, `tasks`, `approval_log` tables |
 | `src/bridge/secrets.py` | 0600 JSON loader/writer for both Discord and Mattermost credentials |
-| `src/bridge/cli.py` | click CLI: `init`, `serve`, `doctor` (handles both platforms) |
+| `src/bridge/cli.py` | click CLI: `init`, `serve`, `doctor`, `register-slash-commands` (handles both platforms) |
 | `src/bridge/commands.py` | Discord slash-command tree |
 | `src/bridge/backends/mattermost/commands.py` | Mattermost command handler (HTTP endpoint + text command parser) |
 | `src/bridge/tasks.py` | `TaskRegistry`: Chat-driven task lifecycle, hook-event dispatch, transcript streaming, subagent block management, task-list mirror |
