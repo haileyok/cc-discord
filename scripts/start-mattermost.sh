@@ -15,6 +15,9 @@ PID_FILE="${STATE_DIR}/daemon.pid"
 LOG_FILE="${STATE_DIR}/daemon.log"
 WORKER_SESSION="${BRIDGE_ZELLIJ_SESSION:-cc-bridge-worker}"
 TMUX_SESSION="cc-bridge-worker"
+# Bind to docker bridge IP so Mattermost containers can reach the bridge
+# without exposing it on external interfaces. Override with BRIDGE_HOST.
+BRIDGE_HOST="${BRIDGE_HOST:-172.17.0.1}"
 
 export BRIDGE_PLATFORM=mattermost
 
@@ -26,7 +29,7 @@ if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
 else
     echo "Starting cc-bridge daemon (mattermost)..."
     cd "$REPO_DIR"
-    nohup uv run cc-bridge serve "$@" >> "$LOG_FILE" 2>&1 &
+    nohup uv run cc-bridge serve --host "$BRIDGE_HOST" "$@" >> "$LOG_FILE" 2>&1 &
     DAEMON_PID=$!
     echo "$DAEMON_PID" > "$PID_FILE"
     echo "Daemon started (pid $DAEMON_PID), logging to $LOG_FILE"
