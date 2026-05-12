@@ -3812,6 +3812,13 @@ class TestGetClaudeCommand:
         from bridge.tasks import _get_claude_command
         assert _get_claude_command() == ["claude-mode", "extend", "--modifier", "bold", "--"]
 
+    def test_tilde_expansion(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --modifier ~/.claude/foo.md --")
+        from bridge.tasks import _get_claude_command
+        result = _get_claude_command()
+        assert "~" not in result[3], "tilde should be expanded"
+        assert result[3].startswith("/"), "expanded path should be absolute"
+
     def test_empty_raises(self, monkeypatch):
         monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "")
         from bridge.tasks import _get_claude_command

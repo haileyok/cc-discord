@@ -68,7 +68,7 @@ def _get_claude_command() -> list[str]:
     tokens = shlex.split(raw)
     if not tokens:
         raise ValueError("BRIDGE_CLAUDE_COMMAND must not be empty")
-    return tokens
+    return [os.path.expanduser(t) for t in tokens]
 
 
 @dataclass
