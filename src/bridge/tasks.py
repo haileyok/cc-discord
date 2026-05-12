@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -54,6 +55,20 @@ _MAX_ATTACHMENTS_PER_POST = 10
 # malformed value can't reach argv (claude --resume <id>) or the KDL
 # layout (interpolated as an env(1) arg).
 _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _get_claude_command() -> list[str]:
+    """Return the tokenized command for launching Claude sessions.
+
+    Reads BRIDGE_CLAUDE_COMMAND from the environment (default: "claude").
+    For claude-mode usage, include the -- separator in the value, e.g.:
+        BRIDGE_CLAUDE_COMMAND="claude-mode extend --"
+    """
+    raw = os.environ.get("BRIDGE_CLAUDE_COMMAND", "claude")
+    tokens = shlex.split(raw)
+    if not tokens:
+        raise ValueError("BRIDGE_CLAUDE_COMMAND must not be empty")
+    return tokens
 
 
 @dataclass
@@ -149,6 +164,7 @@ def _write_task_layout(
     task_id: str,
     *,
     env: dict[str, str],
+    claude_command: list[str],
     claude_argv: list[str],
     tab_name: str,
     settings_dir: Path = TASK_SETTINGS_DIR,
@@ -186,7 +202,8 @@ def _write_task_layout(
     args_tokens: list[str] = []
     for k, v in env.items():
         args_tokens.append(_kdl_quote(f"{k}={v}"))
-    args_tokens.append(_kdl_quote("claude"))
+    for token in claude_command:
+        args_tokens.append(_kdl_quote(token))
     for arg in claude_argv:
         args_tokens.append(_kdl_quote(arg))
     args_line = " ".join(args_tokens)
@@ -788,9 +805,10 @@ class TaskRegistry:
 
         # Generate a zellij layout that opens the new tab as a single
         # claude pane (no default shell). claude_argv is what runs after
-        # `env K=V ...`. `tab_name` matches what we'll use to address the
-        # tab via `go-to-tab-name` later.
+        # the claude command tokens. `tab_name` matches what we'll use to
+        # address the tab via `go-to-tab-name` later.
         tab_name = f"cc-{task_id[:8]}"
+        claude_command = _get_claude_command()
         claude_argv = [
             "--settings", str(settings_path),
             "--dangerously-skip-permissions",
@@ -798,6 +816,7 @@ class TaskRegistry:
         layout_path = _write_task_layout(
             task_id,
             env=env,
+            claude_command=claude_command,
             claude_argv=claude_argv,
             tab_name=tab_name,
         )
@@ -2547,10 +2566,9 @@ class TaskRegistry:
 
         if pane_alive:
             # Just write the resume command into the existing pane; user sees the new banner.
-            await self._zellij.write_to_pane(
-                pane_id,
-                f"\nclaude --resume {task.current_claude_session_id}\n",
-            )
+            claude_command = _get_claude_command()
+            resume_cmd = shlex.join([*claude_command, "--resume", task.current_claude_session_id])
+            await self._zellij.write_to_pane(pane_id, f"\n{resume_cmd}\n")
             # Status stays 'running' — SessionStart will rebind on the new session id
             task.last_activity = int(time.time())
             await self._persist(task)
@@ -2560,9 +2578,11 @@ class TaskRegistry:
         settings_path = _write_task_settings(task.task_id)
         env = self._build_spawn_env(task.task_id)
         tab_name = f"cc-{task.task_id[:8]}"
+        claude_command = _get_claude_command()
         layout_path = _write_task_layout(
             task.task_id,
             env=env,
+            claude_command=claude_command,
             claude_argv=[
                 "--settings", str(settings_path),
                 "--resume", task.current_claude_session_id,

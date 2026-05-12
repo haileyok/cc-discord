@@ -3345,11 +3345,12 @@ class TestTaskSettingsIntegration:
 
         original_write_layout = tasks_module._write_task_layout
 
-        def patched_write_layout(task_id: str, *, env=None, claude_argv=None, tab_name=None):
+        def patched_write_layout(task_id: str, *, env=None, claude_command=None, claude_argv=None, tab_name=None):
             # Call original but capture the layout_path
             path = original_write_layout(
                 task_id,
                 env=env,
+                claude_command=claude_command,
                 claude_argv=claude_argv,
                 tab_name=tab_name
             )
@@ -3791,3 +3792,105 @@ class TestEnvVarBackwardCompatibility:
         task = registry.get_by_task_id("task-new-var")
         assert task is not None
         assert task.current_claude_session_id == session_id
+
+
+class TestGetClaudeCommand:
+    """Tests for _get_claude_command() env-var parsing."""
+
+    def test_default_returns_claude(self, monkeypatch):
+        monkeypatch.delenv("BRIDGE_CLAUDE_COMMAND", raising=False)
+        from bridge.tasks import _get_claude_command
+        assert _get_claude_command() == ["claude"]
+
+    def test_custom_command_with_separator(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --")
+        from bridge.tasks import _get_claude_command
+        assert _get_claude_command() == ["claude-mode", "extend", "--"]
+
+    def test_custom_command_with_modifier(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --modifier bold --")
+        from bridge.tasks import _get_claude_command
+        assert _get_claude_command() == ["claude-mode", "extend", "--modifier", "bold", "--"]
+
+    def test_empty_raises(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "")
+        from bridge.tasks import _get_claude_command
+        with pytest.raises(ValueError, match="must not be empty"):
+            _get_claude_command()
+
+
+class TestWriteTaskLayoutClaudeCommand:
+    """Tests for custom claude_command in KDL layout generation."""
+
+    def test_layout_contains_custom_command_tokens(self, tmp_path, monkeypatch):
+        from bridge.tasks import _write_task_layout
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={"FOO": "bar"},
+            claude_command=["claude-mode", "extend", "--"],
+            claude_argv=["--settings", "/tmp/s.json"],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+        assert '"claude-mode"' in content
+        assert '"extend"' in content
+        assert '"--"' in content
+        assert '"--settings"' in content
+
+    def test_layout_default_command(self, tmp_path):
+        from bridge.tasks import _write_task_layout
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={},
+            claude_command=["claude"],
+            claude_argv=["--settings", "/tmp/s.json"],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+        assert '"claude"' in content
+        assert '"claude-mode"' not in content
+
+
+@pytest.mark.asyncio
+class TestRestartWithCustomCommand:
+    """Tests for restart_task with BRIDGE_CLAUDE_COMMAND."""
+
+    async def test_restart_live_pane_uses_custom_command(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --")
+        session_id = "12345678-1234-5678-1234-567812345678"
+        await upsert_task(
+            in_memory_db,
+            "task-cmd",
+            "999",
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id=session_id,
+            now=1000,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        write_calls = []
+        pane_list = [{"id": "terminal_1", "title": "", "pwd": "/tmp", "terminal_command": "claude", "exited": False}]
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        async def mock_list_panes() -> list:
+            return pane_list
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        await registry.restart_task("task-cmd")
+
+        assert len(write_calls) == 1
+        assert f"claude-mode extend -- --resume {session_id}" in write_calls[0]["text"]
