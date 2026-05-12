@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections.abc
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -94,6 +96,19 @@ class FakeDiscordBot:
     async def add_reactions(self, message_id: str, thread_id: str, emoji: list[str]) -> None:
         """Fake add_reactions: record the call."""
         self._reaction_calls.append({"message_id": message_id, "thread_id": thread_id, "emoji": emoji})
+
+    @contextlib.asynccontextmanager
+    async def start_typing(
+        self, thread_id: str
+    ) -> collections.abc.AsyncIterator[None]:
+        """Fake start_typing: delegates to FakeBotChannel typing context."""
+        if thread_id not in self._fake_channels:
+            self._fake_channels[thread_id] = FakeBotChannel(
+                id=int(thread_id) if thread_id.isdigit() else 1000
+            )
+        channel = self._fake_channels[thread_id]
+        async with channel.typing():
+            yield
 
     async def fetch_messageable(self, thread_id: str) -> FakeBotChannel:
         """Fake fetch_messageable: return a FakeBotChannel."""

@@ -5,6 +5,7 @@ import base64
 import contextlib
 import logging
 from pathlib import Path
+import collections.abc
 from typing import Awaitable, Callable, TypeVar
 
 import aiohttp
@@ -303,6 +304,21 @@ class DiscordBot:
             return True
         except discord.NotFound:
             return False
+
+    @contextlib.asynccontextmanager
+    async def start_typing(
+        self, thread_id: str
+    ) -> collections.abc.AsyncIterator[None]:
+        """Keep Discord typing indicator active via channel.typing()."""
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        discord_thread_id = int(thread_id)
+        channel = await self._client.fetch_channel(discord_thread_id)
+        if hasattr(channel, "typing"):
+            async with channel.typing():
+                yield
+        else:
+            yield
 
     async def fetch_messageable(self, thread_id: str) -> discord.abc.Messageable:
         """Resolve a thread id to a Messageable (caches via _client.fetch_channel)."""

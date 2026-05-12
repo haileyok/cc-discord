@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -119,6 +120,19 @@ class ChatPlatform(Protocol):
             thread_id: The ID of the thread/channel.
             message_id: The ID of the message to edit.
             content: New text content.
+        """
+        ...
+
+    def start_typing(
+        self, thread_id: str
+    ) -> contextlib.AbstractAsyncContextManager[None]:
+        """Return a context manager that keeps a typing indicator active.
+
+        The indicator is shown until the context is exited. Backends handle
+        their own periodic re-send if required by the platform API.
+
+        Args:
+            thread_id: The thread/channel to show typing in.
         """
         ...
 

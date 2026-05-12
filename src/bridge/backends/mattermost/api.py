@@ -112,6 +112,14 @@ class MattermostAPI:
         )
         return await self._request("POST", "/files", data=data)
 
+    async def trigger_typing(self, user_id: str, channel_id: str) -> None:
+        """Send a typing indicator. Lasts ~5-10s server-side."""
+        await self._request(
+            "POST",
+            f"/users/{user_id}/typing",
+            json={"channel_id": channel_id},
+        )
+
     async def download_file(self, file_id: str) -> bytes:
         return await self._request("GET", f"/files/{file_id}")
 

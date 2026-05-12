@@ -728,10 +728,7 @@ class TaskRegistry:
     async def _run_typing(self, task: Task) -> None:
         """Run typing indicator in background. Lives until cancelled."""
         try:
-            channel = await self._bot.fetch_messageable(task.thread_id)
-            if not hasattr(channel, "typing"):
-                return
-            async with channel.typing():
+            async with self._bot.start_typing(task.thread_id):
                 await asyncio.Future()
         except asyncio.CancelledError:
             return

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections.abc
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,7 @@ class FakePlatform:
     _reaction_calls: list[dict] = field(default_factory=list)
     _edit_calls: list[dict] = field(default_factory=list)
     _download_calls: list[dict] = field(default_factory=list)
+    _typing_calls: list[dict] = field(default_factory=list)
     _thread_counter: int = 0
     _message_counter: int = 0
 
@@ -136,6 +139,14 @@ class FakePlatform:
         self._edit_calls.append(
             {"thread_id": thread_id, "message_id": message_id, "content": content}
         )
+
+    @contextlib.asynccontextmanager
+    async def start_typing(
+        self, thread_id: str
+    ) -> collections.abc.AsyncIterator[None]:
+        """Fake start_typing: track calls."""
+        self._typing_calls.append({"thread_id": thread_id})
+        yield
 
     async def fetch_messageable(self, thread_id: str) -> FakeMessageable:
         """Fake fetch_messageable: return a FakeMessageable with typing context."""

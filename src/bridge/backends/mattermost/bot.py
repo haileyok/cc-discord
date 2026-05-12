@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import collections.abc
+import contextlib
 import logging
 import tempfile
 from datetime import datetime, timezone
@@ -127,6 +129,38 @@ class MattermostBot:
         if self._ws:
             await self._ws.close()
         await self._api.close()
+
+    @contextlib.asynccontextmanager
+    async def start_typing(
+        self, thread_id: str
+    ) -> collections.abc.AsyncIterator[None]:
+        """Keep Mattermost typing indicator active by re-posting every 4s."""
+        stop = asyncio.Event()
+
+        async def _loop() -> None:
+            while not stop.is_set():
+                try:
+                    assert self._bot_user_id is not None
+                    await self._api.trigger_typing(
+                        self._bot_user_id, self._channel_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "typing indicator failed for thread %s",
+                        thread_id,
+                        exc_info=True,
+                    )
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=4.0)
+                except TimeoutError:
+                    pass
+
+        task = asyncio.create_task(_loop())
+        try:
+            yield
+        finally:
+            stop.set()
+            await task
 
     async def post(
         self, message: str, *, thread_id: str | None = None

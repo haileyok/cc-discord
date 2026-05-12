@@ -1221,3 +1221,48 @@ class TestMattermostBotApprovalTextResolution:
         approval_router.resolve_tui_by_text.assert_not_called()
         # on_message should be called
         on_msg.assert_called_once_with(post)
+
+
+class TestMattermostBotTyping:
+    """Tests for typing indicators."""
+
+    @pytest.mark.asyncio
+    async def test_start_typing_sends_indicator(self):
+        """start_typing fires at least one trigger_typing call."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        bot._bot_user_id = "bot-user-123"
+        bot._api = mock.AsyncMock()
+
+        async with bot.start_typing("thread-456"):
+            await asyncio.sleep(0.05)
+
+        bot._api.trigger_typing.assert_called_with("bot-user-123", "channel-id")
+
+    @pytest.mark.asyncio
+    async def test_start_typing_stops_on_exit(self):
+        """The re-send loop stops cleanly when the context exits."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        bot._bot_user_id = "bot-user-123"
+        bot._api = mock.AsyncMock()
+
+        async with bot.start_typing("thread-456"):
+            await asyncio.sleep(0.05)
+
+        call_count_at_exit = bot._api.trigger_typing.call_count
+        await asyncio.sleep(0.1)
+        assert bot._api.trigger_typing.call_count == call_count_at_exit
+
+    @pytest.mark.asyncio
+    async def test_start_typing_survives_api_error(self):
+        """Typing loop keeps going if trigger_typing raises."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        bot._bot_user_id = "bot-user-123"
+        bot._api = mock.AsyncMock()
+        bot._api.trigger_typing = mock.AsyncMock(
+            side_effect=[Exception("network"), None]
+        )
+
+        async with bot.start_typing("thread-456"):
+            await asyncio.sleep(0.05)
+
+        assert bot._api.trigger_typing.call_count >= 1
