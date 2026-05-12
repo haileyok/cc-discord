@@ -4,18 +4,18 @@ Localhost HTTP bridge between Claude Code sessions and Discord or Mattermost. Lo
 
 ## What it does
 
-Runs as a small Python daemon (`aiohttp` + `discord.py`) on `127.0.0.1:8787`. Two modes, share one daemon:
+Runs as a small Python daemon (`aiohttp` + chat backend) on `127.0.0.1:8787`. Two modes, share one daemon:
 
 **Notification mode** (you run Claude in your terminal, the bridge listens):
 - **Stop hook** — Pings Discord when a Claude turn took >10 minutes. Result lands in a per-session thread.
 - **Notification hook** — Permission prompts and idle states surface as `⏸ awaiting input` in the same thread.
 - **`/ask-discord` skill** — Claude calls this when blocked; the question lands in the thread, the daemon waits up to 15 min for your reply, and Claude continues.
 
-**Discord-driven mode** (`/start` from Discord spawns Claude in a zellij tab):
-- Slash commands manage the lifecycle: `/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`.
-- The bridge mirrors assistant text, tool use (with fenced diffs for Edit/Write), subagent activity (live-updated embed per agent), and the session's task list back to its thread.
-- Discord replies in the thread relay into the pane; attachments are saved and their paths get inlined into the prompt so Claude reads them with the `Read` tool. Voice memos are auto-transcribed (Wispr Flow API or local `whisper`).
-- `AskUserQuestion` and `ExitPlanMode` round-trip through Discord reactions / text replies — no need to attach to the pane to answer.
+**Chat-driven mode** (`/start` or `!start` from chat spawns Claude in a zellij tab):
+- Commands manage the lifecycle: `/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks` (Discord slash commands) or `!start`, `!list`, etc. (Mattermost text commands).
+- The bridge mirrors assistant text, tool use (with fenced diffs for Edit/Write), subagent activity (live-updated embed per agent), and the session's task list back to its thread/channel.
+- Chat replies relay into the pane; attachments are saved and their paths get inlined into the prompt so Claude reads them with the `Read` tool. Voice memos are auto-transcribed (Wispr Flow API or local `whisper`).
+- `AskUserQuestion` and `ExitPlanMode` round-trip through reactions / text replies — no need to attach to the pane to answer.
 - The agent can attach files back by emitting `[[attach: /absolute/path]]` markers in its replies.
 
 A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallback when the daemon isn't running, so you don't lose pings if you forgot to start it.
@@ -26,6 +26,27 @@ A separate webhook URL at `~/.claude/discord-notify-webhook` is used as a fallba
 - **Discord** (optional): A Discord application with a bot, message-content intent enabled, invited to a guild you control, with permission to view + send messages + create public threads in one channel.
 - **Mattermost** (optional): A Mattermost server with a bot account, authorized to post to at least one channel, and an API token.
 - [Claude Code](https://docs.claude.com/claude-code) installed.
+
+## Runtime model
+
+The bridge has two process requirements depending on which mode you use:
+
+**1. The bridge daemon** (`cc-bridge serve`) — runs the HTTP server on `127.0.0.1:8787` and the chat backend (Discord bot or Mattermost WebSocket client). This is all you need for **notification mode**.
+
+**2. An attached zellij client** — required for **chat-driven mode** only. The bridge spawns Claude sessions as tabs in a zellij session (default: `cc-bridge-worker`). `zellij action write-chars` delivers keystrokes to panes, but it **silently returns 0 and drops input** if no terminal client is attached to the session. This means:
+
+- You must keep `zellij attach <session-name>` running in a terminal for chat-driven mode to work.
+- If the daemon runs as a launchd agent or systemd unit, you still need a separate terminal with the zellij client attached.
+- Docker containers cannot satisfy this requirement (no attached terminal), so Docker deployments are limited to notification mode.
+
+**Minimal chat-driven setup:**
+
+| Process | What to run |
+|---|---|
+| Daemon (launchd / systemd / terminal 1) | `cc-bridge serve` |
+| Terminal (must stay open) | `zellij attach cc-bridge-worker` |
+
+**Notification-only setup:** run the daemon only — no zellij needed.
 
 ## Setup
 
@@ -91,7 +112,7 @@ Replace `/home/<you>/cc-discord` with the actual repo path. Validate with `pytho
 
 If you already use `~/.claude/hooks/notify-long-task.sh` (or any other Stop hook), keep it on disk as rollback insurance — both hooks can coexist; this one just supersedes it.
 
-These two hooks cover **notification mode**. **Discord-driven mode** (sessions spawned via `/start`) gets a different set of hooks injected via `claude --settings <task-scoped-path>` automatically — you don't add them to your user `settings.json`. The task-scoped settings file is generated per `/start` invocation and cleaned up when the task ends. See the `Discord-driven sessions` section below.
+These two hooks cover **notification mode**. **Chat-driven mode** (sessions spawned via `/start` or `!start`) gets a different set of hooks injected via `claude --settings <task-scoped-path>` automatically — you don't add them to your user `settings.json`. The task-scoped settings file is generated per task and cleaned up when it ends. See the `Chat-driven sessions` section below.
 
 ### 4. Install the `/ask-discord` skill
 
@@ -104,7 +125,7 @@ ln -sfn "$(pwd)/skills/SKILL.md" ~/.claude/skills/ask-discord/SKILL.md
 
 After symlinking, run `/reload-plugins` in a Claude Code session — `/ask-discord` will appear in the slash-command picker.
 
-### 5. Webhook fallback (optional)
+### 5. Webhook fallback (optional, Discord only)
 
 Create a Discord channel webhook (channel settings → Integrations → Webhooks → New Webhook → copy URL), then write the URL to `~/.claude/discord-notify-webhook`:
 
@@ -116,6 +137,8 @@ chmod 0600 ~/.claude/discord-notify-webhook
 When the daemon's down, the Stop and Notification hooks fall back to this webhook (channel root instead of a thread), so you still get pinged.
 
 ### 6. Start the daemon
+
+> Starting the daemon is sufficient for notification mode. For chat-driven mode, you also need an attached zellij client — see [Runtime model](#runtime-model) above.
 
 **Foreground (simplest):**
 ```bash
@@ -130,7 +153,7 @@ bash scripts/install-systemd-user.sh   # copies the unit file into ~/.config/sys
 systemctl --user daemon-reload
 systemctl --user enable --now cc-bridge
 ```
-If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl enable-linger $USER` first.
+If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl enable-linger $USER` first. The unit defaults to `BRIDGE_PLATFORM=discord`; to use Mattermost, edit `~/.config/systemd/user/cc-bridge.service`, change the `Environment=` line, then `systemctl --user daemon-reload && systemctl --user restart cc-bridge`.
 
 **macOS launchd user agent (survives reboots and login):**
 
@@ -160,6 +183,8 @@ Write `~/Library/LaunchAgents/local.cc-bridge.plist`, replacing `<you>` with you
     <string>/Users/<you>/Library/Logs/cc-bridge.log</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>BRIDGE_PLATFORM</key>
+        <string>discord</string>
         <key>PATH</key>
         <string>/Users/<you>/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
@@ -172,7 +197,9 @@ Load it:
 launchctl load -w ~/Library/LaunchAgents/local.cc-bridge.plist
 ```
 
-`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Tail the log with `tail -f ~/Library/Logs/cc-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/local.cc-bridge.plist`.
+`PATH` must include wherever your `zellij` and `claude` binaries live (Homebrew, cargo, nix) — launchd agents don't inherit your shell's `PATH`. Set `BRIDGE_PLATFORM` to `mattermost` if using the Mattermost backend. Tail the log with `tail -f ~/Library/Logs/cc-bridge.log`. To stop: `launchctl unload ~/Library/LaunchAgents/local.cc-bridge.plist`.
+
+**Docker:** The Docker image runs the daemon but cannot provide an attached zellij client, so chat-driven mode (`/start`, `!start`) will not work. Use Docker for notification-mode-only deployments. See [Runtime model](#runtime-model).
 
 ### 7. Verify
 
@@ -254,14 +281,7 @@ Commands without a task_id argument operate on the most recently started task fo
    ```
    Verify: `zellij --version`
 
-2. **Pick a session name** (optional). The bridge defaults to `cc-bridge-worker`; override by exporting `BRIDGE_ZELLIJ_SESSION=<name>` before starting the daemon. To attach and watch tabs:
-   ```bash
-   zellij attach cc-bridge-worker
-   ```
-
-3. **State directories** are auto-created under `~/.local/state/cc-bridge/` (task-settings, attachments, the SQLite db). No manual setup needed.
-
-4. **Optional: get `@`-mentioned when claude is stuck**. Export `BRIDGE_NOTIFY_USER_ID=<your-discord-user-id>` so AskUserQuestion / ExitPlanMode / free-text-stall prompts prefix with a mention.
+2. **Optional: get `@`-mentioned when claude is stuck**. Export `BRIDGE_NOTIFY_USER_ID=<your-discord-user-id>` so AskUserQuestion / ExitPlanMode / free-text-stall prompts prefix with a mention. (Discord only)
 
 ### Configuration env vars
 
@@ -269,6 +289,7 @@ Commands without a task_id argument operate on the most recently started task fo
 |---|---|---|
 | `BRIDGE_PLATFORM` | `discord` | Which backend to use: `discord` or `mattermost`. |
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Where hooks POST events. Override only if you run the daemon on a non-default port. |
+| `BRIDGE_CLAUDE_COMMAND` | `claude` | Shell command to launch Claude. Set to a wrapper like `claude-mode extend --` if needed. |
 | `BRIDGE_ZELLIJ_SESSION` | `cc-bridge-worker` | zellij session name the bridge spawns task tabs into. |
 | `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. (Discord only) |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
