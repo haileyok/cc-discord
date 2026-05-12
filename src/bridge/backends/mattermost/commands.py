@@ -96,7 +96,7 @@ async def dispatch_text_command(
         task_id = args[0] if args else None
         return await handle_stats(registry, thread_id=thread_id, task_id=task_id)
 
-    elif command == "rename":
+    elif command in ("rename", "retitle"):
         name = " ".join(args) if args else None
         return await handle_rename(registry, thread_id=thread_id, name=name)
 
@@ -140,7 +140,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "list": "List active tasks",
     "restart": "Restart a task with --resume",
     "skill": "Invoke a Claude Code skill in the task's session",
-    "rename": "Rename the task's thread",
+    "retitle": "Rename the task's thread",
     "stats": "Show model / token / cost stats for a task",
     "tasks": "Show claude's session task list",
 }
@@ -152,7 +152,7 @@ SLASH_HINTS: dict[str, str] = {
     "list": "",
     "restart": "[task_id]",
     "skill": "<name> [args]",
-    "rename": "[name]",
+    "retitle": "[name]",
     "stats": "[task_id]",
     "tasks": "[task_id]",
 }
