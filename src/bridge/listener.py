@@ -1,4 +1,4 @@
-"""Listener for routing Discord messages to pending /v1/ask calls.
+"""Listener for routing chat platform messages to pending /v1/ask calls.
 
 Implements sliding-window coalescing for multi-message replies within a grace
 period. At most one pending ask per thread; FIFO ordering is enforced by
@@ -22,8 +22,8 @@ class AskResult:
     replied_at: str  # ISO8601 of the *last* coalesced message
 
 
-# Anything with the discord.py-Message shape we care about. Tests pass
-# small dataclasses; runtime passes real discord.Message objects.
+# Anything with the message shape we care about. Tests pass
+# small dataclasses; runtime passes real Message objects from the platform backend.
 class MessageLike(Protocol):
     """Protocol for message-like objects."""
 
@@ -92,7 +92,7 @@ class _PendingAsk:
 
 
 class Listener:
-    """Routes incoming Discord messages to pending /v1/ask calls.
+    """Routes incoming chat platform messages to pending /v1/ask calls.
 
     At most one pending ask per thread. FIFO ordering is enforced by
     server.AskLockMap — the lock is acquired before register(), so by the

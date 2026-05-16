@@ -1,4 +1,4 @@
-"""Skill enumeration for the `/skill` Discord slash command.
+"""Skill enumeration for the `/skill` slash command.
 
 Walks the user-level skills directory plus enabled-plugin skill directories
 listed in `~/.claude/plugins/installed_plugins.json`, scoped by the enabled

@@ -1,4 +1,4 @@
-"""Task and TaskRegistry for managing discord-driven sessions."""
+"""Task and TaskRegistry for managing chat-platform-driven sessions."""
 
 from __future__ import annotations
 
@@ -72,7 +72,7 @@ def _get_claude_command() -> list[str]:
 
 @dataclass
 class SubagentBlock:
-    """Per-subagent live-updating Discord message: tracks state for one
+    """Per-subagent live-updating message: tracks state for one
     subagent (identified by `agent_id`) so we can edit a single message in
     place as the subagent runs, instead of streaming each tool call as its
     own message.
@@ -315,7 +315,7 @@ class TaskRestartError(Exception):
 
 
 class _ToolSummaryAggregator:
-    """Collects PostToolUse summaries within a 1s window and flushes as one Discord message.
+    """Collects PostToolUse summaries within a 1s window and flushes as one message.
 
     On 429 rate limit, enters slow mode (5s window) for the task's lifetime.
     """
@@ -725,7 +725,7 @@ class TaskRegistry:
         _cleanup_task_artifacts(task.task_id)
 
     async def _archive_thread(self, thread_id: str) -> None:
-        """Archive a Discord thread."""
+        """Archive a chat platform thread."""
         try:
             await self._bot.archive_thread(thread_id)
         except Exception:
@@ -766,11 +766,11 @@ class TaskRegistry:
         return agg
 
     async def spawn_task(self, cwd: str, *, prompt: str | None = None) -> Task:
-        """Spawn a new claude session in a Discord-bound task.
+        """Spawn a new claude session in a chat-platform-bound task.
 
         1. Validates cwd is a directory.
         2. Generates a task_id UUID.
-        3. Creates a Discord thread.
+        3. Creates a chat platform thread.
         4. Persists a row with status='spawning'.
         5. Builds env with CC_BRIDGE_TASK_ID (and CC_DISCORD_TASK_ID for backward compat) and BRIDGE_URL.
         6. Spawns claude in zellij via ZellijManager.
@@ -1020,7 +1020,7 @@ class TaskRegistry:
         return False
 
     async def _save_attachments(self, task_id: str, msg: MessageLike) -> list[Path]:
-        """Download Discord attachments to disk under ATTACHMENTS_DIR/<task_id>/.
+        """Download chat platform attachments to disk under ATTACHMENTS_DIR/<task_id>/.
 
         Filenames are sanitized to the basename and prefixed with the message id
         to avoid collisions when the same name is attached multiple times.
@@ -1595,7 +1595,7 @@ class TaskRegistry:
             logger.info("Stop: no transcript_path in body or task; skipping final stream")
 
     async def _post_stats_footer(self, task: Task, transcript_path: Path) -> None:
-        """After Stop, post a one-line model/tokens/cost summary to Discord."""
+        """After Stop, post a one-line model/tokens/cost summary to chat platform."""
         try:
             stats = usage.compute_stats(transcript_path)
         except Exception:
@@ -1767,12 +1767,12 @@ class TaskRegistry:
 
     @staticmethod
     def _format_thinking(text: str) -> str:
-        """Discord-render a thinking block: 🤔 + multi-line italics."""
+        """Render a thinking block: 🤔 + multi-line italics."""
         return f"🤔 *{text.strip()}*"
 
     async def _refresh_subagent_blocks(self, task: Task) -> None:
         """Scan `<session>/subagents/agent-*.jsonl` and create/update one
-        `SubagentBlock` per file. Each block is a single Discord message
+        `SubagentBlock` per file. Each block is a single message
         edited in place to show the last N actions of that subagent.
 
         Idempotent — uses `last_entry_uuid` for change detection so we only
@@ -2149,7 +2149,7 @@ class TaskRegistry:
             )
 
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
-        """Handle AskUserQuestion prompt: post each question to Discord with
+        """Handle AskUserQuestion prompt: post each question to chat platform with
         option reactions, in sequence.
 
         Single-select: numeric reactions resolve immediately to the selected
@@ -2285,7 +2285,7 @@ class TaskRegistry:
                 )
 
     async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
-        """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""
+        """Handle ExitPlanMode prompt: post plan to chat platform with approve/reject reactions."""
         await self._flush_pending_text_before_prompt(task)
         if not self._approval_router:
             logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)

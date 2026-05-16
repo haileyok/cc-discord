@@ -1,8 +1,8 @@
-"""ApprovalRouter — bridges PreToolUse hook calls to Discord reaction round-trips.
+"""ApprovalRouter — bridges PreToolUse hook calls to chat platform reaction round-trips.
 
 Holds an in-memory dict[request_id -> Future]. The HTTP handler in server.py registers
-a Future, posts the approval prompt in Discord, and awaits the Future with a 600s timeout.
-The bot's reaction handler resolves Futures by request_id (looked up via the message_id
+a Future, posts the approval prompt to the chat platform, and awaits the Future with a 600s timeout.
+The backend's reaction handler resolves Futures by request_id (looked up via the message_id
 the bot just posted).
 """
 
@@ -116,7 +116,7 @@ class ApprovalRouter:
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> tuple[str, str]:
-        """Post the approval prompt to Discord, wait for resolution.
+        """Post the approval prompt to chat platform, wait for resolution.
 
         Returns (decision, reason). Always returns — never raises (timeout → ('deny', '...')).
         """
@@ -141,7 +141,7 @@ class ApprovalRouter:
             if not message_ids:
                 # Empty response - fail closed
                 await self._cleanup(request_id)
-                return ("deny", "could not post approval prompt to Discord")
+                return ("deny", "could not post approval prompt")
             primary_msg_id = message_ids[0]
             pending.message_id = primary_msg_id
             async with self._lock:
@@ -447,7 +447,7 @@ class ApprovalRouter:
 
     async def cancel_thread_tui(self, thread_id: str) -> int:
         """Cancel all pending TUI prompts in this thread (used when zellij UserPromptSubmit
-        fires while a Discord prompt is still pending). Returns count cancelled.
+        fires while a chat prompt is still pending). Returns count cancelled.
 
         Uses sentinel approach: resolves with ("", "cancelled") instead of calling .cancel(),
         so request_tui_answer doesn't raise CancelledError.

@@ -197,7 +197,7 @@ def _compute_cost(
 
 
 def format_summary(stats: Stats) -> str:
-    """Render a one-line Discord footer with the session's stats."""
+    """Render a one-line footer with the session's stats for the chat platform."""
     model = stats.model or "?"
     used_str = _humanize_tokens(stats.last_context_size)
     if stats.context_window:
