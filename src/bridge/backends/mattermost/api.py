@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +45,9 @@ class MattermostAPI:
         assert self._session is not None, "call start() first"
         async with self._session.request(method, self._url(path), **kwargs) as resp:
             if resp.status == 429:
-                retry_after = resp.headers.get("X-RateLimit-Reset", "1")
-                raise RateLimitError(float(retry_after))
+                reset_epoch = float(resp.headers.get("X-RateLimit-Reset", "0"))
+                retry_after = max(reset_epoch - time.time(), 0.5)
+                raise RateLimitError(retry_after)
             resp.raise_for_status()
             if resp.content_type == "application/json":
                 return await resp.json()

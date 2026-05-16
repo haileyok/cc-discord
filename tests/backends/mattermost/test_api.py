@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -338,9 +339,11 @@ class TestMattermostAPI:
         api = MattermostAPI("https://mm.example.com", "token")
 
         # Create mock response with 429 status
+        # X-RateLimit-Reset should be an epoch timestamp
+        future_timestamp = str(int(time.time()) + 3)
         mock_resp = mock.Mock()
         mock_resp.status = 429
-        mock_resp.headers = {"X-RateLimit-Reset": "3.5"}
+        mock_resp.headers = {"X-RateLimit-Reset": future_timestamp}
 
         # Create a context manager that returns the mock response
         @contextlib.asynccontextmanager
@@ -354,7 +357,8 @@ class TestMattermostAPI:
         with pytest.raises(RateLimitError) as exc_info:
             await api._request("GET", "/test")
 
-        assert exc_info.value.retry_after == 3.5
+        # Should be approximately 3 seconds (with tolerance for timing variation)
+        assert 2 <= exc_info.value.retry_after <= 4
 
     @pytest.mark.asyncio
     async def test_request_handles_json_response(self):
@@ -445,3 +449,53 @@ class TestMattermostAPI:
 
         with pytest.raises(aiohttp.ClientResponseError):
             await api._request("GET", "/test")
+
+    @pytest.mark.asyncio
+    async def test_request_rate_limit_future_timestamp(self):
+        """Test _request() parses X-RateLimit-Reset as epoch timestamp (future)."""
+        api = MattermostAPI("https://mm.example.com", "token")
+
+        # Set reset time to 5 seconds in the future
+        future_timestamp = str(int(time.time()) + 5)
+        mock_resp = mock.Mock()
+        mock_resp.status = 429
+        mock_resp.headers = {"X-RateLimit-Reset": future_timestamp}
+
+        @contextlib.asynccontextmanager
+        async def mock_request(*args, **kwargs):
+            yield mock_resp
+
+        mock_session = mock.Mock()
+        mock_session.request = mock_request
+        api._session = mock_session
+
+        with pytest.raises(RateLimitError) as exc_info:
+            await api._request("GET", "/test")
+
+        # retry_after should be between 0 and 6 (approximately 5 seconds)
+        assert 0 <= exc_info.value.retry_after <= 6
+
+    @pytest.mark.asyncio
+    async def test_request_rate_limit_past_timestamp(self):
+        """Test _request() uses floor of 0.5 for past timestamps."""
+        api = MattermostAPI("https://mm.example.com", "token")
+
+        # Set reset time to 10 seconds in the past
+        past_timestamp = str(int(time.time()) - 10)
+        mock_resp = mock.Mock()
+        mock_resp.status = 429
+        mock_resp.headers = {"X-RateLimit-Reset": past_timestamp}
+
+        @contextlib.asynccontextmanager
+        async def mock_request(*args, **kwargs):
+            yield mock_resp
+
+        mock_session = mock.Mock()
+        mock_session.request = mock_request
+        api._session = mock_session
+
+        with pytest.raises(RateLimitError) as exc_info:
+            await api._request("GET", "/test")
+
+        # retry_after should be exactly 0.5 (the minimum)
+        assert exc_info.value.retry_after == 0.5
