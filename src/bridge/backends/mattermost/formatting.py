@@ -79,6 +79,43 @@ def format_tool_diff(tool_name: str, diff_text: str) -> str:
     return diff_text
 
 
+def format_agent_task_list(entries: list[dict], done: int, total: int) -> str:
+    """Format an agent's TodoWrite task list as a Mattermost checklist.
+
+    This renders the task_list_state from a Claude session (TodoWrite items),
+    as opposed to format_task_list which renders bridge Task sessions.
+
+    Args:
+        entries: List of dicts with "id", "status", "subject" keys.
+        done: Count of completed tasks.
+        total: Total task count.
+
+    Returns:
+        Markdown checklist string with header and footer.
+    """
+    if not entries:
+        return "**📋 Tasks**\n_(no tasks)_"
+
+    lines = ["**📋 Tasks**"]
+    for entry in entries:
+        tid = entry.get("id", "?")
+        status = entry.get("status", "pending")
+        subject = entry.get("subject", "")
+        mark = {
+            "completed": "✅",
+            "in_progress": "▶️",
+            "deleted": "🗑",
+            "pending": "⬜",
+        }.get(status, "⬜")
+        line = f"{mark} #{tid}"
+        if subject:
+            line += f" {subject}"
+        lines.append(line)
+
+    lines.append(f"_{done}/{total} done_")
+    return "\n".join(lines)
+
+
 def format_task_todos(todos: list[dict]) -> str:
     """Format TodoWrite as Mattermost checklist.
 

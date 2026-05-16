@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from bridge.backends.mattermost.formatting import (
+    format_agent_task_list,
     format_subagent_block,
     format_task_list,
     format_task_todos,
@@ -51,7 +52,11 @@ class MattermostRichFormatter:
                 data["duration"],
             )
         elif block_type == "task_list":
-            text = format_task_list(data["tasks"])
+            text = format_agent_task_list(
+                data["entries"],
+                data["done"],
+                data["total"],
+            )
         elif block_type == "todo_list":
             text = format_task_todos(data["todos"])
         else:
@@ -83,6 +88,14 @@ class MattermostRichFormatter:
                 data["finished"],
                 data["duration"],
             )
+        elif block_type == "task_list":
+            text = format_agent_task_list(
+                data["entries"],
+                data["done"],
+                data["total"],
+            )
+        elif block_type == "todo_list":
+            text = format_task_todos(data["todos"])
         else:
             text = str(data)
 

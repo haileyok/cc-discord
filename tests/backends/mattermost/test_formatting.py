@@ -256,7 +256,7 @@ class TestMattermostRichFormatter:
 
     @pytest.mark.asyncio
     async def test_post_rich_task_list(self):
-        """Test posting a task list."""
+        """Test posting a task list (agent TodoWrite entries)."""
         from bridge.backends.mattermost.rich_formatter import MattermostRichFormatter
 
         bot = mock.AsyncMock()
@@ -264,20 +264,29 @@ class TestMattermostRichFormatter:
 
         formatter = MattermostRichFormatter(bot)
 
-        task = mock.MagicMock()
-        task.task_id = "abc123"
-        task.status = "running"
-        task.cwd_leaf = "src"
-        task.age = "2m"
-
         result = await formatter.post_rich(
-            "thread123", "task_list", {"tasks": [task]}
+            "thread123",
+            "task_list",
+            {
+                "entries": [
+                    {"id": "1", "status": "completed", "subject": "write tests"},
+                    {"id": "2", "status": "in_progress", "subject": "refactor"},
+                    {"id": "3", "status": "pending", "subject": "deploy"},
+                ],
+                "done": 1,
+                "total": 3,
+                "in_progress": 1,
+            },
         )
 
         assert result == "msg456"
         bot.post.assert_called_once()
         call_args = bot.post.call_args
-        assert "abc123" in call_args[0][0]
+        text = call_args[0][0]
+        assert "Tasks" in text
+        assert "#1" in text
+        assert "write tests" in text
+        assert "1/3 done" in text
 
     @pytest.mark.asyncio
     async def test_post_rich_todo_list(self):
@@ -329,6 +338,71 @@ class TestMattermostRichFormatter:
         assert call_args[0] == ("thread123", "msg123")
         assert "researcher" in call_args[1]["content"]
         assert "finished" in call_args[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_edit_rich_task_list(self):
+        """Test editing a task list block (agent TodoWrite entries)."""
+        from bridge.backends.mattermost.rich_formatter import MattermostRichFormatter
+
+        bot = mock.AsyncMock()
+        bot.edit_message = mock.AsyncMock()
+
+        formatter = MattermostRichFormatter(bot)
+
+        await formatter.edit_rich(
+            "thread123",
+            "msg456",
+            "task_list",
+            {
+                "entries": [
+                    {"id": "1", "status": "completed", "subject": "done task"},
+                    {"id": "2", "status": "pending", "subject": "todo task"},
+                ],
+                "done": 1,
+                "total": 2,
+                "in_progress": 0,
+            },
+        )
+
+        bot.edit_message.assert_called_once()
+        call_args = bot.edit_message.call_args
+        assert call_args[0] == ("thread123", "msg456")
+        text = call_args[1]["content"]
+        assert "Tasks" in text
+        assert "#1" in text
+        assert "done task" in text
+        assert "1/2 done" in text
+
+    @pytest.mark.asyncio
+    async def test_edit_rich_todo_list(self):
+        """Test editing a todo_list block."""
+        from bridge.backends.mattermost.rich_formatter import MattermostRichFormatter
+
+        bot = mock.AsyncMock()
+        bot.edit_message = mock.AsyncMock()
+
+        formatter = MattermostRichFormatter(bot)
+
+        await formatter.edit_rich(
+            "thread123",
+            "msg789",
+            "todo_list",
+            {
+                "todos": [
+                    {"status": "completed", "content": "finished item"},
+                    {"status": "in_progress", "content": "active item"},
+                ],
+            },
+        )
+
+        bot.edit_message.assert_called_once()
+        call_args = bot.edit_message.call_args
+        assert call_args[0] == ("thread123", "msg789")
+        text = call_args[1]["content"]
+        assert "✅" in text
+        assert "finished item" in text
+        assert "▶️" in text
+        assert "active item" in text
 
     @pytest.mark.asyncio
     async def test_post_rich_unknown_block_type(self):
