@@ -11,8 +11,10 @@ import pytest
 from bridge.backends.mattermost.bot import (
     BotNotReady,
     MattermostBot,
+    MattermostMessageAdapter,
     _chunk,
     _emoji_to_mattermost,
+    _extract_images,
     _mattermost_to_emoji,
     _process_post_files,
 )
@@ -765,10 +767,11 @@ class TestAudioProcessing:
         post = {"message": "hello", "file_ids": []}
         api = mock.AsyncMock()
 
-        voice_blocks, file_refs = await _process_post_files(post, api)
+        voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
 
         assert voice_blocks == []
         assert file_refs == []
+        assert image_attachments == []
 
     @pytest.mark.asyncio
     async def test_process_post_files_with_non_audio_file(self):
@@ -786,12 +789,13 @@ class TestAudioProcessing:
             }
         )
 
-        voice_blocks, file_refs = await _process_post_files(post, api)
+        voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
 
         assert voice_blocks == []
         assert len(file_refs) == 1
         assert file_refs[0]["id"] == "file1"
         assert file_refs[0]["name"] == "document.pdf"
+        assert image_attachments == []
 
     @pytest.mark.asyncio
     async def test_process_post_files_with_audio_file_successful_transcription(self):
@@ -813,11 +817,12 @@ class TestAudioProcessing:
         with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
             mock_transcribe.return_value = "hello world"
 
-            voice_blocks, file_refs = await _process_post_files(post, api)
+            voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
 
         assert len(voice_blocks) == 1
         assert "[voice memo] hello world" in voice_blocks[0]
         assert file_refs == []
+        assert image_attachments == []
 
     @pytest.mark.asyncio
     async def test_process_post_files_with_audio_file_transcription_failure(self):
@@ -839,11 +844,12 @@ class TestAudioProcessing:
         with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
             mock_transcribe.return_value = None
 
-            voice_blocks, file_refs = await _process_post_files(post, api)
+            voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
 
         assert len(voice_blocks) == 1
         assert "[voice memo received — transcription unavailable" in voice_blocks[0]
         assert file_refs == []
+        assert image_attachments == []
 
     @pytest.mark.asyncio
     async def test_process_post_files_with_mixed_audio_and_non_audio(self):
@@ -877,13 +883,71 @@ class TestAudioProcessing:
         with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
             mock_transcribe.side_effect = ["memo transcription", "note transcription"]
 
-            voice_blocks, file_refs = await _process_post_files(post, api)
+            voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
 
         assert len(voice_blocks) == 2
         assert "[voice memo] memo transcription" in voice_blocks[0]
         assert "[voice memo] note transcription" in voice_blocks[1]
         assert len(file_refs) == 1
         assert file_refs[0]["id"] == "file2"
+        assert image_attachments == []
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_image_file(self):
+        """Test image files are downloaded and returned as image attachments."""
+        import base64
+        post = {
+            "message": "check this",
+            "file_ids": ["img1"],
+        }
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "img1",
+                "name": "photo.png",
+                "mime_type": "image/png",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
+
+        voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
+
+        assert voice_blocks == []
+        assert file_refs == []
+        assert len(image_attachments) == 1
+        assert image_attachments[0]["filename"] == "photo.png"
+        assert image_attachments[0]["media_type"] == "image/png"
+        assert image_attachments[0]["data"] == base64.b64encode(b"\x89PNG\r\n\x1a\n").decode("ascii")
+
+    @pytest.mark.asyncio
+    async def test_process_post_files_with_mixed_audio_image_and_other(self):
+        """Test mixed audio, image, and other files are handled correctly."""
+        import base64
+        post = {
+            "message": "check these",
+            "file_ids": ["audio1", "img1", "doc1"],
+        }
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            side_effect=[
+                {"id": "audio1", "name": "memo.wav", "mime_type": "audio/wav"},
+                {"id": "img1", "name": "photo.jpg", "mime_type": "image/jpeg"},
+                {"id": "doc1", "name": "report.pdf", "mime_type": "application/pdf"},
+            ]
+        )
+        api.download_file = mock.AsyncMock(return_value=b"fake data")
+
+        with mock.patch("bridge.backends.mattermost.bot.voice.transcribe") as mock_transcribe:
+            mock_transcribe.return_value = "audio content"
+            voice_blocks, file_refs, image_attachments = await _process_post_files(post, api)
+
+        assert len(voice_blocks) == 1
+        assert "[voice memo] audio content" in voice_blocks[0]
+        assert len(file_refs) == 1
+        assert file_refs[0]["id"] == "doc1"
+        assert len(image_attachments) == 1
+        assert image_attachments[0]["filename"] == "photo.jpg"
+        assert image_attachments[0]["media_type"] == "image/jpeg"
 
     @pytest.mark.asyncio
     async def test_handle_event_includes_transcription_in_message(self):
@@ -1404,3 +1468,346 @@ class TestMattermostBotNotReadyGuards:
 
         with pytest.raises(BotNotReady):
             await bot.fetch_messageable("thread1")
+
+
+class TestExtractImages:
+    """Tests for the _extract_images standalone function."""
+
+    @pytest.mark.asyncio
+    async def test_extract_images_returns_base64_for_image_file(self):
+        """Test that image files are downloaded and base64-encoded."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "img1",
+                "name": "photo.png",
+                "mime_type": "image/png",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
+
+        post = {"file_ids": ["img1"]}
+        results = await _extract_images(post, api)
+
+        assert len(results) == 1
+        assert results[0]["type"] == "image"
+        assert results[0]["source"]["type"] == "base64"
+        assert results[0]["source"]["media_type"] == "image/png"
+        import base64
+        assert results[0]["source"]["data"] == base64.b64encode(b"\x89PNG\r\n\x1a\n").decode("ascii")
+
+    @pytest.mark.asyncio
+    async def test_extract_images_skips_non_image_files(self):
+        """Test that non-image files are skipped."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "doc1",
+                "name": "report.pdf",
+                "mime_type": "application/pdf",
+            }
+        )
+
+        post = {"file_ids": ["doc1"]}
+        results = await _extract_images(post, api)
+
+        assert results == []
+        api.download_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_extract_images_skips_audio_files(self):
+        """Test that audio files are skipped."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "audio1",
+                "name": "memo.wav",
+                "mime_type": "audio/wav",
+            }
+        )
+
+        post = {"file_ids": ["audio1"]}
+        results = await _extract_images(post, api)
+
+        assert results == []
+        api.download_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_extract_images_handles_jpeg(self):
+        """Test JPEG images are extracted correctly."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "img1",
+                "name": "photo.jpg",
+                "mime_type": "image/jpeg",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"\xff\xd8\xff")
+
+        post = {"file_ids": ["img1"]}
+        results = await _extract_images(post, api)
+
+        assert len(results) == 1
+        assert results[0]["source"]["media_type"] == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_extract_images_handles_gif(self):
+        """Test GIF images are extracted correctly."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "img1",
+                "name": "anim.gif",
+                "mime_type": "image/gif",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"GIF89a")
+
+        post = {"file_ids": ["img1"]}
+        results = await _extract_images(post, api)
+
+        assert len(results) == 1
+        assert results[0]["source"]["media_type"] == "image/gif"
+
+    @pytest.mark.asyncio
+    async def test_extract_images_handles_webp(self):
+        """Test WebP images are extracted correctly."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "img1",
+                "name": "photo.webp",
+                "mime_type": "image/webp",
+            }
+        )
+        api.download_file = mock.AsyncMock(return_value=b"RIFF....WEBP")
+
+        post = {"file_ids": ["img1"]}
+        results = await _extract_images(post, api)
+
+        assert len(results) == 1
+        assert results[0]["source"]["media_type"] == "image/webp"
+
+    @pytest.mark.asyncio
+    async def test_extract_images_multiple_files_mixed(self):
+        """Test multiple files: only images are extracted."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            side_effect=[
+                {"id": "img1", "name": "photo.png", "mime_type": "image/png"},
+                {"id": "doc1", "name": "report.pdf", "mime_type": "application/pdf"},
+                {"id": "img2", "name": "banner.jpg", "mime_type": "image/jpeg"},
+            ]
+        )
+        api.download_file = mock.AsyncMock(return_value=b"bytes")
+
+        post = {"file_ids": ["img1", "doc1", "img2"]}
+        results = await _extract_images(post, api)
+
+        assert len(results) == 2
+        assert api.download_file.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_extract_images_returns_empty_for_no_file_ids(self):
+        """Test that posts without file_ids return empty list."""
+        api = mock.AsyncMock()
+
+        post = {"message": "no files"}
+        results = await _extract_images(post, api)
+
+        assert results == []
+        api.get_file_info.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_extract_images_skips_on_file_info_error(self):
+        """Test that errors fetching file info are logged and skipped."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(side_effect=Exception("API error"))
+
+        post = {"file_ids": ["img1"]}
+        results = await _extract_images(post, api)
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_extract_images_skips_on_download_error(self):
+        """Test that errors downloading files are logged and skipped."""
+        api = mock.AsyncMock()
+        api.get_file_info = mock.AsyncMock(
+            return_value={"id": "img1", "name": "photo.png", "mime_type": "image/png"}
+        )
+        api.download_file = mock.AsyncMock(side_effect=Exception("Download failed"))
+
+        post = {"file_ids": ["img1"]}
+        results = await _extract_images(post, api)
+
+        assert results == []
+
+
+class TestMattermostMessageAdapterWithImages:
+    """Tests for MattermostMessageAdapter image attachment support."""
+
+    def test_adapter_attachments_empty_when_no_image_data(self):
+        """Test that adapters without image data have empty attachments."""
+        post = {"id": "msg1", "message": "hello"}
+        adapter = MattermostMessageAdapter(post)
+        assert adapter.attachments == []
+
+    def test_adapter_attachments_populated_from_image_data(self):
+        """Test that adapters with _mm_image_attachments have populated attachments."""
+        import base64
+        image_bytes = b"\x89PNG\r\n"
+        post = {
+            "id": "msg1",
+            "message": "check this image",
+            "_mm_image_attachments": [
+                {
+                    "filename": "photo.png",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            ],
+        }
+        adapter = MattermostMessageAdapter(post)
+        assert len(adapter.attachments) == 1
+
+    @pytest.mark.asyncio
+    async def test_adapter_attachment_read_returns_bytes(self):
+        """Test that attachment .read() returns the original bytes."""
+        import base64
+        image_bytes = b"\x89PNG\r\n\x1a\ntest"
+        post = {
+            "id": "msg1",
+            "message": "image",
+            "_mm_image_attachments": [
+                {
+                    "filename": "photo.png",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            ],
+        }
+        adapter = MattermostMessageAdapter(post)
+        assert len(adapter.attachments) == 1
+        data = await adapter.attachments[0].read()
+        assert data == image_bytes
+
+    def test_adapter_attachment_has_filename(self):
+        """Test that attachment has correct filename attribute."""
+        import base64
+        post = {
+            "id": "msg1",
+            "message": "image",
+            "_mm_image_attachments": [
+                {
+                    "filename": "my_photo.jpg",
+                    "media_type": "image/jpeg",
+                    "data": base64.b64encode(b"jpeg").decode("ascii"),
+                }
+            ],
+        }
+        adapter = MattermostMessageAdapter(post)
+        assert adapter.attachments[0].filename == "my_photo.jpg"
+
+    def test_adapter_multiple_image_attachments(self):
+        """Test that multiple images are all included."""
+        import base64
+        post = {
+            "id": "msg1",
+            "message": "images",
+            "_mm_image_attachments": [
+                {
+                    "filename": "img1.png",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(b"png1").decode("ascii"),
+                },
+                {
+                    "filename": "img2.jpg",
+                    "media_type": "image/jpeg",
+                    "data": base64.b64encode(b"jpg2").decode("ascii"),
+                },
+            ],
+        }
+        adapter = MattermostMessageAdapter(post)
+        assert len(adapter.attachments) == 2
+        assert adapter.attachments[0].filename == "img1.png"
+        assert adapter.attachments[1].filename == "img2.jpg"
+
+
+class TestImageExtractionIntegration:
+    """Integration tests for image extraction through the _handle_event flow."""
+
+    @pytest.mark.asyncio
+    async def test_handle_event_populates_image_attachments_in_post(self):
+        """Test that posted events with images populate _mm_image_attachments."""
+        handler = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=handler,
+        )
+        bot._bot_user_id = "bot123"
+        bot._api = mock.AsyncMock()
+        bot._api.get_file_info = mock.AsyncMock(
+            return_value={
+                "id": "img1",
+                "name": "photo.png",
+                "mime_type": "image/png",
+            }
+        )
+        bot._api.download_file = mock.AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
+
+        post = {
+            "id": "msg1",
+            "message": "check this",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "file_ids": ["img1"],
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        handler.assert_called_once()
+        called_post = handler.call_args[0][0]
+        assert "_mm_image_attachments" in called_post
+        assert len(called_post["_mm_image_attachments"]) == 1
+        assert called_post["_mm_image_attachments"][0]["filename"] == "photo.png"
+        assert called_post["_mm_image_attachments"][0]["media_type"] == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_handle_event_mixed_files_only_images_in_mm_attachments(self):
+        """Test that only image files appear in _mm_image_attachments."""
+        handler = mock.AsyncMock()
+        bot = MattermostBot(
+            "https://mm.example.com",
+            "token",
+            "channel-id",
+            on_message=handler,
+        )
+        bot._bot_user_id = "bot123"
+        bot._api = mock.AsyncMock()
+        bot._api.get_file_info = mock.AsyncMock(
+            side_effect=[
+                {"id": "img1", "name": "photo.png", "mime_type": "image/png"},
+                {"id": "doc1", "name": "report.pdf", "mime_type": "application/pdf"},
+            ]
+        )
+        bot._api.download_file = mock.AsyncMock(return_value=b"imgdata")
+
+        post = {
+            "id": "msg1",
+            "message": "files here",
+            "user_id": "user1",
+            "channel_id": "channel-id",
+            "file_ids": ["img1", "doc1"],
+        }
+
+        await bot._handle_event("posted", {"post": post})
+
+        handler.assert_called_once()
+        called_post = handler.call_args[0][0]
+        assert "_mm_image_attachments" in called_post
+        assert len(called_post["_mm_image_attachments"]) == 1
+        assert called_post["_mm_image_attachments"][0]["filename"] == "photo.png"

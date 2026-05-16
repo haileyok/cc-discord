@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections.abc
 import contextlib
 import logging
@@ -26,6 +27,76 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CHUNK_LIMIT = 3500  # soft limit, well under the 16383 hard limit
+
+_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+
+def _is_image_mime_type(mime_type: str) -> bool:
+    """Check if a MIME type represents an image Claude can process via vision."""
+    return mime_type.lower() in _IMAGE_MIME_TYPES
+
+
+class _MattermostImageAttachment:
+    """Attachment-like wrapper around a Mattermost image stored as base64.
+
+    Provides the same interface as Discord attachments so tasks._save_attachments
+    can download it to disk without knowing the message came from Mattermost.
+    """
+
+    __slots__ = ("filename", "_data_b64")
+
+    def __init__(self, filename: str, data_b64: str) -> None:
+        self.filename = filename
+        self._data_b64 = data_b64
+
+    async def read(self) -> bytes:
+        """Return the raw image bytes."""
+        return base64.b64decode(self._data_b64)
+
+
+async def _extract_images(
+    post: dict[str, Any], api: MattermostAPI
+) -> list[dict[str, Any]]:
+    """Pull image file attachments off a Mattermost post as base64 blobs.
+
+    Non-image attachments and files that fail to download are ignored (logged).
+    Returned dicts are shaped for Claude's vision API:
+      {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+    """
+    file_ids: list[str] = post.get("file_ids", [])
+    if not file_ids:
+        return []
+
+    images: list[dict[str, Any]] = []
+    for file_id in file_ids:
+        try:
+            file_info = await api.get_file_info(file_id)
+        except Exception:
+            logger.warning("Failed to get file info for %s", file_id, exc_info=True)
+            continue
+
+        mime_type = file_info.get("mime_type", "")
+        if not _is_image_mime_type(mime_type):
+            continue
+
+        try:
+            data = await api.download_file(file_id)
+        except Exception:
+            logger.warning("Failed to download image file %s", file_id, exc_info=True)
+            continue
+
+        images.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type.lower(),
+                    "data": base64.b64encode(data).decode("ascii"),
+                },
+            }
+        )
+
+    return images
 
 
 class MattermostMessageAdapter:
@@ -53,8 +124,13 @@ class MattermostMessageAdapter:
         self.channel = self._Channel(thread_id)
         self.content = post.get("message", "")
         self.author = self._Author(is_bot=(post.get("user_id") == bot_user_id))
-        self.attachments = []
         self.id = post.get("id")
+        # Populate image attachments from data stored by _handle_event
+        raw_images: list[dict[str, Any]] = post.get("_mm_image_attachments", [])
+        self.attachments: list[_MattermostImageAttachment] = [
+            _MattermostImageAttachment(img["filename"], img["data"])
+            for img in raw_images
+        ]
         create_at = post.get("create_at")
         if create_at:
             self.created_at = datetime.fromtimestamp(create_at / 1000, tz=timezone.utc)
@@ -301,9 +377,13 @@ class MattermostBot:
             if post.get("channel_id") != self._channel_id:
                 return
 
-            # Process audio attachments and integrate transcriptions into message
+            # Process file attachments: audio (transcribe), images (extract), other (ref)
             if post.get("file_ids"):
-                voice_blocks, file_refs = await _process_post_files(post, self._api)
+                voice_blocks, file_refs, image_attachments = await _process_post_files(
+                    post, self._api
+                )
+                if image_attachments:
+                    post["_mm_image_attachments"] = image_attachments
                 # Reconstruct message with transcriptions and file refs
                 text_parts: list[str] = []
                 if post.get("message"):
@@ -449,19 +529,21 @@ def _is_audio_mime_type(mime_type: str) -> bool:
 
 async def _process_post_files(
     post: dict[str, Any], api: MattermostAPI
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
     """Process file_ids in a Mattermost post.
 
     Returns a tuple of:
     - List of voice memo blocks (strings to include in message)
-    - List of file reference dicts for non-audio files
+    - List of file reference dicts for non-audio, non-image files
+    - List of image attachment dicts: {"filename": str, "media_type": str, "data": str (base64)}
     """
     file_ids = post.get("file_ids", [])
     if not file_ids:
-        return [], []
+        return [], [], []
 
     voice_blocks: list[str] = []
     file_refs: list[dict[str, Any]] = []
+    image_attachments: list[dict[str, Any]] = []
 
     for file_id in file_ids:
         try:
@@ -498,8 +580,24 @@ async def _process_post_files(
                     "[voice memo received — transcription unavailable; "
                     f"raw file: (download failed: {file_id})]"
                 )
+        elif _is_image_mime_type(mime_type):
+            # Download image for Claude vision support
+            try:
+                img_data = await api.download_file(file_id)
+                filename = file_info.get("name") or f"{file_id}.bin"
+                image_attachments.append(
+                    {
+                        "filename": filename,
+                        "media_type": mime_type.lower(),
+                        "data": base64.b64encode(img_data).decode("ascii"),
+                    }
+                )
+            except Exception as e:
+                logger.warning("Failed to download image file %s: %s", file_id, e)
+                # Fall through to file ref so users know the file exists
+                file_refs.append(file_info)
         else:
-            # Non-audio file reference
+            # Non-audio, non-image file reference
             file_refs.append(file_info)
 
-    return voice_blocks, file_refs
+    return voice_blocks, file_refs, image_attachments
