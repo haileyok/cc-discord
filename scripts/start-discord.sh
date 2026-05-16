@@ -17,6 +17,7 @@ WORKER_SESSION="${BRIDGE_ZELLIJ_SESSION:-cc-bridge-worker}"
 TMUX_SESSION="cc-bridge-worker"
 
 export BRIDGE_PLATFORM=discord
+export BRIDGE_CLAUDE_COMMAND="${BRIDGE_CLAUDE_COMMAND:-claude-mode extend --modifier ~/.claude/output-styles/qdots-coding-partner.md --modifier bold --}"
 
 mkdir -p "$STATE_DIR"
 

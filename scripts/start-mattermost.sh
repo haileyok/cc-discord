@@ -20,6 +20,7 @@ TMUX_SESSION="cc-bridge-worker"
 BRIDGE_HOST="${BRIDGE_HOST:-172.17.0.1}"
 
 export BRIDGE_PLATFORM=mattermost
+export BRIDGE_CLAUDE_COMMAND="${BRIDGE_CLAUDE_COMMAND:-claude-mode extend --modifier ~/.claude/output-styles/qdots-coding-partner.md --modifier bold --}"
 
 mkdir -p "$STATE_DIR"
 
