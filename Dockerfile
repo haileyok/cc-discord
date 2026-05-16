@@ -28,8 +28,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 RUN npm install -g @anthropic-ai/claude-code
 
 # ── Non-root user ───────────────────────────────────────────────────
-RUN useradd -m -s /bin/bash claude && \
-    echo 'claude ALL=(ALL) ALL' > /etc/sudoers.d/claude
+RUN useradd -m -s /bin/bash claude
 
 # ── Rust toolchain (owned by claude user) ────────────────────────────
 USER claude
@@ -76,4 +75,4 @@ EXPOSE 8787
 USER claude
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["uv", "run", "cc-bridge", "serve", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["uv", "run", "cc-bridge", "serve", "--host", "127.0.0.1", "--port", "8787"]
