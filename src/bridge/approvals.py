@@ -57,7 +57,7 @@ class _PendingApproval:
     thread_id: str
     created_at: int
     future: asyncio.Future  # resolves to (decision: str, reason: str)
-    message_id: int | None = None  # Discord message id; set after we post the prompt
+    message_id: str | None = None  # message id (as string); set after we post the prompt
 
 
 @dataclass
@@ -73,7 +73,7 @@ class _PendingTuiAnswer:
     # multi_select. `source` is one of "reaction" | "reply" | "cancelled" |
     # "timeout" | "post_failed".
     future: asyncio.Future
-    message_id: int | None = None
+    message_id: str | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -95,9 +95,9 @@ class ApprovalRouter:
         self._timeout = timeout
         self._tui_timeout = tui_timeout
         self._by_request_id: dict[str, _PendingApproval] = {}
-        self._by_message_id: dict[int, _PendingApproval] = {}
+        self._by_message_id: dict[str, _PendingApproval] = {}
         self._tui_pending: dict[str, _PendingTuiAnswer] = {}
-        self._tui_by_message_id: dict[int, _PendingTuiAnswer] = {}
+        self._tui_by_message_id: dict[str, _PendingTuiAnswer] = {}
         self._tui_by_thread_id: dict[str, list[_PendingTuiAnswer]] = {}
         self._recently_cancelled_threads: dict[str, float] = {}  # thread_id -> cancel_timestamp
         self._lock = asyncio.Lock()
@@ -185,7 +185,7 @@ class ApprovalRouter:
 
         return (decision, reason)
 
-    async def resolve_by_reaction(self, message_id: int, emoji: str, user_is_self_bot: bool) -> bool:
+    async def resolve_by_reaction(self, message_id: str, emoji: str, user_is_self_bot: bool) -> bool:
         """Called by the bot on reaction-add. Returns True if a Future was resolved.
 
         Filters out reactions added by the bridge's own bot user (user_is_self_bot=True).
@@ -339,7 +339,7 @@ class ApprovalRouter:
 
         return (answer, source)
 
-    async def resolve_tui_by_reaction(self, message_id: int, emoji: str, user_is_bot: bool) -> bool:
+    async def resolve_tui_by_reaction(self, message_id: str, emoji: str, user_is_bot: bool) -> bool:
         if user_is_bot:
             return False
         async with self._lock:
@@ -393,7 +393,8 @@ class ApprovalRouter:
         bot_user = self._bot.client.user if self._bot.client else None
         bot_user_id = bot_user.id if bot_user else None
         target = await self._bot.fetch_messageable(pending.thread_id)
-        msg = await target.fetch_message(pending.message_id)
+        # Convert string message_id to int for discord.py API
+        msg = await target.fetch_message(int(pending.message_id))
         selected: set[int] = set()
         for r in msg.reactions:
             emoji = str(r.emoji)

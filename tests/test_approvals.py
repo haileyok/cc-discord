@@ -681,3 +681,46 @@ async def test_cancel_thread_tui(tmp_path):
     assert results[1] == ("", "cancelled")
 
     await state.close_db(conn)
+
+
+@pytest.mark.asyncio
+async def test_approval_router_resolve_with_str_message_id(tmp_path):
+    """resolve_by_reaction works correctly when message_id is a string (from post())."""
+    from bridge.approvals import ApprovalRouter
+
+    db_path = tmp_path / "test.db"
+    conn = await state.open_db(db_path)
+    bot = FakeDiscordBot()
+
+    await state.upsert_task(conn, "task-str-id", 1001, "/tmp", "running")
+
+    router = ApprovalRouter(bot, conn, timeout=10.0)
+
+    async def trigger_reaction():
+        """Simulate user clicking ✅ after a short delay."""
+        await asyncio.sleep(0.1)
+        # Get the pending approval from the router state
+        pending_list = list(router._by_request_id.values())
+        if pending_list:
+            pending = pending_list[0]
+            # The message_id should be a string (from bot.post())
+            # and should work with resolve_by_reaction
+            if pending.message_id:
+                assert isinstance(pending.message_id, str), f"Expected str, got {type(pending.message_id)}"
+                result = await router.resolve_by_reaction(pending.message_id, "✅", False)
+                assert result is True, "resolve_by_reaction should return True for valid string message_id"
+
+    task = asyncio.create_task(trigger_reaction())
+
+    decision, reason = await router.request_permission(
+        request_id="req-str-id",
+        task_id="task-str-id",
+        thread_id="1001",
+        tool_name="Bash",
+        tool_input={"cmd": "ls"},
+    )
+
+    await task
+    assert decision == "allow"
+    assert reason == "approved via reaction"
+    await state.close_db(conn)
