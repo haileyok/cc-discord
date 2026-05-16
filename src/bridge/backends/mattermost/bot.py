@@ -17,6 +17,7 @@ from bridge import voice
 from bridge.backends.mattermost.api import MattermostAPI, RateLimitError
 from bridge.backends.mattermost.commands import dispatch_text_command, parse_text_command
 from bridge.backends.mattermost.ws import MattermostWebSocket
+from bridge.exceptions import BotNotReady
 
 if TYPE_CHECKING:
     from bridge.approvals import ApprovalRouter
@@ -96,6 +97,11 @@ class MattermostBot:
     def channel_id(self) -> str:
         return self._channel_id
 
+    def _require_ready(self) -> None:
+        """Raise BotNotReady if the bot hasn't connected yet."""
+        if not self._ready:
+            raise BotNotReady("Mattermost bot not connected")
+
     def bind_registry(self, registry: TaskRegistry) -> None:
         """Bind a TaskRegistry for text command handling.
 
@@ -166,6 +172,7 @@ class MattermostBot:
         self, message: str, *, thread_id: str | None = None
     ) -> list[str]:
         """Post a message to the channel or thread."""
+        self._require_ready()
         chunks = _chunk(message, CHUNK_LIMIT)
         msg_ids: list[str] = []
         for chunk in chunks:
@@ -185,6 +192,7 @@ class MattermostBot:
         text: str | None = None,
     ) -> list[str]:
         """Post attachments to the channel or thread."""
+        self._require_ready()
         file_ids: list[str] = []
         failed: list[str] = []
         for fp in file_paths:
@@ -213,6 +221,7 @@ class MattermostBot:
 
     async def create_thread(self, name: str) -> str:
         """Create a new thread."""
+        self._require_ready()
         result = await self._api.create_post(
             self._channel_id,
             f"🟢 cc-bridge task: {name}",
@@ -221,10 +230,11 @@ class MattermostBot:
 
     async def archive_thread(self, thread_id: str) -> None:
         """Archive a thread (no-op for Mattermost)."""
-        pass
+        self._require_ready()
 
     async def rename_thread(self, thread_id: str, name: str) -> None:
         """Rename a thread."""
+        self._require_ready()
         await self._api.update_post(
             thread_id, f"🟢 cc-bridge task: {name}"
         )
@@ -238,6 +248,7 @@ class MattermostBot:
         self, attachment_ref: Any, dest_dir: Path
     ) -> Path:
         """Download an attachment."""
+        self._require_ready()
         file_id = attachment_ref["id"]
         filename = attachment_ref.get("name", f"{file_id}.bin")
         data = await self._api.download_file(file_id)
@@ -250,6 +261,7 @@ class MattermostBot:
         self, message_id: str, thread_id: str, emoji: list[str]
     ) -> None:
         """Add emoji reactions to a message."""
+        self._require_ready()
         assert self._bot_user_id is not None
         for name in emoji:
             mm_name = _emoji_to_mattermost(name)
@@ -263,11 +275,13 @@ class MattermostBot:
         content: str | None = None,
     ) -> None:
         """Edit an existing message."""
+        self._require_ready()
         if content is not None:
             await self._api.update_post(message_id, content)
 
     async def fetch_messageable(self, thread_id: str) -> Any:
         """Fetch a messageable object."""
+        self._require_ready()
         return thread_id
 
     async def _handle_event(self, event: str, data: dict[str, Any]) -> None:

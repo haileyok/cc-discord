@@ -8,15 +8,16 @@ from unittest import mock
 
 import pytest
 
-from bridge.approvals import ApprovalRouter
-from bridge.backends.mattermost.api import RateLimitError
 from bridge.backends.mattermost.bot import (
+    BotNotReady,
     MattermostBot,
     _chunk,
     _emoji_to_mattermost,
     _mattermost_to_emoji,
     _process_post_files,
 )
+from bridge.approvals import ApprovalRouter
+from bridge.backends.mattermost.api import RateLimitError
 
 
 class TestChunkFunction:
@@ -224,6 +225,7 @@ class TestMattermostBotPosting:
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
         bot._api.create_post = mock.AsyncMock(return_value={"id": "msg1"})
+        bot._ready = True
 
         result = await bot.post("hello world")
 
@@ -238,6 +240,7 @@ class TestMattermostBotPosting:
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
         bot._api.create_post = mock.AsyncMock(return_value={"id": "msg1"})
+        bot._ready = True
 
         result = await bot.post("hello", thread_id="thread123")
 
@@ -254,6 +257,7 @@ class TestMattermostBotPosting:
         bot._api.create_post = mock.AsyncMock(
             side_effect=[{"id": "msg1"}, {"id": "msg2"}]
         )
+        bot._ready = True
 
         # Create a message that will be chunked
         long_text = "x" * 5000  # Longer than CHUNK_LIMIT
@@ -269,6 +273,7 @@ class TestMattermostBotPosting:
         """Test post_with_attachments uploads files."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
+        bot._ready = True
 
         # Mock file upload responses - each call returns different file info
         bot._api.upload_file = mock.AsyncMock(
@@ -307,6 +312,7 @@ class TestMattermostBotPosting:
         """Test post_with_attachments posts text when file upload fails."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
+        bot._ready = True
 
         # Mock upload failure
         bot._api.upload_file = mock.AsyncMock(side_effect=Exception("Upload failed"))
@@ -337,6 +343,7 @@ class TestMattermostBotPosting:
         """Test post retries on rate limit."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
+        bot._ready = True
 
         # Mock rate limit then success
         bot._api.create_post = mock.AsyncMock(
@@ -361,6 +368,7 @@ class TestMattermostBotThreadOperations:
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
         bot._api.create_post = mock.AsyncMock(return_value={"id": "thread123"})
+        bot._ready = True
 
         result = await bot.create_thread("my task")
 
@@ -377,6 +385,7 @@ class TestMattermostBotThreadOperations:
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
         bot._api.update_post = mock.AsyncMock()
+        bot._ready = True
 
         await bot.rename_thread("thread123", "new name")
 
@@ -390,6 +399,7 @@ class TestMattermostBotThreadOperations:
         """Test archive_thread is a no-op for Mattermost."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
+        bot._ready = True
 
         # Should not raise
         await bot.archive_thread("thread123")
@@ -427,6 +437,7 @@ class TestMattermostBotAttachments:
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
         bot._api.download_file = mock.AsyncMock(return_value=b"file content")
+        bot._ready = True
 
         import tempfile
 
@@ -443,6 +454,7 @@ class TestMattermostBotAttachments:
     async def test_download_attachment_creates_nested_directories(self):
         """Test download_attachment creates dest_dir if it doesn't exist."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        bot._ready = True
         bot._api = mock.AsyncMock()
         bot._api.download_file = mock.AsyncMock(return_value=b"test data")
 
@@ -474,6 +486,7 @@ class TestMattermostBotReactions:
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
         bot._bot_user_id = "bot123"
+        bot._ready = True
 
         await bot.add_reactions("msg1", "thread1", ["✅", "👍"])
 
@@ -493,6 +506,7 @@ class TestMattermostBotEditing:
         """Test editing a message."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
+        bot._ready = True
 
         await bot.edit_message("thread1", "msg1", content="new content")
 
@@ -503,6 +517,7 @@ class TestMattermostBotEditing:
         """Test edit_message without content is no-op."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
         bot._api = mock.AsyncMock()
+        bot._ready = True
 
         await bot.edit_message("thread1", "msg1")
 
@@ -512,6 +527,7 @@ class TestMattermostBotEditing:
     async def test_fetch_messageable(self):
         """Test fetch_messageable returns thread_id."""
         bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        bot._ready = True
 
         result = await bot.fetch_messageable("thread1")
 
@@ -1291,3 +1307,100 @@ class TestMattermostBotTyping:
             await asyncio.sleep(0.05)
 
         assert bot._api.trigger_typing.call_count >= 1
+
+
+class TestMattermostBotNotReadyGuards:
+    """Tests for BotNotReady guards on public methods."""
+
+    @pytest.mark.asyncio
+    async def test_post_raises_bot_not_ready(self):
+        """Test post raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        # Bot is not ready by default
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.post("hello")
+
+    @pytest.mark.asyncio
+    async def test_post_with_attachments_raises_bot_not_ready(self):
+        """Test post_with_attachments raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file1 = Path(tmpdir) / "test.txt"
+            file1.write_text("content")
+
+            with pytest.raises(BotNotReady):
+                await bot.post_with_attachments([file1])
+
+    @pytest.mark.asyncio
+    async def test_create_thread_raises_bot_not_ready(self):
+        """Test create_thread raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.create_thread("test thread")
+
+    @pytest.mark.asyncio
+    async def test_archive_thread_raises_bot_not_ready(self):
+        """Test archive_thread raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.archive_thread("thread-id")
+
+    @pytest.mark.asyncio
+    async def test_rename_thread_raises_bot_not_ready(self):
+        """Test rename_thread raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.rename_thread("thread-id", "new name")
+
+    @pytest.mark.asyncio
+    async def test_download_attachment_raises_bot_not_ready(self):
+        """Test download_attachment raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attachment_ref = {"id": "file123", "name": "test.txt"}
+
+            with pytest.raises(BotNotReady):
+                await bot.download_attachment(attachment_ref, Path(tmpdir))
+
+    @pytest.mark.asyncio
+    async def test_add_reactions_raises_bot_not_ready(self):
+        """Test add_reactions raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.add_reactions("msg1", "thread1", ["✅"])
+
+    @pytest.mark.asyncio
+    async def test_edit_message_raises_bot_not_ready(self):
+        """Test edit_message raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.edit_message("thread1", "msg1", content="new content")
+
+    @pytest.mark.asyncio
+    async def test_fetch_messageable_raises_bot_not_ready(self):
+        """Test fetch_messageable raises BotNotReady when bot is not ready."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        assert bot.is_ready is False
+
+        with pytest.raises(BotNotReady):
+            await bot.fetch_messageable("thread1")
