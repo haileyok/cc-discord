@@ -309,6 +309,21 @@ class MattermostBot:
                     result = await dispatch_text_command(
                         command, args, self._registry, thread_id
                     )
+                    # For rename/retitle, call rename_thread() with the cleaned name
+                    if (
+                        command in ("rename", "retitle")
+                        and result.success
+                        and result.embed_data
+                        and "cleaned_name" in result.embed_data
+                    ):
+                        try:
+                            await self.rename_thread(
+                                thread_id, result.embed_data["cleaned_name"]
+                            )
+                        except Exception:
+                            logger.exception(
+                                "rename_thread failed for thread %s", thread_id
+                            )
                     await self.post(result.message, thread_id=thread_id)
                     return
 

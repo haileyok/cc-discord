@@ -266,6 +266,160 @@ class TestDispatchTextCommand:
         assert "Unknown" in result.message
 
 
+class TestRenameViaTextCommand:
+    """Tests that !rename/!retitle actually calls rename_thread() on the bot."""
+
+    @pytest.mark.asyncio
+    async def test_rename_text_command_calls_rename_thread(self):
+        """Test that !rename newname results in rename_thread() being called."""
+        from bridge.backends.mattermost.bot import MattermostBot
+
+        bot = mock.AsyncMock(spec=MattermostBot)
+        bot._registry = mock.MagicMock()
+        bot._approval_router = None
+        bot._bot_user_id = "bot123"
+        bot._channel_id = "channel123"
+        bot._on_message = None
+        bot._allowed_user_ids = None
+
+        task = mock.MagicMock()
+        task.task_id = "task-abc"
+        task.thread_id = "root-post-id"
+        bot._registry.get_by_thread_id = mock.MagicMock(return_value=task)
+        bot._registry.get_by_task_id = mock.MagicMock(return_value=task)
+
+        # Track what rename_thread is called with
+        rename_calls = []
+
+        async def fake_rename_thread(thread_id, name):
+            rename_calls.append((thread_id, name))
+
+        bot.rename_thread = fake_rename_thread
+
+        # Capture what post() is called with
+        posted = []
+
+        async def fake_post(message, *, thread_id=None):
+            posted.append(message)
+            return ["msg1"]
+
+        bot.post = fake_post
+
+        # Simulate the _handle_event pathway directly by calling the real method
+        # We need to bind the real _handle_event to our mock bot
+        real_handle_event = MattermostBot._handle_event.__get__(bot, MattermostBot)
+
+        post_data = {
+            "user_id": "user1",
+            "channel_id": "channel123",
+            "root_id": "root-post-id",
+            "id": "msg-id",
+            "message": "!rename my new name",
+        }
+
+        await real_handle_event("posted", {"post": post_data})
+
+        # rename_thread() must have been called with the task's thread_id and cleaned name
+        assert len(rename_calls) == 1, (
+            f"Expected rename_thread to be called once, got: {rename_calls}"
+        )
+        thread_id_called, name_called = rename_calls[0]
+        assert thread_id_called == "root-post-id"
+        assert name_called == "my new name"
+
+    @pytest.mark.asyncio
+    async def test_retitle_text_command_calls_rename_thread(self):
+        """Test that !retitle newname also calls rename_thread()."""
+        from bridge.backends.mattermost.bot import MattermostBot
+
+        bot = mock.AsyncMock(spec=MattermostBot)
+        bot._registry = mock.MagicMock()
+        bot._approval_router = None
+        bot._bot_user_id = "bot123"
+        bot._channel_id = "channel123"
+        bot._on_message = None
+        bot._allowed_user_ids = None
+
+        task = mock.MagicMock()
+        task.task_id = "task-abc"
+        task.thread_id = "root-post-id"
+        bot._registry.get_by_thread_id = mock.MagicMock(return_value=task)
+        bot._registry.get_by_task_id = mock.MagicMock(return_value=task)
+
+        rename_calls = []
+
+        async def fake_rename_thread(thread_id, name):
+            rename_calls.append((thread_id, name))
+
+        bot.rename_thread = fake_rename_thread
+
+        async def fake_post(message, *, thread_id=None):
+            return ["msg1"]
+
+        bot.post = fake_post
+
+        real_handle_event = MattermostBot._handle_event.__get__(bot, MattermostBot)
+
+        post_data = {
+            "user_id": "user1",
+            "channel_id": "channel123",
+            "root_id": "root-post-id",
+            "id": "msg-id",
+            "message": "!retitle cool title",
+        }
+
+        await real_handle_event("posted", {"post": post_data})
+
+        assert len(rename_calls) == 1
+        thread_id_called, name_called = rename_calls[0]
+        assert thread_id_called == "root-post-id"
+        assert name_called == "cool title"
+
+    @pytest.mark.asyncio
+    async def test_rename_failure_does_not_call_rename_thread(self):
+        """Test that a failed rename (no task in thread) does not call rename_thread()."""
+        from bridge.backends.mattermost.bot import MattermostBot
+
+        bot = mock.AsyncMock(spec=MattermostBot)
+        bot._registry = mock.MagicMock()
+        bot._approval_router = None
+        bot._bot_user_id = "bot123"
+        bot._channel_id = "channel123"
+        bot._on_message = None
+        bot._allowed_user_ids = None
+
+        # No task found in this thread
+        bot._registry.get_by_thread_id = mock.MagicMock(return_value=None)
+        bot._registry.get_by_task_id = mock.MagicMock(return_value=None)
+
+        rename_calls = []
+
+        async def fake_rename_thread(thread_id, name):
+            rename_calls.append((thread_id, name))
+
+        bot.rename_thread = fake_rename_thread
+
+        async def fake_post(message, *, thread_id=None):
+            return ["msg1"]
+
+        bot.post = fake_post
+
+        real_handle_event = MattermostBot._handle_event.__get__(bot, MattermostBot)
+
+        post_data = {
+            "user_id": "user1",
+            "channel_id": "channel123",
+            "root_id": "root-post-id",
+            "id": "msg-id",
+            "message": "!rename wont work",
+        }
+
+        await real_handle_event("posted", {"post": post_data})
+
+        # rename_thread should NOT be called when the handler fails
+        assert len(rename_calls) == 0
+
+
 class TestSlashCommandHandlers:
     """Tests for HTTP slash command handlers."""
 
