@@ -29,6 +29,7 @@ class MattermostAPI:
     async def start(self) -> None:
         self._session = aiohttp.ClientSession(
             headers={"Authorization": f"Bearer {self._token}"},
+            timeout=aiohttp.ClientTimeout(total=30),
         )
 
     async def close(self) -> None:

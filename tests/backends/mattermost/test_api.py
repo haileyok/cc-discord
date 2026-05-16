@@ -499,3 +499,12 @@ class TestMattermostAPI:
 
         # retry_after should be exactly 0.5 (the minimum)
         assert exc_info.value.retry_after == 0.5
+
+    @pytest.mark.asyncio
+    async def test_start_creates_session_with_timeout(self, api):
+        """Test start() creates aiohttp session with 30s timeout."""
+        await api.start()
+        assert api._session is not None
+        # Check that timeout is configured to 30 seconds total
+        assert api._session.timeout.total == 30
+        await api.close()
