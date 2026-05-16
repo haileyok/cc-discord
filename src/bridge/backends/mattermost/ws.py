@@ -65,7 +65,11 @@ class MattermostWebSocket:
         max_backoff = 30.0
         while not self._closing:
             try:
-                async with websockets.connect(self._ws_url) as ws:
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                ) as ws:
                     self._ws = ws
                     await self._authenticate(ws)
                     backoff = 1.0

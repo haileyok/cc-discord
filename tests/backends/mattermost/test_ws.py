@@ -231,6 +231,58 @@ class TestMattermostWebSocketEventDispatching:
         assert data["post"] == "not valid json"
 
 
+class TestMattermostWebSocketPingHeartbeat:
+    """Tests for WebSocket ping/heartbeat configuration."""
+
+    def _make_mock_connect(self, ws_instance: "MattermostWebSocket") -> mock.MagicMock:
+        """Create a mock for websockets.connect that allows one connection then stops."""
+        mock_conn = mock.AsyncMock()
+        mock_conn.__aenter__.return_value = mock_conn
+        mock_conn.__aiter__.return_value = mock_conn
+        mock_conn.__anext__.side_effect = StopAsyncIteration
+
+        # After __aexit__, set _closing so the while-loop doesn't reconnect
+        async def aexit_side_effect(exc_type, exc_val, exc_tb):
+            ws_instance._closing = True
+            return None
+
+        mock_conn.__aexit__.side_effect = aexit_side_effect
+
+        return mock.MagicMock(return_value=mock_conn)
+
+    @pytest.mark.asyncio
+    async def test_connect_called_with_ping_interval(self):
+        """Test that websockets.connect is called with ping_interval=30."""
+        handler = mock.AsyncMock()
+        ws = MattermostWebSocket("https://mm.example.com", "token", handler)
+        mock_connect = self._make_mock_connect(ws)
+
+        with mock.patch("bridge.backends.mattermost.ws.websockets.connect", mock_connect):
+            await ws._run_loop()
+
+        assert mock_connect.called
+        _, kwargs = mock_connect.call_args
+        assert kwargs.get("ping_interval") == 30, (
+            f"Expected ping_interval=30, got {kwargs.get('ping_interval')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_connect_called_with_ping_timeout(self):
+        """Test that websockets.connect is called with ping_timeout=10."""
+        handler = mock.AsyncMock()
+        ws = MattermostWebSocket("https://mm.example.com", "token", handler)
+        mock_connect = self._make_mock_connect(ws)
+
+        with mock.patch("bridge.backends.mattermost.ws.websockets.connect", mock_connect):
+            await ws._run_loop()
+
+        assert mock_connect.called
+        _, kwargs = mock_connect.call_args
+        assert kwargs.get("ping_timeout") == 10, (
+            f"Expected ping_timeout=10, got {kwargs.get('ping_timeout')!r}"
+        )
+
+
 class TestMattermostWebSocketLifecycle:
     """Tests for lifecycle management."""
 
