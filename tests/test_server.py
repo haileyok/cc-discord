@@ -1600,3 +1600,121 @@ async def test_pretooluse_unknown_task_id(client, in_memory_db):
     body = await resp.json()
     assert body["decision"] == "deny"
     assert "unknown" in body["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+async def authed_client(fake_bot, in_memory_db, monkeypatch):
+    """Test client with BRIDGE_API_SECRET set to 'mysecret'."""
+    monkeypatch.setenv("BRIDGE_API_SECRET", "mysecret")
+    started_at = time.monotonic()
+    app = await build_app(fake_bot, started_at=started_at)
+    registry = ThreadRegistry(fake_bot, in_memory_db)
+    zellij = ZellijManager()
+
+    async def mock_run(*argv, env=None, timeout=10.0):
+        return (0, "", "")
+
+    monkeypatch.setattr(zellij, "_run", mock_run)
+    task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+    await task_registry.load_from_db()
+    from bridge.server import AskLockMap, APPROVAL_ROUTER_KEY
+    from bridge.approvals import ApprovalRouter
+    app[THREADS_KEY] = registry
+    app[LISTENER_KEY] = Listener()
+    app[ASK_LOCKS_KEY] = AskLockMap()
+    app[TASK_REGISTRY_KEY] = task_registry
+    app[ZELLIJ_KEY] = zellij
+    app[APPROVAL_ROUTER_KEY] = ApprovalRouter(fake_bot, in_memory_db, timeout=0.5)
+    async with test_utils.TestClient(test_utils.TestServer(app)) as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_auth_no_secret_env_passes_all(client, fake_bot):
+    """Without BRIDGE_API_SECRET set, all requests pass through (backward compat)."""
+    # /v1/health — unauthenticated GET
+    resp = await client.get("/v1/health")
+    assert resp.status == 200
+
+    # /v1/notify — unauthenticated POST (bot not ready → 503, not 401)
+    fake_bot.set_ready(False)
+    resp = await client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+    )
+    assert resp.status == 503  # Not 401; auth passed, bot not ready
+
+
+@pytest.mark.asyncio
+async def test_auth_missing_header_returns_401(authed_client, fake_bot):
+    """With BRIDGE_API_SECRET set and no Authorization header, /v1/notify returns 401."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_auth_wrong_secret_returns_401(authed_client, fake_bot):
+    """With BRIDGE_API_SECRET set and wrong secret, /v1/notify returns 401."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+        headers={"Authorization": "Bearer wrongsecret"},
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_auth_correct_secret_passes(authed_client, fake_bot):
+    """With correct Authorization: Bearer <secret>, request reaches endpoint."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+        headers={"Authorization": "Bearer mysecret"},
+    )
+    # Auth passes; endpoint runs normally and returns 200
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_health_always_passes(authed_client):
+    """/v1/health is exempt from auth even when BRIDGE_API_SECRET is set."""
+    resp = await authed_client.get("/v1/health")
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_hook_event_with_correct_secret(authed_client, fake_bot):
+    """With correct secret, /v1/hook/event returns 200."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/hook/event",
+        json={"hook_event_name": "Stop", "session_id": "sess-abc"},
+        headers={"Authorization": "Bearer mysecret"},
+    )
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_hook_event_without_secret_returns_401(authed_client):
+    """With BRIDGE_API_SECRET set and no header, /v1/hook/event returns 401."""
+    resp = await authed_client.post(
+        "/v1/hook/event",
+        json={"hook_event_name": "Stop", "session_id": "sess-abc"},
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "unauthorized"

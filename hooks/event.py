@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787")
+BRIDGE_API_SECRET = os.environ.get("BRIDGE_API_SECRET", "")
 HTTP_TIMEOUT = 5
 
 
@@ -20,10 +21,13 @@ def _post(url: str, body: dict) -> None:
     """POST JSON body to url. Raise _BridgeUnavailable on any failure."""
     try:
         data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if BRIDGE_API_SECRET:
+            headers["Authorization"] = f"Bearer {BRIDGE_API_SECRET}"
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:

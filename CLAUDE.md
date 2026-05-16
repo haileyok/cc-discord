@@ -2,7 +2,7 @@
 
 Localhost HTTP bridge between Claude Code sessions and Discord or Mattermost. Single-process Python daemon — `aiohttp` server and a `ChatPlatform` backend (Discord or Mattermost) share one asyncio event loop.
 
-Freshness: 2026-05-11
+Freshness: 2026-05-15
 
 ## Repo location and tooling
 
@@ -31,6 +31,7 @@ Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3
 ### Platform-agnostic
 
 - **`BRIDGE_CLAUDE_COMMAND` controls the launcher binary.** Default: `"claude"`. Set to a shlex-compatible command string to use a wrapper like `claude-mode`. Include the `--` separator when using claude-mode so bridge-appended flags (`--settings`, `--resume`, `--dangerously-skip-permissions`) pass through correctly. Example: `BRIDGE_CLAUDE_COMMAND="claude-mode extend --"`. The `generate_thread_name()` one-shot (`claude -p`) is unaffected — it always uses bare `claude`.
+- **`BRIDGE_API_SECRET` gates all `/v1/` endpoints except `/v1/health`.** When set, every request to a non-health `/v1/` endpoint must include `Authorization: Bearer <secret>`; missing or wrong values get a 401 `{"error": "unauthorized"}`. When unset, auth is skipped (dev/backward-compat mode). All four hooks (`event.py`, `pretooluse-approve.py`, `notify-stop.py`, `notify-notification.py`) read the same env var and include the header automatically. `/v1/health` is always exempt so monitoring can probe without credentials.
 - **Hooks must always exit 0.** `hooks/notify-stop.py` and `hooks/notify-notification.py` wrap `main()` in `try/except: pass; finally: sys.exit(0)` on purpose — a Claude Code Stop/Notification hook that fails non-zero degrades the user's session. Preserve that contract when editing.
 - **FIFO ordering for `/v1/ask` is enforced by `AskLockMap`, not `Listener`.** `Listener.register()` raises `RuntimeError` if a thread already has a pending ask — this is an invariant guard, not the queueing mechanism. The per-thread `asyncio.Lock` in `server.AskLockMap` must be acquired *before* posting the question and *released* after `unregister`. Any new `/v1/ask`-style endpoint must follow the same lock-then-register pattern.
 - **Single event loop, shared by aiohttp + discord.py.** Long blocking work (sync DB calls, `time.sleep`, `requests`) inside any handler starves both the HTTP server and the Discord gateway. Use the async equivalents (`aiosqlite`, `asyncio.sleep`, `aiohttp` client).

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 import time
 from datetime import datetime, timezone
@@ -445,6 +446,43 @@ async def _handle_slash(request: web.Request) -> web.Response:
     )
 
 
+def _make_auth_middleware(secret: str | None):
+    """Create an aiohttp middleware that enforces Bearer token auth.
+
+    If ``secret`` is None or empty, the middleware is a no-op (dev/backward-compat mode).
+    GET /v1/health is always exempt so monitoring can probe without credentials.
+
+    Args:
+        secret: The expected bearer token value, or None to disable auth.
+
+    Returns:
+        An aiohttp middleware coroutine.
+    """
+    @web.middleware
+    async def _auth_middleware(request: web.Request, handler):
+        # Health endpoint is always exempt
+        if request.path == "/v1/health":
+            return await handler(request)
+
+        # If no secret configured, pass through (backward compat)
+        if not secret:
+            return await handler(request)
+
+        # Validate Authorization: Bearer <secret>
+        auth_header = request.headers.get("Authorization", "")
+        expected = f"Bearer {secret}"
+        if auth_header != expected:
+            return web.Response(
+                status=401,
+                text=json.dumps({"error": "unauthorized"}),
+                content_type="application/json",
+            )
+
+        return await handler(request)
+
+    return _auth_middleware
+
+
 async def build_app(
     platform: ChatPlatform,
     *,
@@ -452,7 +490,9 @@ async def build_app(
     is_mattermost: bool = False,
 ) -> web.Application:
     """Build and configure the aiohttp Application."""
-    app = web.Application()
+    secret = os.environ.get("BRIDGE_API_SECRET") or None
+    middlewares = [_make_auth_middleware(secret)]
+    app = web.Application(middlewares=middlewares)
     app[BOT_KEY] = platform
     app[STARTED_AT_KEY] = started_at if started_at is not None else time.monotonic()
     app.router.add_post("/v1/notify", _handle_notify)
