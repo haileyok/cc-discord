@@ -556,10 +556,12 @@ class TestSlashCommandHandlers:
         assert "Unauthorized" in data["text"]
 
     @pytest.mark.asyncio
-    async def test_slash_token_skipped_when_unconfigured(self):
-        """Test no configured token skips validation."""
+    async def test_slash_token_unconfigured_logs_warning(self, caplog):
+        """Test no configured token logs warning but allows request."""
+        import logging
         from bridge.backends.mattermost.commands import handle_slash_request
 
+        caplog.set_level(logging.WARNING)
         request = self._make_request({"text": "", "channel_id": "ch123"})
         registry = mock.MagicMock()
         registry.list_tasks = mock.AsyncMock(return_value=[])
@@ -571,6 +573,49 @@ class TestSlashCommandHandlers:
         assert response.status == 200
         data = json.loads(response.body.decode())
         assert data["response_type"] == "in_channel"
+        # Check that a warning was logged
+        assert any("slash_tokens" in record.message and "unauthenticated" in record.message.lower()
+                   for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_slash_token_missing_when_configured(self):
+        """Test missing token when tokens configured returns unauthorized."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        # Request has no 'token' field
+        request = self._make_request({"text": "", "channel_id": "ch123"})
+        registry = mock.MagicMock()
+
+        response = await handle_slash_request(
+            request, "list", registry, slash_tokens=["valid_token"],
+        )
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "ephemeral"
+        assert "Unauthorized" in data["text"]
+
+    @pytest.mark.asyncio
+    async def test_slash_token_empty_when_configured(self):
+        """Test empty token when tokens configured returns unauthorized."""
+        from bridge.backends.mattermost.commands import handle_slash_request
+
+        # Request has empty token field
+        request = self._make_request({
+            "text": "",
+            "channel_id": "ch123",
+            "token": "",
+        })
+        registry = mock.MagicMock()
+
+        response = await handle_slash_request(
+            request, "list", registry, slash_tokens=["valid_token"],
+        )
+
+        assert response.status == 200
+        data = json.loads(response.body.decode())
+        assert data["response_type"] == "ephemeral"
+        assert "Unauthorized" in data["text"]
 
     @pytest.mark.asyncio
     async def test_slash_unknown_command(self):

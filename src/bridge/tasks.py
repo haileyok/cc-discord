@@ -195,7 +195,11 @@ def _write_task_layout(
         # rather than escape them. Defense-in-depth: callers also
         # validate session_id at ingest, but this keeps us safe even if
         # a new field flows in unsanitized later.
-        cleaned = "".join(ch for ch in s if ch >= " " or ch == " ")
+        # Strip C0 (0x00-0x1F except space) and C1 (0x80-0x9F) control chars
+        cleaned = "".join(
+            ch for ch in s
+            if not ((ord(ch) < 0x20 and ch != " ") or (0x80 <= ord(ch) <= 0x9f))
+        )
         return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     args_tokens: list[str] = []

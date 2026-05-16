@@ -196,8 +196,12 @@ async def handle_slash_request(
     try:
         data = await request.post()
 
-        if slash_tokens and data.get("token") not in slash_tokens:
-            return _slash_response("Unauthorized", ephemeral=True)
+        if slash_tokens is not None:
+            token = data.get("token")
+            if not token or token not in slash_tokens:
+                return _slash_response("Unauthorized", ephemeral=True)
+        else:
+            logger.warning("No slash_tokens configured — slash commands are unauthenticated")
 
         channel_id = data.get("channel_id", "")
         text = data.get("text", "")

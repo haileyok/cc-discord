@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json
 import os
+import stat
 import sys
 import time
 import urllib.error
@@ -54,6 +55,10 @@ def _try_webhook_fallback(msg: str) -> None:
     """Try to POST to the webhook URL if the file exists."""
     if not WEBHOOK_FILE.exists():
         return
+    # Enforce secure permissions on webhook file
+    current_mode = WEBHOOK_FILE.stat().st_mode & 0o777
+    if current_mode != 0o600:
+        WEBHOOK_FILE.chmod(0o600)
     url = WEBHOOK_FILE.read_text().strip()
     if not url:
         return
