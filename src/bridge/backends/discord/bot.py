@@ -11,6 +11,8 @@ from typing import Awaitable, Callable, TypeVar
 import aiohttp
 import discord
 
+from bridge.exceptions import BotNotReady
+
 
 _T = TypeVar("_T")
 
@@ -104,12 +106,6 @@ async def _extract_images(
             }
         )
     return images
-
-
-class BotNotReady(RuntimeError):
-    """Raised when attempting operations on a bot that hasn't finished handshake."""
-
-    pass
 
 
 class DiscordBot:

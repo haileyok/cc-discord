@@ -16,11 +16,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
-import discord
 
 import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
-from bridge.backends.discord.bot import BotNotReady
+from bridge.exceptions import BotNotReady
 from bridge.listener import MessageLike
 from bridge.platform import ChatPlatform, RichFormatter
 from bridge.state import TaskRow, list_active_tasks, upsert_task
@@ -1382,7 +1381,7 @@ class TaskRegistry:
             return
         if not task.task_list_state:
             return
-        embed = self._render_task_list_embed(task)
+        data = self._render_task_list_embed(task)
 
         # If our most recent task-list post is STILL the most recent
         # message in the thread (i.e. nothing else has been posted since),
@@ -1399,7 +1398,7 @@ class TaskRegistry:
                         task.thread_id,
                         task.last_task_list_message_id,
                         "task_list",
-                        {"embed": embed},
+                        data,
                     )
                     return
             except BotNotReady:
@@ -1414,7 +1413,7 @@ class TaskRegistry:
             if not self._formatter:
                 return
             task.last_task_list_message_id = await self._formatter.post_rich(
-                task.thread_id, "task_list", {"embed": embed}
+                task.thread_id, "task_list", data
             )
         except BotNotReady:
             return
@@ -1422,9 +1421,18 @@ class TaskRegistry:
             logger.exception("failed to post task list for task %s", task.task_id)
 
     @staticmethod
-    def _render_task_list_embed(task: Task) -> discord.Embed:
-        """Render the task_list_state mirror as a Discord embed so it stands
-        apart from the thread's prose flow with a colored border."""
+    def _render_task_list_embed(task: Task) -> dict:
+        """Render the task_list_state mirror as a plain data dict.
+
+        Returns a dict with keys:
+          - "entries": list of dicts with "id", "status", "subject" keys
+          - "done": int count of completed tasks
+          - "total": int count of all tasks
+          - "in_progress": int count of in-progress tasks
+
+        The RichFormatter for each backend is responsible for rendering
+        this data into its native format (Discord embed, markdown, etc.).
+        """
         # Sort by id; ids are typically integer-stringy so try numeric sort.
         def _sort_key(tid: str) -> tuple[int, int | str]:
             try:
@@ -1432,7 +1440,7 @@ class TaskRegistry:
             except ValueError:
                 return (1, tid)
 
-        lines: list[str] = []
+        entries: list[dict] = []
         total = 0
         done = 0
         in_progress = 0
@@ -1441,39 +1449,18 @@ class TaskRegistry:
             status = entry.get("status") or "pending"
             subject = (entry.get("subject") or "").strip()
             if status == "completed":
-                mark, done = "✅", done + 1
+                done += 1
             elif status == "in_progress":
-                mark, in_progress = "▶️", in_progress + 1
-            elif status == "deleted":
-                mark = "🗑"
-            else:
-                mark = "⬜"
+                in_progress += 1
             total += 1
-            line = f"{mark} #{tid}"
-            if subject:
-                line += f" {subject}"
-            lines.append(line)
+            entries.append({"id": tid, "status": status, "subject": subject})
 
-        description = "\n".join(lines) or "_(no tasks)_"
-        if len(description) > 4000:
-            description = description[:3997] + "…"
-
-        # Color: green when everything's done, yellow if any in progress,
-        # otherwise neutral grey.
-        if total > 0 and done == total:
-            color = 0x57F287
-        elif in_progress > 0:
-            color = 0xFEE75C
-        else:
-            color = 0x95A5A6
-
-        embed = discord.Embed(
-            title="📋 Tasks",
-            description=description,
-            color=color,
-        )
-        embed.set_footer(text=f"{done}/{total} done")
-        return embed
+        return {
+            "entries": entries,
+            "done": done,
+            "total": total,
+            "in_progress": in_progress,
+        }
 
     def _is_sidechain_tool(self, body: dict, tool_name: str) -> bool:
         """Best-effort: did the most recent `tool_use` of `tool_name` come from
@@ -1861,7 +1848,7 @@ class TaskRegistry:
                 last_edit_at=now,
                 finished_at=now if finished else None,
             )
-            embed = self._render_subagent_embed(
+            data = self._render_subagent_embed(
                 block, last_actions, total_actions, finished
             )
             # Post FIRST, persist only on success. If the post fails (most
@@ -1874,7 +1861,7 @@ class TaskRegistry:
                 if not self._formatter:
                     return
                 block.message_id = await self._formatter.post_rich(
-                    task.thread_id, "subagent_block", {"embed": embed}
+                    task.thread_id, "subagent_block", data
                 )
             except BotNotReady:
                 logger.info(
@@ -1904,14 +1891,14 @@ class TaskRegistry:
 
         if block.message_id is None:
             return  # initial post failed; nothing to edit
-        embed = self._render_subagent_embed(
+        data = self._render_subagent_embed(
             block, last_actions, total_actions, finished
         )
         try:
             if not self._formatter:
                 return
             await self._formatter.edit_rich(
-                task.thread_id, block.message_id, "subagent_block", {"embed": embed}
+                task.thread_id, block.message_id, "subagent_block", data
             )
         except Exception:
             logger.exception(
@@ -1963,8 +1950,19 @@ class TaskRegistry:
         last_actions: list[str],
         total_actions: int,
         finished: bool,
-    ) -> discord.Embed:
-        status = "finished" if finished else "running"
+    ) -> dict:
+        """Render a subagent block as a plain data dict.
+
+        Returns a dict with keys:
+          - "attribution": str agent name/label
+          - "actions": list[str] of recent action lines
+          - "total_actions": int total action count
+          - "finished": bool whether the subagent has finished
+          - "duration": str human-readable elapsed time (e.g. "30s", "1.5m")
+
+        The RichFormatter for each backend is responsible for rendering
+        this data into its native format (Discord embed, markdown, etc.).
+        """
         # finished_at may not have been set yet on the first observed-finished
         # refresh; fall back to now to avoid a None subtraction.
         end = (block.finished_at if finished else None) or time.time()
@@ -1972,21 +1970,13 @@ class TaskRegistry:
         dur = (
             f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
         )
-        # Color cues: yellow while running, green when finished cleanly.
-        color = 0x57F287 if finished else 0xFEE75C  # discord brand yellow/green
-
-        # Discord embed.description hard cap is 4096; truncate safely.
-        description = "\n".join(last_actions)
-        if len(description) > 3900:
-            description = description[:3897] + "…"
-
-        embed = discord.Embed(
-            title=f"🤖 {block.attribution}",
-            description=description or "_(no actions yet)_",
-            color=color,
-        )
-        embed.set_footer(text=f"{status} · {total_actions} actions · {dur}")
-        return embed
+        return {
+            "attribution": block.attribution,
+            "actions": last_actions,
+            "total_actions": total_actions,
+            "finished": finished,
+            "duration": dur,
+        }
 
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
         """Track a TUI handler task and remove it from tracking when it completes.

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from aiohttp import web
 
 from bridge.approvals import ApprovalRouter
-from bridge.backends.discord.bot import BotNotReady
+from bridge.exceptions import BotNotReady
 from bridge.listener import Listener, _PendingAsk
 from bridge.platform import ChatPlatform
 from bridge.secrets import Secrets
@@ -503,9 +503,10 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
             bot_self = bot_holder.get("bot")
             client_user = bot_self.client.user if bot_self and bot_self.client else None
             user_is_self_bot = bool(client_user and payload.user_id == client_user.id)
-            if await approval_router.resolve_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot):
+            msg_id = str(payload.message_id)
+            if await approval_router.resolve_by_reaction(msg_id, str(payload.emoji), user_is_self_bot):
                 return
-            await approval_router.resolve_tui_by_reaction(payload.message_id, str(payload.emoji), user_is_self_bot)
+            await approval_router.resolve_tui_by_reaction(msg_id, str(payload.emoji), user_is_self_bot)
 
         bot = DiscordBot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
         bot_holder["bot"] = bot
