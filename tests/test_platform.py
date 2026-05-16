@@ -159,6 +159,13 @@ async def test_fake_platform_start_close() -> None:
     assert fake.is_ready is True  # No-op, still ready
 
 
+def test_fake_platform_channel_id_property() -> None:
+    """Test FakePlatform.channel_id property returns a string."""
+    fake = FakePlatform()
+    assert isinstance(fake.channel_id, str)
+    assert fake.channel_id == "fake-channel-id"
+
+
 def _has_protocol_methods(cls: type) -> bool:
     """Check that cls has all ChatPlatform protocol methods.
 

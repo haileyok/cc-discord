@@ -44,6 +44,7 @@ class FakePlatform:
     """
 
     is_ready: bool = True
+    channel_id: str = "fake-channel-id"
     _post_calls: list[dict] = field(default_factory=list)
     _attachment_calls: list[dict] = field(default_factory=list)
     _thread_calls: list[dict] = field(default_factory=list)

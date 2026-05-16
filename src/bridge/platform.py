@@ -20,6 +20,11 @@ class ChatPlatform(Protocol):
         """Whether the platform is ready to handle requests."""
         ...
 
+    @property
+    def channel_id(self) -> str:
+        """The configured channel/workspace ID."""
+        ...
+
     async def start(self) -> None:
         """Start the platform connection."""
         ...
