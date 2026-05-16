@@ -431,3 +431,94 @@ class TestBot:
 
         # Should not raise
         await bot.on_raw_reaction_add(payload)
+
+
+class TestAllowedUserIds:
+    """Tests for allowed_user_ids filtering on incoming messages."""
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_none_permits_all_users(self):
+        """When allowed_user_ids is None, all users are allowed (backward compat)."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=None)
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 999
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_permits_listed_user(self):
+        """Messages from a user whose ID is in allowed_user_ids are processed."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=["111", "222"])
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 111
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_blocks_unlisted_user(self):
+        """Messages from a user whose ID is NOT in allowed_user_ids are silently dropped."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=["111", "222"])
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 999  # not in allowed list
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 0
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_stored_as_set_internally(self):
+        """allowed_user_ids is converted to a set for O(1) lookup."""
+        bot = DiscordBot("tok", 1, allowed_user_ids=["111", "222", "333"])
+        assert bot._allowed_user_ids == {"111", "222", "333"}
+
+    def test_allowed_user_ids_none_stored_as_none(self):
+        """When allowed_user_ids is None, internal attribute is None."""
+        bot = DiscordBot("tok", 1, allowed_user_ids=None)
+        assert bot._allowed_user_ids is None
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_empty_list_blocks_all(self):
+        """An empty allowed_user_ids list blocks all non-bot users."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=[])
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 42
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 0

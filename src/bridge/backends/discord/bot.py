@@ -125,6 +125,7 @@ class DiscordBot:
         *,
         on_message: Callable[[discord.Message], Awaitable[None]] | None = None,
         on_reaction: Callable[[discord.RawReactionActionEvent], Awaitable[None]] | None = None,
+        allowed_user_ids: list[str] | None = None,
     ) -> None:
         intents = discord.Intents.default()
         # Privileged intent — required for `on_message` payloads to carry
@@ -139,6 +140,7 @@ class DiscordBot:
         self._ready = asyncio.Event()
         self._on_message_cb = on_message
         self._on_reaction_cb = on_reaction
+        self._allowed_user_ids: set[str] | None = set(allowed_user_ids) if allowed_user_ids is not None else None
         # discord.py registers event handlers by method name.
         self._client.event(self.on_ready)
         if on_message is not None:
@@ -178,9 +180,14 @@ class DiscordBot:
         """Dispatch incoming messages to the registered callback.
 
         Filters out the bot's own messages (AC3.6).
+        If allowed_user_ids is configured, silently drops messages from
+        users whose ID is not in the allowed set.
         """
         # Always ignore our own messages
         if msg.author == self._client.user:
+            return
+        # If an allow-list is configured, drop messages from unlisted users
+        if self._allowed_user_ids is not None and str(msg.author.id) not in self._allowed_user_ids:
             return
         if self._on_message_cb is not None:
             await self._on_message_cb(msg)

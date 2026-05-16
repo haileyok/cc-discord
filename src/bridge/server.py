@@ -548,7 +548,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787, 
                 return
             await approval_router.resolve_tui_by_reaction(msg_id, str(payload.emoji), user_is_self_bot)
 
-        bot = DiscordBot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch)
+        bot = DiscordBot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message, on_reaction=_on_reaction_dispatch, allowed_user_ids=secrets.allowed_user_ids)
         bot_holder["bot"] = bot
         formatter = DiscordRichFormatter(bot)
 
