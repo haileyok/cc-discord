@@ -149,6 +149,28 @@ class ChatPlatform(Protocol):
         """
         ...
 
+    def format_mention(self, user_id: str) -> str:
+        """Format a user mention for this platform.
+
+        Args:
+            user_id: The ID of the user to mention.
+
+        Returns:
+            Formatted mention string for the platform (e.g., '<@user_id>' for Discord).
+        """
+        ...
+
+    def format_channel_link(self, channel_id: str) -> str:
+        """Format a channel link/reference for this platform.
+
+        Args:
+            channel_id: The ID of the channel to reference.
+
+        Returns:
+            Formatted channel reference for the platform (e.g., '<#channel_id>' for Discord).
+        """
+        ...
+
 
 class RichFormatter(Protocol):
     """Protocol for rich formatting (embeds, markdown blocks, etc.)."""

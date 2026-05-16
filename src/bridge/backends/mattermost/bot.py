@@ -360,6 +360,28 @@ class MattermostBot:
         self._require_ready()
         return thread_id
 
+    def format_mention(self, user_id: str) -> str:
+        """Format a user mention for Mattermost.
+
+        Args:
+            user_id: The Mattermost user ID (as string).
+
+        Returns:
+            Formatted mention string (e.g., '@user_id').
+        """
+        return f"@{user_id}"
+
+    def format_channel_link(self, channel_id: str) -> str:
+        """Format a channel link for Mattermost.
+
+        Args:
+            channel_id: The Mattermost channel ID (as string).
+
+        Returns:
+            Formatted channel link string (e.g., '~channel_id').
+        """
+        return f"~{channel_id}"
+
     async def _handle_event(self, event: str, data: dict[str, Any]) -> None:
         """Handle incoming WebSocket events."""
         if event == "posted":

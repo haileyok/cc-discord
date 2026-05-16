@@ -153,6 +153,14 @@ class FakePlatform:
         """Fake fetch_messageable: return a FakeMessageable with typing context."""
         return FakeMessageable()
 
+    def format_mention(self, user_id: str) -> str:
+        """Format a user mention using @ prefix."""
+        return f"@{user_id}"
+
+    def format_channel_link(self, channel_id: str) -> str:
+        """Format a channel link using # prefix."""
+        return f"#{channel_id}"
+
 
 @dataclass
 class FakeZellij:

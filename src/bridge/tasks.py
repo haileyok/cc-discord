@@ -506,17 +506,21 @@ class TaskRegistry:
         after the formatter is created."""
         self._formatter = formatter
 
-    @staticmethod
-    def _notify_mention_prefix() -> str:
-        """Return `<@USER_ID> ` to prepend to interactive TUI prompts so the
-        configured user gets a Discord notification when claude is blocking
-        on input. Empty string if `BRIDGE_NOTIFY_USER_ID` isn't set —
-        keeps the prompt body unchanged for users who don't want pings.
+    def _notify_mention_prefix(self) -> str:
+        """Return a formatted mention to prepend to interactive TUI prompts so the
+        configured user gets a notification when claude is blocking on input.
+        Empty string if `BRIDGE_NOTIFY_USER_ID` isn't set — keeps the prompt
+        body unchanged for users who don't want pings.
+
+        Uses the bot's format_mention method for platform-specific formatting.
         """
         user_id = os.environ.get("BRIDGE_NOTIFY_USER_ID", "").strip()
         if not user_id.isdigit():
             return ""
-        return f"<@{user_id}> "
+        if self._bot is None:
+            # Fallback during early initialization before bot is bound
+            return f"<@{user_id}> "
+        return f"{self._bot.format_mention(user_id)} "
 
     async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
         """Restore in-memory task map from SQLite.

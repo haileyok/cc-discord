@@ -434,6 +434,28 @@ class DiscordBot:
         await attachment_ref.save(dest_path)
         return dest_path
 
+    def format_mention(self, user_id: str) -> str:
+        """Format a user mention for Discord.
+
+        Args:
+            user_id: The Discord user ID (as string).
+
+        Returns:
+            Formatted mention string (e.g., '<@user_id>').
+        """
+        return f"<@{user_id}>"
+
+    def format_channel_link(self, channel_id: str) -> str:
+        """Format a channel link for Discord.
+
+        Args:
+            channel_id: The Discord channel ID (as string).
+
+        Returns:
+            Formatted channel link string (e.g., '<#channel_id>').
+        """
+        return f"<#{channel_id}>"
+
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         """Called by discord.py on every reaction-add. Bridges to the approval router callback."""
         if self._on_reaction_cb is not None:
