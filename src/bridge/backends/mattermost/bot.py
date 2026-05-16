@@ -241,6 +241,7 @@ class MattermostBot:
         file_id = attachment_ref["id"]
         filename = attachment_ref.get("name", f"{file_id}.bin")
         data = await self._api.download_file(file_id)
+        dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / filename
         dest.write_bytes(data)
         return dest

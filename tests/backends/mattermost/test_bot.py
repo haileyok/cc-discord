@@ -439,6 +439,31 @@ class TestMattermostBotAttachments:
             assert result == dest_dir / "test.txt"
             assert result.read_bytes() == b"file content"
 
+    @pytest.mark.asyncio
+    async def test_download_attachment_creates_nested_directories(self):
+        """Test download_attachment creates dest_dir if it doesn't exist."""
+        bot = MattermostBot("https://mm.example.com", "token", "channel-id")
+        bot._api = mock.AsyncMock()
+        bot._api.download_file = mock.AsyncMock(return_value=b"test data")
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Use a non-existent nested directory
+            dest_dir = Path(tmpdir) / "nonexistent" / "subdir"
+            assert not dest_dir.exists()
+
+            attachment_ref = {"id": "file456", "name": "document.bin"}
+
+            result = await bot.download_attachment(attachment_ref, dest_dir)
+
+            # Directory should be created
+            assert dest_dir.exists()
+            # File should be written
+            assert result == dest_dir / "document.bin"
+            assert result.exists()
+            assert result.read_bytes() == b"test data"
+
 
 class TestMattermostBotReactions:
     """Tests for reaction operations."""
