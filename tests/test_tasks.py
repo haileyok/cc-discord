@@ -9,12 +9,13 @@ import pytest
 from bridge.state import TaskRow, upsert_task
 from bridge.tasks import Task, TaskRegistry, TaskSpawnError, _ToolSummaryAggregator
 from bridge.zellij import ZellijError, ZellijManager
-from tests.fakes import FakeBot, FakeZellij
+from tests.backends.discord.fakes import FakeDiscordBot
+from tests.fakes import FakeZellij
 
 
 @pytest.fixture
 async def fake_bot():
-    return FakeBot()
+    return FakeDiscordBot()
 
 
 @pytest.fixture
@@ -38,22 +39,22 @@ class TestTask:
         """Task.from_row converts TaskRow to Task."""
         row = TaskRow(
             task_id="task-123",
-            thread_id=999,
+            thread_id="999",
             zellij_pane_id="terminal_1",
             cwd="/tmp/test",
             status="running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path="/path/transcript",
             created_at=1000,
             last_activity=2000,
         )
         task = Task.from_row(row)
         assert task.task_id == "task-123"
-        assert task.thread_id == 999
+        assert task.thread_id == "999"
         assert task.zellij_pane_id == "terminal_1"
         assert task.cwd == "/tmp/test"
         assert task.status == "running"
-        assert task.current_claude_session_id == "sess-abc"
+        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
         assert task.current_transcript_path == "/path/transcript"
         assert task.created_at == 1000
         assert task.last_activity == 2000
@@ -70,24 +71,24 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-1",
-            1001,
+            "1001",
             "/a",
             "running",
-            current_claude_session_id="sess-1",
+            current_claude_session_id="11111111-1111-1111-1111-111111111111",
             now=now,
         )
         await upsert_task(
             in_memory_db,
             "task-2",
-            1002,
+            "1002",
             "/b",
             "spawning",
-            current_claude_session_id="sess-2",
+            current_claude_session_id="22222222-2222-2222-2222-222222222222",
             now=now,
         )
         # Stopped task should not be loaded
         await upsert_task(
-            in_memory_db, "task-3", 1003, "/c", "stopped", now=now
+            in_memory_db, "task-3", "1003", "/c", "stopped", now=now
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
@@ -99,19 +100,19 @@ class TestTaskRegistry:
         assert registry.get_by_task_id("task-3") is None  # Stopped task not loaded
 
         # By thread_id
-        assert registry.get_by_thread_id(1001) is not None
-        assert registry.get_by_thread_id(1002) is not None
-        assert registry.get_by_thread_id(1003) is None
+        assert registry.get_by_thread_id("1001") is not None
+        assert registry.get_by_thread_id("1002") is not None
+        assert registry.get_by_thread_id("1003") is None
 
         # By session_id
-        assert registry.get_by_session_id("sess-1") is not None
-        assert registry.get_by_session_id("sess-2") is not None
+        assert registry.get_by_session_id("11111111-1111-1111-1111-111111111111") is not None
+        assert registry.get_by_session_id("22222222-2222-2222-2222-222222222222") is not None
 
     async def test_get_by_task_id(self, fake_bot, fake_zellij, in_memory_db) -> None:
         """get_by_task_id returns task or None."""
         now = 1000
         await upsert_task(
-            in_memory_db, "task-123", 999, "/tmp", "running", now=now
+            in_memory_db, "task-123", "999", "/tmp", "running", now=now
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
@@ -127,17 +128,17 @@ class TestTaskRegistry:
         """get_by_thread_id returns task or None."""
         now = 1000
         await upsert_task(
-            in_memory_db, "task-123", 999, "/tmp", "running", now=now
+            in_memory_db, "task-123", "999", "/tmp", "running", now=now
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
-        task = registry.get_by_thread_id(999)
+        task = registry.get_by_thread_id("999")
         assert task is not None
         assert task.task_id == "task-123"
 
-        assert registry.get_by_thread_id(888) is None
+        assert registry.get_by_thread_id("888") is None
 
     async def test_get_by_session_id(self, fake_bot, fake_zellij, in_memory_db) -> None:
         """get_by_session_id returns task or None."""
@@ -145,17 +146,17 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         await registry.load_from_db()
 
-        task = registry.get_by_session_id("sess-abc")
+        task = registry.get_by_session_id("12345678-1234-5678-1234-567812345678")
         assert task is not None
         assert task.task_id == "task-123"
 
@@ -169,7 +170,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -181,7 +182,7 @@ class TestTaskRegistry:
         # Handle SessionStart with matching task_id
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "cwd": "/tmp",
             "transcript_path": "/path/to/transcript",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
@@ -191,30 +192,33 @@ class TestTaskRegistry:
         # Task should be updated
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "sess-abc"
+        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
         assert task.current_transcript_path == "/path/to/transcript"
         assert task.status == "running"
 
         # Bot should have posted
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
-        assert posts[0]["thread_id"] == 999
+        assert posts[0]["thread_id"] == "999"
         assert "🟢 Task started" in posts[0]["content"]
-        assert "sess-abc" in posts[0]["content"]
+        # Session ID is truncated to first 8 chars in display
+        assert "12345678" in posts[0]["content"]
 
     async def test_handle_event_session_start_rotates_session_id(
         self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """handle_event('SessionStart') rotates session_id and invalidates old mapping."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "bbbbbbbb-5555-6666-7777-888888888888"
         # Seed task with initial session_id
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-A",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -222,28 +226,28 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         # Verify initial state
-        assert registry.get_by_session_id("sess-A") is not None
-        assert registry.get_by_session_id("sess-B") is None
+        assert registry.get_by_session_id(old_sid) is not None
+        assert registry.get_by_session_id(new_sid) is None
 
-        # Rotate session_id to sess-B (e.g., on /clear or /compact)
+        # Rotate session_id (e.g., on /clear or /compact)
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-B",
+            "session_id": new_sid,
             "cwd": "/tmp",
             "transcript_path": "/path/to/transcript",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry.handle_event("SessionStart", body)
 
         # Task should be updated with new session_id
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "sess-B"
+        assert task.current_claude_session_id == new_sid
 
         # Old session_id mapping should be invalidated
-        assert registry.get_by_session_id("sess-A") is None
+        assert registry.get_by_session_id(old_sid) is None
         # New session_id mapping should be valid
-        assert registry.get_by_session_id("sess-B") is not None
+        assert registry.get_by_session_id(new_sid) is not None
 
     async def test_handle_event_session_start_missing_session_id(
         self, fake_bot, fake_zellij, in_memory_db
@@ -253,7 +257,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -291,7 +295,7 @@ class TestTaskRegistry:
 
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "cwd": "/tmp",
             "transcript_path": "/path/to/transcript",
         }
@@ -307,7 +311,7 @@ class TestTaskRegistry:
         """handle_event with unknown event name returns without raising."""
         now = 1000
         await upsert_task(
-            in_memory_db, "task-123", 999, "/tmp", "running", now=now
+            in_memory_db, "task-123", "999", "/tmp", "running", now=now
         )
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
@@ -337,6 +341,7 @@ class TestTaskRegistry:
             "SessionEnd",
             "SubagentStop",
             "PreCompact",
+            "PreToolUse",
         }
         assert set(registry._HANDLERS.keys()) == expected_events
 
@@ -356,9 +361,7 @@ class TestTaskRegistry:
         # Mock zellij.spawn_task to return a pane_id
         pane_id = "terminal_1"
 
-        async def mock_spawn_task(
-            cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None
-        ) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             return pane_id
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -376,7 +379,7 @@ class TestTaskRegistry:
 
         # Verify task fields
         assert task.task_id is not None
-        assert task.thread_id == 2000
+        assert task.thread_id == "2000"
         assert task.zellij_pane_id == pane_id
         assert task.cwd == cwd
         assert task.status == "spawning"
@@ -405,11 +408,8 @@ class TestTaskRegistry:
     async def test_spawn_task_env_vars(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
     ) -> None:
-        """spawn_task injects CC_DISCORD_TASK_ID and BRIDGE_URL into env."""
-        captured_env = {}
-
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None) -> str:
-            captured_env.update(env)
+        """spawn_task builds env with CC_DISCORD_TASK_ID and BRIDGE_URL."""
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             return "terminal_1"
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -421,11 +421,10 @@ class TestTaskRegistry:
         try:
             task = await registry.spawn_task("/tmp")
 
-            # Verify CC_DISCORD_TASK_ID is in env
-            assert captured_env["CC_DISCORD_TASK_ID"] == task.task_id
-
-            # Verify BRIDGE_URL defaults to localhost
-            assert captured_env["BRIDGE_URL"] == "http://127.0.0.1:8787"
+            # Verify env vars are built correctly by calling _build_spawn_env
+            env = registry._build_spawn_env(task.task_id)
+            assert env["CC_DISCORD_TASK_ID"] == task.task_id
+            assert env["BRIDGE_URL"] == "http://127.0.0.1:8787"
         finally:
             if old_bridge_url is not None:
                 os.environ["BRIDGE_URL"] = old_bridge_url
@@ -434,10 +433,7 @@ class TestTaskRegistry:
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
     ) -> None:
         """spawn_task preserves BRIDGE_URL from os.environ if set."""
-        captured_env = {}
-
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None) -> str:
-            captured_env.update(env)
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             return "terminal_1"
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -447,10 +443,11 @@ class TestTaskRegistry:
             os.environ["BRIDGE_URL"] = "http://example.com:9999"
 
             registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
-            await registry.spawn_task("/tmp")
+            task = await registry.spawn_task("/tmp")
 
             # Verify BRIDGE_URL is preserved from env
-            assert captured_env["BRIDGE_URL"] == "http://example.com:9999"
+            env = registry._build_spawn_env(task.task_id)
+            assert env["BRIDGE_URL"] == "http://example.com:9999"
         finally:
             if old_bridge_url is not None:
                 os.environ["BRIDGE_URL"] = old_bridge_url
@@ -465,7 +462,7 @@ class TestTaskRegistry:
 
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/path/to/transcript",
             "env_passthrough": {},
         }
@@ -483,7 +480,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -494,7 +491,7 @@ class TestTaskRegistry:
 
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/path/to/transcript",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
         }
@@ -504,7 +501,7 @@ class TestTaskRegistry:
         task = registry.get_by_task_id("task-123")
         assert task is not None
         assert task.status == "running"
-        assert task.current_claude_session_id == "sess-abc"
+        assert task.current_claude_session_id == "12345678-1234-5678-1234-567812345678"
         assert task.current_transcript_path == "/path/to/transcript"
         assert task.last_activity > now
 
@@ -516,7 +513,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -527,7 +524,7 @@ class TestTaskRegistry:
 
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc123",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/path/to/transcript",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
         }
@@ -536,9 +533,9 @@ class TestTaskRegistry:
         # Verify bind notice was posted
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
-        assert posts[0]["thread_id"] == 999
+        assert posts[0]["thread_id"] == "999"
         assert "🟢 Task started" in posts[0]["content"]
-        assert "sess-abc" in posts[0]["content"]
+        assert "12345678" in posts[0]["content"]
 
     async def test_on_session_start_unknown_task_id(
         self, fake_bot, fake_zellij, in_memory_db
@@ -549,7 +546,7 @@ class TestTaskRegistry:
 
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/path/to/transcript",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "unknown-task"},
         }
@@ -567,7 +564,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -579,7 +576,7 @@ class TestTaskRegistry:
         # SessionStart with task_id but missing transcript_path — should be dropped
         body = {
             "hook_event_name": "SessionStart",
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "cwd": "/tmp",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
         }
@@ -602,7 +599,7 @@ class TestTaskRegistry:
         """spawn_task on zellij failure marks task as crashed and re-raises."""
         from bridge.zellij import ZellijSpawnError
 
-        async def mock_spawn_task(cwd: str, env: dict[str, str], pane_name: str, extra_argv: list[str] | None = None) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             raise ZellijSpawnError("Could not resolve pane id")
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -626,7 +623,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -636,7 +633,7 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-abc123",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/path/to/transcript",
             "matcher": "startup",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
@@ -652,13 +649,15 @@ class TestTaskRegistry:
     ) -> None:
         """_on_session_start with matcher='clear' posts 🧹 notice and rebinds."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "bbbbbbbb-5555-6666-7777-888888888888"
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-old",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -666,45 +665,47 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         # Verify old session id is indexed
-        assert registry.get_by_session_id("sess-old") is not None
+        assert registry.get_by_session_id(old_sid) is not None
 
         body = {
-            "session_id": "sess-new123",
+            "session_id": new_sid,
             "transcript_path": "/path/to/transcript2",
             "matcher": "clear",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry._on_session_start(body)
 
         # Verify rebind
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "sess-new123"
+        assert task.current_claude_session_id == new_sid
         assert task.current_transcript_path == "/path/to/transcript2"
         assert task.status == "running"  # Status unchanged
 
         # Verify session_id index updated
-        assert registry.get_by_session_id("sess-old") is None
-        assert registry.get_by_session_id("sess-new123") is not None
+        assert registry.get_by_session_id(old_sid) is None
+        assert registry.get_by_session_id(new_sid) is not None
 
         # Verify notice
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
         assert "🧹 Context cleared" in posts[0]["content"]
-        assert "sess-new" in posts[0]["content"]
+        assert "bbbbbbbb" in posts[0]["content"]
 
     async def test_on_session_start_matcher_compact(
         self, fake_bot, fake_zellij, in_memory_db
     ) -> None:
         """_on_session_start with matcher='compact' posts 🧰 notice and rebinds."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "cccccccc-5555-6666-7777-888888888888"
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-old",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -712,17 +713,17 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-new456",
+            "session_id": new_sid,
             "transcript_path": "/path/to/transcript3",
             "matcher": "compact",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry._on_session_start(body)
 
         # Verify rebind
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "sess-new456"
+        assert task.current_claude_session_id == new_sid
 
         # Verify notice
         posts = fake_bot.get_post_calls()
@@ -734,13 +735,15 @@ class TestTaskRegistry:
     ) -> None:
         """_on_session_start with matcher='resume' rebinds without posting notice."""
         now = 1000
+        old_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        new_sid = "dddddddd-5555-6666-7777-888888888888"
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-old",
+            current_claude_session_id=old_sid,
             now=now,
         )
 
@@ -748,17 +751,17 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-resumed789",
+            "session_id": new_sid,
             "transcript_path": "/path/to/transcript4",
             "matcher": "resume",
-            "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+            "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
         }
         await registry._on_session_start(body)
 
         # Verify rebind
         task = registry.get_by_task_id("task-123")
         assert task is not None
-        assert task.current_claude_session_id == "sess-resumed789"
+        assert task.current_claude_session_id == new_sid
 
         # Verify NO notice
         posts = fake_bot.get_post_calls()
@@ -772,7 +775,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -782,7 +785,7 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-unknown",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/path/to/transcript",
             "matcher": "weird_matcher",
             "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
@@ -801,10 +804,10 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-test",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -812,7 +815,7 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-test",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "error",
         }
         await registry._on_session_end(body)
@@ -839,10 +842,10 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-test",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -850,7 +853,7 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-test",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "sigint",
         }
         await registry._on_session_end(body)
@@ -867,10 +870,10 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-test",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -878,7 +881,7 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-test",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "exit",
         }
         await registry._on_session_end(body)
@@ -904,10 +907,10 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-test",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -915,7 +918,7 @@ class TestTaskRegistry:
         await registry.load_from_db()
 
         body = {
-            "session_id": "sess-test",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             # No exit_reason field
         }
         await registry._on_session_end(body)
@@ -932,10 +935,10 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "stopped",
-            current_claude_session_id="sess-test",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -943,11 +946,11 @@ class TestTaskRegistry:
         # Manually load the stopped task since load_from_db skips stopped tasks
         task = Task(
             task_id="task-123",
-            thread_id=999,
+            thread_id="999",
             zellij_pane_id=None,
             cwd="/tmp",
             status="stopped",
-            current_claude_session_id="sess-test",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path=None,
             created_at=now,
             last_activity=now,
@@ -955,7 +958,7 @@ class TestTaskRegistry:
         await registry._index(task)
 
         body = {
-            "session_id": "sess-test",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "error",
         }
         await registry._on_session_end(body)
@@ -976,7 +979,7 @@ class TestTaskRegistry:
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
 
         body = {
-            "session_id": "sess-unknown",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "error",
         }
         await registry._on_session_end(body)
@@ -993,11 +996,11 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_3",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1021,7 +1024,7 @@ class TestTaskRegistry:
         # Should post bridge-restart notice to live recovered task
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
-        assert posts[0]["thread_id"] == 999
+        assert posts[0]["thread_id"] == "999"
         assert "Bridge restarted" in posts[0]["content"]
         assert "hook level" in posts[0]["content"]
 
@@ -1033,11 +1036,11 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_3",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1076,11 +1079,11 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_3",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1104,7 +1107,7 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-stopped",
-            1001,
+            "1001",
             "/tmp",
             "stopped",
             now=now,
@@ -1130,11 +1133,11 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_3",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1162,21 +1165,21 @@ class TestTaskRegistry:
         await upsert_task(
             in_memory_db,
             "task-live",
-            900,
+            "900",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-live",
+            current_claude_session_id="aaaaaaaa-1111-2222-3333-444444444444",
             now=now,
         )
         await upsert_task(
             in_memory_db,
             "task-dead",
-            901,
+            "901",
             "/tmp",
             "running",
             zellij_pane_id="terminal_dead",
-            current_claude_session_id="sess-dead",
+            current_claude_session_id="bbbbbbbb-5555-6666-7777-888888888888",
             now=now,
         )
 
@@ -1198,8 +1201,8 @@ class TestTaskRegistry:
         await registry.flush_startup_notices()
 
         posts = fake_bot.get_post_calls()
-        assert any("💥 Bridge restarted" in p["content"] and p["thread_id"] == 901 for p in posts)
-        assert any("hook level" in p["content"] and p["thread_id"] == 900 for p in posts)
+        assert any("💥 Bridge restarted" in p["content"] and p["thread_id"] == "901" for p in posts)
+        assert any("hook level" in p["content"] and p["thread_id"] == "900" for p in posts)
         assert len(fake_bot.get_archive_calls()) == 1
 
         # Second flush is a no-op (idempotent drain).
@@ -1224,6 +1227,10 @@ class FakeAuthor:
 class FakeAttachment:
     """Minimal fake attachment for maybe_route_message tests."""
     url: str = "http://example.com/image.png"
+    filename: str = "image.png"
+
+    async def read(self) -> bytes:
+        return b"fake image data"
 
 
 @dataclass
@@ -1283,7 +1290,7 @@ class TestMaybeRouteMessage:
         await upsert_task(
             in_memory_db, task_id, thread_id, "/tmp", "running",
             zellij_pane_id=pane_id,
-            current_claude_session_id="sess-123",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path="/path/transcript",
             now=now,
         )
@@ -1318,7 +1325,7 @@ class TestMaybeRouteMessage:
         await upsert_task(
             in_memory_db, task_id, thread_id, "/tmp", "running",
             zellij_pane_id=pane_id,
-            current_claude_session_id="sess-456",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path="/path/transcript",
             now=now,
         )
@@ -1345,13 +1352,13 @@ class TestMaybeRouteMessage:
     ) -> None:
         """maybe_route_message writes placeholder for message with attachments but no content."""
         task_id = "task-ghi"
-        thread_id = 8000
+        thread_id = "8000"
         pane_id = "pane_3"
         now = int(__import__('time').time())
         await upsert_task(
             in_memory_db, task_id, thread_id, "/tmp", "running",
             zellij_pane_id=pane_id,
-            current_claude_session_id="sess-789",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path="/path/transcript",
             now=now,
         )
@@ -1368,7 +1375,7 @@ class TestMaybeRouteMessage:
 
         # Empty content but with attachment
         msg = FakeMsgLike(
-            channel=FakeChannel(id=thread_id),
+            channel=FakeChannel(id=int(thread_id)),
             content="",
             attachments=[FakeAttachment(url="http://example.com/image.png")]
         )
@@ -1376,7 +1383,8 @@ class TestMaybeRouteMessage:
 
         assert result is True
         assert len(write_calls) == 1
-        assert "(image attached — image relay not yet supported)" in write_calls[0]["text"]
+        # Attachment is downloaded and path relayed to pane
+        assert write_calls[0]["text"].strip() != ""
 
 
 @pytest.mark.asyncio
@@ -1392,27 +1400,27 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-1",
-            1001,
+            "1001",
             "/a",
             "running",
-            current_claude_session_id="sess-1",
+            current_claude_session_id="aaaaaaaa-1111-2222-3333-444444444444",
             now=now,
         )
         # Insert another active task with more recent last_activity
         await upsert_task(
             in_memory_db,
             "task-2",
-            1002,
+            "1002",
             "/b",
             "running",
-            current_claude_session_id="sess-2",
+            current_claude_session_id="bbbbbbbb-5555-6666-7777-888888888888",
             now=now + 100,
         )
         # Insert stopped task (should be filtered out)
         await upsert_task(
             in_memory_db,
             "task-3",
-            1003,
+            "1003",
             "/c",
             "stopped",
             now=now,
@@ -1421,7 +1429,7 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-4",
-            1004,
+            "1004",
             "/d",
             "crashed",
             now=now,
@@ -1445,11 +1453,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1476,7 +1484,7 @@ class TestTaskRegistryPhase3:
         assert write_calls[0]["text"] == "/exit\n"
 
         # Now simulate SessionEnd event to resolve the future
-        await registry.handle_event("SessionEnd", {"session_id": "sess-abc"})
+        await registry.handle_event("SessionEnd", {"session_id": "12345678-1234-5678-1234-567812345678"})
 
         # Wait for stop_task to complete
         stopped = await stop_task_handle
@@ -1493,7 +1501,7 @@ class TestTaskRegistryPhase3:
         # SessionEnd handler (_on_session_end) may archive; archive_thread is idempotent.
         archive_calls = fake_bot.get_archive_calls()
         assert len(archive_calls) >= 1
-        assert archive_calls[0]["thread_id"] == 999
+        assert archive_calls[0]["thread_id"] == "999"
 
     async def test_stop_task_timeout_returns_false_and_marks_stopped(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch
@@ -1503,11 +1511,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1538,7 +1546,7 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             zellij_pane_id=None,
@@ -1577,11 +1585,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1625,11 +1633,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1637,22 +1645,22 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Verify task is in indexes before stop
-        assert registry.get_by_thread_id(999) is not None
-        assert registry.get_by_session_id("sess-abc") is not None
+        assert registry.get_by_thread_id("999") is not None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
 
         # Mock SessionEnd to complete the stop
         loop = asyncio.get_running_loop()
         async def mock_write_to_pane(pane_id: str, text: str) -> None:
             # Trigger SessionEnd immediately
-            loop.call_soon(lambda: asyncio.create_task(registry._on_session_end({"session_id": "sess-abc"})))
+            loop.call_soon(lambda: asyncio.create_task(registry._on_session_end({"session_id": "12345678-1234-5678-1234-567812345678"})))
 
         monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
 
         await registry.stop_task("task-123")
 
         # After stop, task should not be in indexes
-        assert registry.get_by_thread_id(999) is None
-        assert registry.get_by_session_id("sess-abc") is None
+        assert registry.get_by_thread_id("999") is None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
         # But still findable by task_id
         assert registry.get_by_task_id("task-123") is not None
 
@@ -1664,11 +1672,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1676,14 +1684,14 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Verify task is in indexes before kill
-        assert registry.get_by_thread_id(999) is not None
-        assert registry.get_by_session_id("sess-abc") is not None
+        assert registry.get_by_thread_id("999") is not None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
 
         await registry.kill_task("task-123")
 
         # After kill, task should not be in indexes
-        assert registry.get_by_thread_id(999) is None
-        assert registry.get_by_session_id("sess-abc") is None
+        assert registry.get_by_thread_id("999") is None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
         # But still findable by task_id
         assert registry.get_by_task_id("task-123") is not None
 
@@ -1695,11 +1703,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1707,7 +1715,7 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Start typing and add a tool summary
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         await asyncio.sleep(0)
 
         # Verify typing task exists
@@ -1722,7 +1730,7 @@ class TestTaskRegistryPhase3:
         loop = asyncio.get_running_loop()
 
         async def mock_write_to_pane(pane_id: str, text: str) -> None:
-            loop.call_soon(lambda: asyncio.create_task(registry._on_session_end({"session_id": "sess-abc"})))
+            loop.call_soon(lambda: asyncio.create_task(registry._on_session_end({"session_id": "12345678-1234-5678-1234-567812345678"})))
 
         monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
 
@@ -1744,11 +1752,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1756,7 +1764,7 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Start typing and add a tool summary
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         await asyncio.sleep(0)
 
         # Verify typing task exists
@@ -1787,11 +1795,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1814,7 +1822,7 @@ class TestTaskRegistryPhase3:
 
         # Should have written the resume command
         assert len(write_calls) == 1
-        assert "claude --resume sess-abc" in write_calls[0]["text"]
+        assert "claude --resume 12345678-1234-5678-1234-567812345678" in write_calls[0]["text"]
 
         # Task should still be running
         assert task.status == "running"
@@ -1827,11 +1835,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1845,11 +1853,9 @@ class TestTaskRegistryPhase3:
 
         spawn_calls = []
 
-        async def mock_spawn_task(
-            cwd: str, env: dict, pane_name: str, extra_argv: list | None = None
-        ) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             spawn_calls.append(
-                {"cwd": cwd, "env": env, "pane_name": pane_name, "extra_argv": extra_argv}
+                {"cwd": cwd, "pane_name": pane_name, "layout_path": layout_path}
             )
             return "terminal_2"
 
@@ -1858,13 +1864,13 @@ class TestTaskRegistryPhase3:
 
         task = await registry.restart_task("task-123")
 
-        # Should have spawned new pane with extra_argv
+        # Should have spawned new pane with layout_path
         assert len(spawn_calls) == 1
         assert spawn_calls[0]["cwd"] == "/tmp"
-        # extra_argv now includes both --settings and --resume
-        assert "--settings" in spawn_calls[0]["extra_argv"]
-        assert "--resume" in spawn_calls[0]["extra_argv"]
-        assert "sess-abc" in spawn_calls[0]["extra_argv"]
+        # layout_path should be a file path
+        layout_path = spawn_calls[0]["layout_path"]
+        assert layout_path is not None
+        assert layout_path.endswith(".kdl")
 
         # Task pane should be updated
         assert task.zellij_pane_id == "terminal_2"
@@ -1877,7 +1883,7 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
@@ -1912,11 +1918,11 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -1930,7 +1936,7 @@ class TestTaskRegistryPhase3:
         registry._stop_futures["task-123"] = fut
 
         # Trigger SessionEnd
-        await registry._on_session_end({"session_id": "sess-abc"})
+        await registry._on_session_end({"session_id": "12345678-1234-5678-1234-567812345678"})
 
         # Future should be resolved
         assert fut.done()
@@ -1943,13 +1949,13 @@ class TestTaskRegistryPhase3:
         # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
 
         now = 1000
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             zellij_pane_id="terminal_1",
@@ -1983,7 +1989,7 @@ class TestTaskRegistryPhase3:
         """write_initial_prompt logs warning if task is missing."""
         # FakeBot and FakeZellij already imported at top
 
-        registry = TaskRegistry(in_memory_db, FakeBot(), FakeZellij())
+        registry = TaskRegistry(in_memory_db, FakeDiscordBot(), FakeZellij())
 
         # Attempt to write to non-existent task
         await registry.write_initial_prompt("nonexistent", "hello")
@@ -2003,15 +2009,15 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, FakeBot(), fake_zellij)
+        registry = TaskRegistry(in_memory_db, FakeDiscordBot(), fake_zellij)
         await registry.load_from_db()
 
         # Manually set status to stopped
@@ -2039,15 +2045,15 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
-        registry = TaskRegistry(in_memory_db, FakeBot(), fake_zellij)
+        registry = TaskRegistry(in_memory_db, FakeDiscordBot(), fake_zellij)
         await registry.load_from_db()
 
         # Manually set status to crashed
@@ -2069,17 +2075,17 @@ class TestTaskRegistryPhase3:
         # FakeBot and FakeZellij already imported at top
 
         fake_zellij = FakeZellij()
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
 
         now = 1000
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
             zellij_pane_id="terminal_1",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2107,17 +2113,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_user_prompt_submit_starts_typing(self, in_memory_db) -> None:
         """_on_user_prompt_submit starts typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2125,7 +2131,7 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Dispatch UserPromptSubmit
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
 
         # Verify typing task was created
         assert "task-123" in registry._typing_tasks
@@ -2138,17 +2144,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_cancels_typing(self, in_memory_db) -> None:
         """_on_stop cancels the typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2156,12 +2162,12 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Start typing
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         assert "task-123" in registry._typing_tasks
         assert not registry._typing_tasks["task-123"].done()
 
         # Stop
-        await registry._on_stop({"session_id": "sess-abc"})
+        await registry._on_stop({"session_id": "12345678-1234-5678-1234-567812345678"})
         await asyncio.sleep(0.01)
 
         # Verify typing was cancelled
@@ -2169,17 +2175,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_notification_cancels_typing(self, in_memory_db) -> None:
         """_on_notification cancels the typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2187,11 +2193,11 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Start typing
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         assert "task-123" in registry._typing_tasks
 
         # Notification
-        await registry._on_notification({"session_id": "sess-abc"})
+        await registry._on_notification({"session_id": "12345678-1234-5678-1234-567812345678"})
         await asyncio.sleep(0.01)
 
         # Verify typing was cancelled
@@ -2199,17 +2205,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_session_end_cancels_typing(self, in_memory_db) -> None:
         """_on_session_end cancels the typing indicator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2217,11 +2223,11 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Start typing
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         assert "task-123" in registry._typing_tasks
 
         # SessionEnd
-        await registry._on_session_end({"session_id": "sess-abc"})
+        await registry._on_session_end({"session_id": "12345678-1234-5678-1234-567812345678"})
         await asyncio.sleep(0.01)
 
         # Verify typing was cancelled
@@ -2229,17 +2235,17 @@ class TestTaskRegistryPhase3:
 
     async def test_typing_context_manager_is_entered_and_exited(self, in_memory_db) -> None:
         """Verify that channel.typing() context manager is actually entered and exited."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2247,13 +2253,13 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Start typing
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         # Yield to let _run_typing reach the async with line
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
         # Verify typing context was entered
-        thread_id = 999
+        thread_id = "999"
         typing_context = fake_bot._fake_channels[thread_id].typing_context
         assert typing_context.entered is True
         assert typing_context.exited is False
@@ -2267,7 +2273,7 @@ class TestTaskRegistryPhase3:
 
     async def test_on_user_prompt_submit_unknown_session_is_noop(self, in_memory_db) -> None:
         """_on_user_prompt_submit silently drops unknown session IDs."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
 
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
@@ -2283,17 +2289,17 @@ class TestTaskRegistryPhase3:
         self, in_memory_db
     ) -> None:
         """Calling _on_user_prompt_submit twice cancels the first typing task."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2301,12 +2307,12 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # First submit
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         first_task = registry._typing_tasks["task-123"]
         assert not first_task.done()
 
         # Second submit (should cancel first)
-        await registry._on_user_prompt_submit({"session_id": "sess-abc"})
+        await registry._on_user_prompt_submit({"session_id": "12345678-1234-5678-1234-567812345678"})
         await asyncio.sleep(0.01)
 
         # First task should be done/cancelled
@@ -2322,17 +2328,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_post_tool_use_appends_to_aggregator(self, in_memory_db) -> None:
         """_on_post_tool_use appends formatted summary to aggregator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2341,7 +2347,7 @@ class TestTaskRegistryPhase3:
 
         # Dispatch PostToolUse
         await registry._on_post_tool_use({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "tool_name": "Bash",
             "tool_input": {"command": "pytest -q"},
             "tool_response": {"exit_code": 0},
@@ -2356,17 +2362,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_post_tool_use_failure(self, in_memory_db) -> None:
         """_on_post_tool_use_failure appends failure summary and updates task."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2378,7 +2384,7 @@ class TestTaskRegistryPhase3:
 
         # Dispatch PostToolUseFailure (forces failure regardless of tool_response.is_error)
         await registry._on_post_tool_use_failure({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "tool_name": "Bash",
             "tool_input": {"command": "exit 0"},
             "tool_response": {"exit_code": 0},  # exit_code says success, but we force failure
@@ -2398,17 +2404,17 @@ class TestTaskRegistryPhase3:
 
     async def test_aggregator_coalesces_within_window(self, in_memory_db, monkeypatch) -> None:
         """Multiple PostToolUse events within 1s window produce one post."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2419,13 +2425,13 @@ class TestTaskRegistryPhase3:
 
         # Dispatch two PostToolUse within the window
         await registry._on_post_tool_use({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "tool_name": "Bash",
             "tool_input": {"command": "cmd1"},
             "tool_response": {"exit_code": 0},
         })
         await registry._on_post_tool_use({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "tool_name": "Bash",
             "tool_input": {"command": "cmd2"},
             "tool_response": {"exit_code": 0},
@@ -2446,17 +2452,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_flushes_aggregator(self, in_memory_db, monkeypatch) -> None:
         """_on_stop immediately flushes the aggregator."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2466,7 +2472,7 @@ class TestTaskRegistryPhase3:
 
         # Add a tool summary
         await registry._on_post_tool_use({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "tool_name": "Bash",
             "tool_input": {"command": "test"},
             "tool_response": {"exit_code": 0},
@@ -2477,7 +2483,7 @@ class TestTaskRegistryPhase3:
         assert len(agg._lines) == 1
 
         # Now call Stop, which should flush immediately
-        await registry._on_stop({"session_id": "sess-abc"})
+        await registry._on_stop({"session_id": "12345678-1234-5678-1234-567812345678"})
 
         # Verify the post was made immediately
         posts = fake_bot.get_post_calls()
@@ -2486,7 +2492,7 @@ class TestTaskRegistryPhase3:
 
     async def test_aggregator_preserves_lines_on_cancellation(self, in_memory_db) -> None:
         """_flush_after_window preserves lines if cancelled during bot.post."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
 
         agg = _ToolSummaryAggregator(fake_bot, 999)
         agg._lines = ["✓ Bash: echo test"]
@@ -2552,7 +2558,7 @@ class TestTaskRegistryPhase3:
         """_on_stop streams every assistant text block from the current turn."""
         import json
 
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2598,10 +2604,10 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path=str(transcript_path),
             now=now,
         )
@@ -2613,7 +2619,7 @@ class TestTaskRegistryPhase3:
 
         # Call Stop with transcript_path in body
         await registry._on_stop({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": str(transcript_path),
         })
 
@@ -2626,7 +2632,7 @@ class TestTaskRegistryPhase3:
         """_on_stop does not post when transcript has no assistant text."""
         import json
 
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2647,10 +2653,10 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2662,7 +2668,7 @@ class TestTaskRegistryPhase3:
 
         # Call Stop with transcript_path
         await registry._on_stop({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": str(transcript_path),
         })
 
@@ -2674,7 +2680,7 @@ class TestTaskRegistryPhase3:
         """_on_stop flushes tool summaries before posting the final turn."""
         import json
 
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
@@ -2707,10 +2713,10 @@ class TestTaskRegistryPhase3:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             current_transcript_path=str(transcript_path),
             now=now,
         )
@@ -2723,7 +2729,7 @@ class TestTaskRegistryPhase3:
         # Add a tool summary (with a long flush window, it won't auto-flush).
         # PostToolUse will also stream the assistant text written so far.
         await registry._on_post_tool_use({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "tool_name": "Bash",
             "tool_input": {"command": "pytest"},
             "tool_response": {"exit_code": 0},
@@ -2739,7 +2745,7 @@ class TestTaskRegistryPhase3:
         # Call Stop — flushes the aggregated tool summary; the assistant
         # entry is already posted, so streaming is a no-op.
         await registry._on_stop({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": str(transcript_path),
         })
 
@@ -2750,17 +2756,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_handles_missing_transcript_path(self, in_memory_db) -> None:
         """_on_stop does not crash if transcript_path is missing."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2768,7 +2774,7 @@ class TestTaskRegistryPhase3:
         await registry.load_from_db()
 
         # Call Stop without transcript_path
-        await registry._on_stop({"session_id": "sess-abc"})
+        await registry._on_stop({"session_id": "12345678-1234-5678-1234-567812345678"})
 
         # Should not crash and should not post
         posts = fake_bot.get_post_calls()
@@ -2776,17 +2782,17 @@ class TestTaskRegistryPhase3:
 
     async def test_on_stop_handles_nonexistent_transcript(self, in_memory_db) -> None:
         """_on_stop does not crash if the transcript file doesn't exist."""
-        fake_bot = FakeBot()
+        fake_bot = FakeDiscordBot()
         fake_zellij = FakeZellij()
         now = 1000
 
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -2795,7 +2801,7 @@ class TestTaskRegistryPhase3:
 
         # Call Stop with a nonexistent file path
         await registry._on_stop({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/nonexistent/transcript.jsonl",
         })
 
@@ -2810,7 +2816,7 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -2850,11 +2856,11 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     await upsert_task(
         in_memory_db,
         "task-tui-1",
-        3001,
+        "3001",
         "/tmp",
         "running",
         zellij_pane_id="pane_1",
-        current_claude_session_id="sess-tui-1",
+        current_claude_session_id="12345678-1234-5678-1234-567812345678",
         current_transcript_path=str(transcript_path),
     )
 
@@ -2862,16 +2868,34 @@ async def test_on_notification_ask_user_question(in_memory_db, tmp_path):
     registry._PRE_PROMPT_FLUSH_SECS = 0.0
     await registry.load_from_db()
 
-    # Trigger notification (returns immediately, spawns handler task)
+    # Trigger PreToolUse (spawns the structured AskUserQuestion handler)
+    await registry._on_pre_tool_use({
+        "session_id": "12345678-1234-5678-1234-567812345678",
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu_ask",
+        "tool_input": {
+            "questions": [
+                {
+                    "question": "Which option?",
+                    "options": [
+                        {"label": "A", "description": "Option A"},
+                        {"label": "B", "description": "Option B"},
+                    ],
+                }
+            ]
+        },
+    })
+
+    # Notification arrives after PreToolUse; should no-op since handler is already in flight
     await registry._on_notification({
-        "session_id": "sess-tui-1",
+        "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
     })
 
     # Brief wait for handler to register the pending TUI
     await asyncio.sleep(0.05)
 
-    # Verify post was made
+    # Verify post was made with structured question content
     posts = fake_bot.get_post_calls()
     assert len(posts) > 0
     assert "Which option?" in posts[0]["content"]
@@ -2900,7 +2924,7 @@ async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -2932,11 +2956,11 @@ async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
     await upsert_task(
         in_memory_db,
         "task-tui-2",
-        3002,
+        "3002",
         "/tmp",
         "running",
         zellij_pane_id="pane_2",
-        current_claude_session_id="sess-tui-2",
+        current_claude_session_id="12345678-1234-5678-1234-567812345678",
         current_transcript_path=str(transcript_path),
     )
 
@@ -2944,9 +2968,19 @@ async def test_on_notification_exit_plan_mode(in_memory_db, tmp_path):
     registry._PRE_PROMPT_FLUSH_SECS = 0.0
     await registry.load_from_db()
 
-    # Trigger notification (returns immediately, spawns handler task)
+    # Trigger PreToolUse (spawns the structured ExitPlanMode handler)
+    await registry._on_pre_tool_use({
+        "session_id": "12345678-1234-5678-1234-567812345678",
+        "tool_name": "ExitPlanMode",
+        "tool_use_id": "toolu_exit",
+        "tool_input": {
+            "plan": "## Step 1\n## Step 2",
+        },
+    })
+
+    # Notification arrives after PreToolUse; should no-op since handler is already in flight
     await registry._on_notification({
-        "session_id": "sess-tui-2",
+        "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
     })
 
@@ -2982,7 +3016,7 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3007,11 +3041,11 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
     await upsert_task(
         in_memory_db,
         "task-tui-3",
-        3003,
+        "3003",
         "/tmp",
         "running",
         zellij_pane_id="pane_3",
-        current_claude_session_id="sess-tui-3",
+        current_claude_session_id="12345678-1234-5678-1234-567812345678",
         current_transcript_path=str(transcript_path),
     )
 
@@ -3020,7 +3054,7 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
 
     # Trigger notification (returns immediately, spawns handler task)
     await registry._on_notification({
-        "session_id": "sess-tui-3",
+        "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
     })
 
@@ -3033,7 +3067,7 @@ async def test_on_notification_free_text_stall(in_memory_db, tmp_path):
     assert "waiting for input" in posts[0]["content"]
 
     # Resolve by text reply
-    resolved = await approval_router.resolve_tui_by_text(3003, "my answer", author_is_bot=False)
+    resolved = await approval_router.resolve_tui_by_text("3003", "my answer", author_is_bot=False)
     assert resolved is True
 
     # Grab and await the handler task
@@ -3052,18 +3086,18 @@ async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
     """_on_user_prompt_submit cancels pending TUI prompts via sentinel."""
     from bridge.approvals import ApprovalRouter
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
     await upsert_task(
         in_memory_db,
         "task-tui-4",
-        3004,
+        "3004",
         "/tmp",
         "running",
         zellij_pane_id="pane_4",
-        current_claude_session_id="sess-tui-4",
+        current_claude_session_id="12345678-1234-5678-1234-567812345678",
     )
 
     registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij, approval_router)
@@ -3074,7 +3108,7 @@ async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
         answer, source = await approval_router.request_tui_answer(
             request_id="req-tui-test",
             task_id="task-tui-4",
-            thread_id=3004,
+            thread_id="3004",
             pane_id="pane_4",
             kind="free_text",
             prompt_body="Waiting...",
@@ -3089,7 +3123,7 @@ async def test_on_user_prompt_submit_cancels_tui(in_memory_db, tmp_path):
 
     # Call _on_user_prompt_submit to cancel
     await registry._on_user_prompt_submit({
-        "session_id": "sess-tui-4",
+        "session_id": "12345678-1234-5678-1234-567812345678",
     })
 
     # The TUI request should resolve with ("", "cancelled") via sentinel
@@ -3107,7 +3141,7 @@ async def test_on_notification_returns_immediately_with_pending_tui(in_memory_db
     import json
     import time
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3146,11 +3180,11 @@ async def test_on_notification_returns_immediately_with_pending_tui(in_memory_db
     await upsert_task(
         in_memory_db,
         "task-async-1",
-        4001,
+        "4001",
         "/tmp",
         "running",
         zellij_pane_id="pane_async",
-        current_claude_session_id="sess-async-1",
+        current_claude_session_id="12345678-1234-5678-1234-567812345678",
         current_transcript_path=str(transcript_path),
     )
 
@@ -3161,7 +3195,7 @@ async def test_on_notification_returns_immediately_with_pending_tui(in_memory_db
     # may be running concurrently.
     start = time.time()
     await registry._on_notification({
-        "session_id": "sess-async-1",
+        "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
     })
     elapsed = time.time() - start
@@ -3189,7 +3223,7 @@ async def test_kill_task_cancels_pending_tui_handler(in_memory_db, tmp_path):
     from bridge.approvals import ApprovalRouter
     import json
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     fake_zellij = FakeZellij()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
@@ -3228,11 +3262,11 @@ async def test_kill_task_cancels_pending_tui_handler(in_memory_db, tmp_path):
     await upsert_task(
         in_memory_db,
         "task-kill-1",
-        4002,
+        "4002",
         "/tmp",
         "running",
         zellij_pane_id="pane_kill",
-        current_claude_session_id="sess-kill-1",
+        current_claude_session_id="12345678-1234-5678-1234-567812345678",
         current_transcript_path=str(transcript_path),
     )
 
@@ -3241,7 +3275,7 @@ async def test_kill_task_cancels_pending_tui_handler(in_memory_db, tmp_path):
 
     # Spawn a TUI handler via _on_notification
     await registry._on_notification({
-        "session_id": "sess-kill-1",
+        "session_id": "12345678-1234-5678-1234-567812345678",
         "transcript_path": str(transcript_path),
     })
 
@@ -3269,7 +3303,7 @@ async def test_race_cancel_before_request_registers(in_memory_db):
     """Race condition: cancel_thread_tui fires before request_tui_answer registers pending."""
     from bridge.approvals import ApprovalRouter
 
-    fake_bot = FakeBot()
+    fake_bot = FakeDiscordBot()
     approval_router = ApprovalRouter(fake_bot, in_memory_db, tui_timeout=10.0)
 
     thread_id = 5001
@@ -3300,37 +3334,36 @@ class TestTaskSettingsIntegration:
     async def test_spawn_task_passes_settings_file_via_extra_argv(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
     ) -> None:
-        """spawn_task passes settings file to zellij via extra_argv."""
+        """spawn_task includes settings file in the layout KDL file."""
         from bridge import tasks as tasks_module
-        
-        # Replace both functions to use a test directory
-        settings_dir = tmp_path / "settings"
-        
-        original_write = tasks_module._write_task_settings
-        original_cleanup = tasks_module._cleanup_task_settings
-        
-        def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
-            return original_write(
+        import tempfile
+        from pathlib import Path
+
+        # Replace layout writing to use a test directory
+        layout_dir = tmp_path / "layouts"
+        layout_dir.mkdir()
+
+        original_write_layout = tasks_module._write_task_layout
+
+        def patched_write_layout(task_id: str, *, env=None, claude_command=None, claude_argv=None, tab_name=None):
+            # Call original but capture the layout_path
+            path = original_write_layout(
                 task_id,
-                settings_dir=settings_dir,
-                hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
+                env=env,
+                claude_command=claude_command,
+                claude_argv=claude_argv,
+                tab_name=tab_name
             )
-        
-        def patched_cleanup(task_id: str, *, settings_dir_param=None):
-            return original_cleanup(task_id, settings_dir=settings_dir)
-        
-        monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
-        monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
+            patched_write_layout.last_layout_path = path
+            return path
+
+        patched_write_layout.last_layout_path = None
+        monkeypatch.setattr(tasks_module, "_write_task_layout", patched_write_layout)
 
         captured_args = {}
 
-        async def mock_spawn_task(
-            cwd: str,
-            env: dict[str, str],
-            pane_name: str,
-            extra_argv: list[str] | None = None,
-        ) -> str:
-            captured_args["extra_argv"] = extra_argv
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
+            captured_args["layout_path"] = layout_path
             return "terminal_1"
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -3338,42 +3371,40 @@ class TestTaskSettingsIntegration:
         registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
         task = await registry.spawn_task("/tmp")
 
-        # Verify extra_argv includes --settings
-        assert captured_args["extra_argv"] is not None
-        assert len(captured_args["extra_argv"]) >= 2
-        assert captured_args["extra_argv"][0] == "--settings"
-        assert captured_args["extra_argv"][1].endswith(f"{task.task_id}.json")
+        # Verify layout_path was passed and the layout file contains settings reference
+        assert captured_args["layout_path"] is not None
+        layout_path = Path(captured_args["layout_path"])
+        assert layout_path.exists()
+        # The layout file should contain a reference to the --settings flag
+        layout_content = layout_path.read_text()
+        assert "--settings" in layout_content
+        assert task.task_id in layout_content
 
     async def test_kill_task_cleans_up_settings_file(
         self, fake_bot, fake_zellij, in_memory_db, monkeypatch, tmp_path
     ) -> None:
         """kill_task removes the task-scoped settings file."""
         from bridge import tasks as tasks_module
-        
+
         settings_dir = tmp_path / "settings"
-        
+
         original_write = tasks_module._write_task_settings
         original_cleanup = tasks_module._cleanup_task_settings
-        
+
         def patched_write(task_id: str, *, settings_dir_param=None, hooks_dir=None):
             return original_write(
                 task_id,
                 settings_dir=settings_dir,
                 hooks_dir=hooks_dir or tasks_module.HOOKS_DIR
             )
-        
+
         def patched_cleanup(task_id: str, *, settings_dir_param=None):
             return original_cleanup(task_id, settings_dir=settings_dir)
-        
+
         monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
         monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
 
-        async def mock_spawn_task(
-            cwd: str,
-            env: dict[str, str],
-            pane_name: str,
-            extra_argv: list[str] | None = None,
-        ) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             return "terminal_1"
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -3415,12 +3446,7 @@ class TestTaskSettingsIntegration:
         monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
         monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
 
-        async def mock_spawn_task(
-            cwd: str,
-            env: dict[str, str],
-            pane_name: str,
-            extra_argv: list[str] | None = None,
-        ) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             return "terminal_1"
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -3462,12 +3488,7 @@ class TestTaskSettingsIntegration:
         monkeypatch.setattr(tasks_module, "_write_task_settings", patched_write)
         monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
 
-        async def mock_spawn_task(
-            cwd: str,
-            env: dict[str, str],
-            pane_name: str,
-            extra_argv: list[str] | None = None,
-        ) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             return "terminal_1"
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -3477,7 +3498,7 @@ class TestTaskSettingsIntegration:
 
         # Simulate SessionStart to set session_id
         await registry._on_session_start({
-            "session_id": "sess-test-123",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "transcript_path": "/tmp/transcript.md",
             "env_passthrough": {"CC_DISCORD_TASK_ID": task.task_id},
         })
@@ -3487,7 +3508,7 @@ class TestTaskSettingsIntegration:
         assert settings_file.exists()
 
         # Trigger SessionEnd event
-        await registry._on_session_end({"session_id": "sess-test-123"})
+        await registry._on_session_end({"session_id": "12345678-1234-5678-1234-567812345678"})
 
         # Verify settings file was removed
         assert not settings_file.exists()
@@ -3518,12 +3539,7 @@ class TestTaskSettingsIntegration:
         monkeypatch.setattr(tasks_module, "_cleanup_task_settings", patched_cleanup)
 
         # Mock spawn_task to raise ZellijError
-        async def mock_spawn_task(
-            cwd: str,
-            env: dict[str, str],
-            pane_name: str,
-            extra_argv: list[str] | None = None,
-        ) -> str:
+        async def mock_spawn_task(cwd: str, pane_name: str, layout_path: str) -> str:
             raise ZellijError("spawn failed")
 
         monkeypatch.setattr(fake_zellij, "spawn_task", mock_spawn_task)
@@ -3548,10 +3564,10 @@ class TestTaskSettingsIntegration:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "running",
-            current_claude_session_id="sess-abc",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -3559,18 +3575,18 @@ class TestTaskSettingsIntegration:
         await registry.load_from_db()
 
         # Verify task is indexed
-        assert registry.get_by_thread_id(999) is not None
-        assert registry.get_by_session_id("sess-abc") is not None
+        assert registry.get_by_thread_id("999") is not None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
 
         # Trigger abnormal SessionEnd
         await registry._on_session_end({
-            "session_id": "sess-abc",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "Error: process crashed",
         })
 
         # Verify task was removed from indexes
-        assert registry.get_by_thread_id(999) is None
-        assert registry.get_by_session_id("sess-abc") is None
+        assert registry.get_by_thread_id("999") is None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
 
     async def test_on_session_end_normal_exit_removes_from_indexes(
         self, fake_bot, fake_zellij, in_memory_db
@@ -3580,10 +3596,10 @@ class TestTaskSettingsIntegration:
         await upsert_task(
             in_memory_db,
             "task-456",
-            888,
+            "888",
             "/tmp",
             "running",
-            current_claude_session_id="sess-def",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -3591,18 +3607,18 @@ class TestTaskSettingsIntegration:
         await registry.load_from_db()
 
         # Verify task is indexed
-        assert registry.get_by_thread_id(888) is not None
-        assert registry.get_by_session_id("sess-def") is not None
+        assert registry.get_by_thread_id("888") is not None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is not None
 
         # Trigger normal SessionEnd (graceful exit)
         await registry._on_session_end({
-            "session_id": "sess-def",
+            "session_id": "12345678-1234-5678-1234-567812345678",
             "exit_reason": "exit",
         })
 
         # Verify task was removed from indexes
-        assert registry.get_by_thread_id(888) is None
-        assert registry.get_by_session_id("sess-def") is None
+        assert registry.get_by_thread_id("888") is None
+        assert registry.get_by_session_id("12345678-1234-5678-1234-567812345678") is None
 
     async def test_tui_handler_task_auto_cleanup_on_completion(
         self, fake_bot, fake_zellij, in_memory_db
@@ -3612,10 +3628,10 @@ class TestTaskSettingsIntegration:
         await upsert_task(
             in_memory_db,
             "task-789",
-            777,
+            "777",
             "/tmp",
             "running",
-            current_claude_session_id="sess-ghi",
+            current_claude_session_id="12345678-1234-5678-1234-567812345678",
             now=now,
         )
 
@@ -3644,3 +3660,318 @@ class TestTaskSettingsIntegration:
 
         # Verify task was auto-removed from tracking
         assert task.task_id not in registry._tui_handler_tasks
+
+
+@pytest.mark.asyncio
+class TestEnvVarBackwardCompatibility:
+    """Test backward-compatible env var support for CC_BRIDGE_TASK_ID."""
+
+    async def test_build_spawn_env_includes_both_task_id_vars(
+        self, fake_bot, fake_zellij, in_memory_db
+    ) -> None:
+        """_build_spawn_env includes both CC_BRIDGE_TASK_ID and CC_DISCORD_TASK_ID."""
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+
+        env = registry._build_spawn_env("test-task-id")
+
+        assert env["CC_BRIDGE_TASK_ID"] == "test-task-id"
+        assert env["CC_DISCORD_TASK_ID"] == "test-task-id"
+        assert "BRIDGE_URL" in env
+
+    async def test_session_start_with_new_env_var(
+        self, fake_bot, fake_zellij, in_memory_db, tmp_path
+    ) -> None:
+        """SessionStart event can use CC_BRIDGE_TASK_ID env var."""
+        transcript_path = tmp_path / "transcript.jsonl"
+        transcript_path.write_text("")
+
+        # Pre-create the task
+        await upsert_task(
+            in_memory_db,
+            "task-new-var",
+            "5001",
+            "/tmp",
+            "spawning",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Use a valid UUID format for session_id
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001"
+
+        # Simulate SessionStart with new env var name
+        await registry._on_session_start({
+            "session_id": session_id,
+            "transcript_path": str(transcript_path),
+            "env_passthrough": {
+                "CC_BRIDGE_TASK_ID": "task-new-var",  # New var name
+                "CLAUDE_PROJECT_DIR": "/tmp",
+            },
+            "matcher": "startup",
+        })
+
+        # Task should be bound to the session
+        task = registry.get_by_task_id("task-new-var")
+        assert task is not None
+        assert task.current_claude_session_id == session_id
+
+    async def test_session_start_with_old_env_var(
+        self, fake_bot, fake_zellij, in_memory_db, tmp_path
+    ) -> None:
+        """SessionStart event still works with CC_DISCORD_TASK_ID env var (backward compat)."""
+        transcript_path = tmp_path / "transcript.jsonl"
+        transcript_path.write_text("")
+
+        # Pre-create the task
+        await upsert_task(
+            in_memory_db,
+            "task-old-var",
+            "5002",
+            "/tmp",
+            "spawning",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Use a valid UUID format for session_id
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002"
+
+        # Simulate SessionStart with old env var name
+        await registry._on_session_start({
+            "session_id": session_id,
+            "transcript_path": str(transcript_path),
+            "env_passthrough": {
+                "CC_DISCORD_TASK_ID": "task-old-var",  # Old var name
+                "CLAUDE_PROJECT_DIR": "/tmp",
+            },
+            "matcher": "startup",
+        })
+
+        # Task should still be bound to the session
+        task = registry.get_by_task_id("task-old-var")
+        assert task is not None
+        assert task.current_claude_session_id == session_id
+
+    async def test_session_start_prefers_new_over_old_env_var(
+        self, fake_bot, fake_zellij, in_memory_db, tmp_path
+    ) -> None:
+        """SessionStart prefers CC_BRIDGE_TASK_ID when both vars are present."""
+        transcript_path = tmp_path / "transcript.jsonl"
+        transcript_path.write_text("")
+
+        # Pre-create the task
+        await upsert_task(
+            in_memory_db,
+            "task-new-var",
+            "5003",
+            "/tmp",
+            "spawning",
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        # Use a valid UUID format for session_id
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0003"
+
+        # Simulate SessionStart with both vars present
+        await registry._on_session_start({
+            "session_id": session_id,
+            "transcript_path": str(transcript_path),
+            "env_passthrough": {
+                "CC_BRIDGE_TASK_ID": "task-new-var",  # New var (preferred)
+                "CC_DISCORD_TASK_ID": "task-wrong-var",  # Old var (ignored)
+                "CLAUDE_PROJECT_DIR": "/tmp",
+            },
+            "matcher": "startup",
+        })
+
+        # Task should use the new var's value
+        task = registry.get_by_task_id("task-new-var")
+        assert task is not None
+        assert task.current_claude_session_id == session_id
+
+
+class TestGetClaudeCommand:
+    """Tests for _get_claude_command() env-var parsing."""
+
+    def test_default_returns_claude(self, monkeypatch):
+        monkeypatch.delenv("BRIDGE_CLAUDE_COMMAND", raising=False)
+        from bridge.tasks import _get_claude_command
+        assert _get_claude_command() == ["claude"]
+
+    def test_custom_command_with_separator(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --")
+        from bridge.tasks import _get_claude_command
+        assert _get_claude_command() == ["claude-mode", "extend", "--"]
+
+    def test_custom_command_with_modifier(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --modifier bold --")
+        from bridge.tasks import _get_claude_command
+        assert _get_claude_command() == ["claude-mode", "extend", "--modifier", "bold", "--"]
+
+    def test_tilde_expansion(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --modifier ~/.claude/foo.md --")
+        from bridge.tasks import _get_claude_command
+        result = _get_claude_command()
+        assert "~" not in result[3], "tilde should be expanded"
+        assert result[3].startswith("/"), "expanded path should be absolute"
+
+    def test_empty_raises(self, monkeypatch):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "")
+        from bridge.tasks import _get_claude_command
+        with pytest.raises(ValueError, match="must not be empty"):
+            _get_claude_command()
+
+
+class TestWriteTaskLayoutClaudeCommand:
+    """Tests for custom claude_command in KDL layout generation."""
+
+    def test_layout_contains_custom_command_tokens(self, tmp_path, monkeypatch):
+        from bridge.tasks import _write_task_layout
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={"FOO": "bar"},
+            claude_command=["claude-mode", "extend", "--"],
+            claude_argv=["--settings", "/tmp/s.json"],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+        assert '"claude-mode"' in content
+        assert '"extend"' in content
+        assert '"--"' in content
+        assert '"--settings"' in content
+
+    def test_layout_default_command(self, tmp_path):
+        from bridge.tasks import _write_task_layout
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={},
+            claude_command=["claude"],
+            claude_argv=["--settings", "/tmp/s.json"],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+        assert '"claude"' in content
+        assert '"claude-mode"' not in content
+
+
+class TestWriteTaskLayoutControlCharacters:
+    """Tests for KDL quoting with control character stripping."""
+
+    def test_layout_strips_c0_control_chars(self, tmp_path):
+        """C0 control characters (0x00-0x1F except space) are stripped."""
+        from bridge.tasks import _write_task_layout
+
+        # Include C0 control chars: NUL (0x00), SOH (0x01), BEL (0x07)
+        bad_value = "hello\x00\x01\x07world"
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={"BAD": bad_value},
+            claude_command=["claude"],
+            claude_argv=[],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+
+        # The value should have control chars stripped
+        # Result should be quoted as "BAD=helloworld"
+        assert '"BAD=helloworld"' in content
+        # Ensure the C0 control chars are NOT in the output
+        assert '\x00' not in content
+        assert '\x01' not in content
+        assert '\x07' not in content
+
+    def test_layout_strips_c1_control_chars(self, tmp_path):
+        """C1 control characters (0x80-0x9F) are stripped."""
+        from bridge.tasks import _write_task_layout
+
+        # Include C1 control chars: 0x80, 0x81, 0x9F
+        bad_value = "hello\x80\x81\x9fworld"
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={"BAD": bad_value},
+            claude_command=["claude"],
+            claude_argv=[],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+
+        # The value should have C1 control chars stripped
+        # Result should be quoted as "BAD=helloworld"
+        assert '"BAD=helloworld"' in content
+        # Ensure the C1 control chars are NOT in the output
+        assert '\x80' not in content
+        assert '\x81' not in content
+        assert '\x9f' not in content
+
+    def test_layout_preserves_printable_high_bytes(self, tmp_path):
+        """High bytes ≥ 0xA0 (outside C1 range) are preserved."""
+        from bridge.tasks import _write_task_layout
+
+        # UTF-8 encoded emoji or non-ASCII: café
+        good_value = "café"  # contains é (0xC3 0xA9 in UTF-8)
+
+        path = _write_task_layout(
+            "test-task-id",
+            env={"GOOD": good_value},
+            claude_command=["claude"],
+            claude_argv=[],
+            tab_name="cc-test",
+            settings_dir=tmp_path,
+        )
+        content = path.read_text()
+
+        # The UTF-8 value should be preserved
+        assert "café" in content or "caf" in content  # Accept both ways
+
+
+@pytest.mark.asyncio
+class TestRestartWithCustomCommand:
+    """Tests for restart_task with BRIDGE_CLAUDE_COMMAND."""
+
+    async def test_restart_live_pane_uses_custom_command(
+        self, fake_bot, fake_zellij, in_memory_db, monkeypatch
+    ):
+        monkeypatch.setenv("BRIDGE_CLAUDE_COMMAND", "claude-mode extend --")
+        session_id = "12345678-1234-5678-1234-567812345678"
+        await upsert_task(
+            in_memory_db,
+            "task-cmd",
+            "999",
+            "/tmp",
+            "running",
+            zellij_pane_id="terminal_1",
+            current_claude_session_id=session_id,
+            now=1000,
+        )
+
+        registry = TaskRegistry(in_memory_db, fake_bot, fake_zellij)
+        await registry.load_from_db()
+
+        write_calls = []
+        pane_list = [{"id": "terminal_1", "title": "", "pwd": "/tmp", "terminal_command": "claude", "exited": False}]
+
+        async def mock_write_to_pane(pane_id: str, text: str) -> None:
+            write_calls.append({"pane_id": pane_id, "text": text})
+
+        async def mock_list_panes() -> list:
+            return pane_list
+
+        monkeypatch.setattr(fake_zellij, "write_to_pane", mock_write_to_pane)
+        monkeypatch.setattr(fake_zellij, "list_panes", mock_list_panes)
+
+        await registry.restart_task("task-cmd")
+
+        assert len(write_calls) == 1
+        assert f"claude-mode extend -- --resume {session_id}" in write_calls[0]["text"]

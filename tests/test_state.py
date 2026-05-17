@@ -94,6 +94,19 @@ class TestOpenDB:
         finally:
             await conn.close()
 
+    async def test_sessions_table_thread_id_is_text(self, tmp_path: Path) -> None:
+        """Sessions table thread_id column is TEXT type."""
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            cursor = await conn.execute("PRAGMA table_info(sessions)")
+            columns = await cursor.fetchall()
+            # col[1] is name, col[2] is type
+            thread_id_col = [col for col in columns if col[1] == "thread_id"][0]
+            assert thread_id_col[2].upper() == "TEXT", f"Expected TEXT, got {thread_id_col[2]}"
+        finally:
+            await conn.close()
+
 
 @pytest.mark.asyncio
 class TestCloseDB:
@@ -119,13 +132,13 @@ class TestSessionRow:
         row = SessionRow(
             session_id="sess-123",
             cwd="/tmp/test",
-            thread_id=999,
+            thread_id="999",
             created_at=1000,
             last_activity=2000,
         )
         assert row.session_id == "sess-123"
         assert row.cwd == "/tmp/test"
-        assert row.thread_id == 999
+        assert row.thread_id == "999"
         assert row.created_at == 1000
         assert row.last_activity == 2000
 
@@ -134,12 +147,12 @@ class TestSessionRow:
         row = SessionRow(
             session_id="sess-123",
             cwd="/tmp/test",
-            thread_id=999,
+            thread_id="999",
             created_at=1000,
             last_activity=2000,
         )
         with pytest.raises(AttributeError):
-            row.thread_id = 123
+            row.thread_id = "123"
 
 
 @pytest.mark.asyncio
@@ -165,7 +178,7 @@ class TestGetSession:
             now = int(time.time())
             await conn.execute(
                 "INSERT INTO sessions (session_id, cwd, thread_id, created_at, last_activity) VALUES (?, ?, ?, ?, ?)",
-                ("sess-123", "/tmp/test", 999, now, now),
+                ("sess-123", "/tmp/test", "999", now, now),
             )
             await conn.commit()
 
@@ -174,7 +187,7 @@ class TestGetSession:
             assert row is not None
             assert row.session_id == "sess-123"
             assert row.cwd == "/tmp/test"
-            assert row.thread_id == 999
+            assert row.thread_id == "999"
             assert row.created_at == now
             assert row.last_activity == now
         finally:
@@ -191,13 +204,13 @@ class TestUpsertSession:
         conn = await open_db(db_path)
         try:
             now = int(time.time())
-            await upsert_session(conn, "sess-123", "/tmp/test", 999, now=now)
+            await upsert_session(conn, "sess-123", "/tmp/test", "999", now=now)
 
             row = await get_session(conn, "sess-123")
             assert row is not None
             assert row.session_id == "sess-123"
             assert row.cwd == "/tmp/test"
-            assert row.thread_id == 999
+            assert row.thread_id == "999"
             assert row.created_at == now
             assert row.last_activity == now
         finally:
@@ -209,23 +222,23 @@ class TestUpsertSession:
         conn = await open_db(db_path)
         try:
             t0 = int(time.time())
-            await upsert_session(conn, "sess-123", "/tmp/test", 999, now=t0)
+            await upsert_session(conn, "sess-123", "/tmp/test", "999", now=t0)
 
             row1 = await get_session(conn, "sess-123")
             assert row1 is not None
             assert row1.created_at == t0
             assert row1.last_activity == t0
-            assert row1.thread_id == 999
+            assert row1.thread_id == "999"
 
             # Re-upsert with different thread_id and later timestamp
             t1 = t0 + 100
-            await upsert_session(conn, "sess-123", "/tmp/test", 888, now=t1)
+            await upsert_session(conn, "sess-123", "/tmp/test", "888", now=t1)
 
             row2 = await get_session(conn, "sess-123")
             assert row2 is not None
             assert row2.session_id == "sess-123"
             assert row2.cwd == "/tmp/test"
-            assert row2.thread_id == 888  # Updated
+            assert row2.thread_id == "888"  # Updated
             assert row2.created_at == t0  # Preserved
             assert row2.last_activity == t1  # Bumped
         finally:
@@ -237,7 +250,7 @@ class TestUpsertSession:
         conn = await open_db(db_path)
         try:
             before = int(time.time())
-            await upsert_session(conn, "sess-123", "/tmp/test", 999)
+            await upsert_session(conn, "sess-123", "/tmp/test", "999")
             after = int(time.time())
 
             row = await get_session(conn, "sess-123")
@@ -258,7 +271,7 @@ class TestDeleteSession:
         conn = await open_db(db_path)
         try:
             now = int(time.time())
-            await upsert_session(conn, "sess-123", "/tmp/test", 999, now=now)
+            await upsert_session(conn, "sess-123", "/tmp/test", "999", now=now)
 
             row = await get_session(conn, "sess-123")
             assert row is not None
@@ -293,7 +306,7 @@ class TestSessionPersistence:
         # First connection: insert
         conn1 = await open_db(db_path)
         try:
-            await upsert_session(conn1, "sess-123", "/tmp/test", 999, now=now)
+            await upsert_session(conn1, "sess-123", "/tmp/test", "999", now=now)
         finally:
             await conn1.close()
 
@@ -304,7 +317,7 @@ class TestSessionPersistence:
             assert row is not None
             assert row.session_id == "sess-123"
             assert row.cwd == "/tmp/test"
-            assert row.thread_id == 999
+            assert row.thread_id == "999"
             assert row.created_at == now
             assert row.last_activity == now
         finally:
@@ -352,6 +365,19 @@ class TestTasks:
         finally:
             await conn.close()
 
+    async def test_tasks_table_thread_id_is_text(self, tmp_path: Path) -> None:
+        """Tasks table thread_id column is TEXT type."""
+        db_path = tmp_path / "state.db"
+        conn = await open_db(db_path)
+        try:
+            cursor = await conn.execute("PRAGMA table_info(tasks)")
+            columns = await cursor.fetchall()
+            # col[1] is name, col[2] is type
+            thread_id_col = [col for col in columns if col[1] == "thread_id"][0]
+            assert thread_id_col[2].upper() == "TEXT", f"Expected TEXT, got {thread_id_col[2]}"
+        finally:
+            await conn.close()
+
     async def test_upsert_task_inserts_new_row(self, tmp_path: Path) -> None:
         """upsert_task inserts a new task row."""
         from bridge.state import upsert_task, get_task
@@ -362,7 +388,7 @@ class TestTasks:
             await upsert_task(
                 conn,
                 "task-123",
-                thread_id=999,
+                thread_id="999",
                 cwd="/tmp/test",
                 status="spawning",
                 now=now,
@@ -370,7 +396,7 @@ class TestTasks:
             row = await get_task(conn, "task-123")
             assert row is not None
             assert row.task_id == "task-123"
-            assert row.thread_id == 999
+            assert row.thread_id == "999"
             assert row.cwd == "/tmp/test"
             assert row.status == "spawning"
             assert row.zellij_pane_id is None
@@ -391,7 +417,7 @@ class TestTasks:
             await upsert_task(
                 conn,
                 "task-123",
-                thread_id=999,
+                thread_id="999",
                 cwd="/tmp/test",
                 status="spawning",
                 now=t0,
@@ -405,7 +431,7 @@ class TestTasks:
             await upsert_task(
                 conn,
                 "task-123",
-                thread_id=999,
+                thread_id="999",
                 cwd="/tmp/test",
                 status="running",
                 zellij_pane_id="terminal_1",
@@ -431,18 +457,18 @@ class TestTasks:
             await upsert_task(
                 conn,
                 "task-123",
-                thread_id=999,
+                thread_id="999",
                 cwd="/tmp/test",
                 status="running",
                 now=now,
             )
-            row = await get_task_by_thread_id(conn, 999)
+            row = await get_task_by_thread_id(conn, "999")
             assert row is not None
             assert row.task_id == "task-123"
-            assert row.thread_id == 999
+            assert row.thread_id == "999"
 
             # Non-existent thread
-            row = await get_task_by_thread_id(conn, 888)
+            row = await get_task_by_thread_id(conn, "888")
             assert row is None
         finally:
             await conn.close()
@@ -457,7 +483,7 @@ class TestTasks:
             await upsert_task(
                 conn,
                 "task-123",
-                thread_id=999,
+                thread_id="999",
                 cwd="/tmp/test",
                 status="running",
                 current_claude_session_id="sess-abc",
@@ -483,16 +509,16 @@ class TestTasks:
             now = int(time.time())
             # Insert tasks with different statuses
             await upsert_task(
-                conn, "task-1", 1001, "/a", "spawning", now=now
+                conn, "task-1", "1001", "/a", "spawning", now=now
             )
             await upsert_task(
-                conn, "task-2", 1002, "/b", "running", now=now + 10
+                conn, "task-2", "1002", "/b", "running", now=now + 10
             )
             await upsert_task(
-                conn, "task-3", 1003, "/c", "stopped", now=now + 20
+                conn, "task-3", "1003", "/c", "stopped", now=now + 20
             )
             await upsert_task(
-                conn, "task-4", 1004, "/d", "crashed", now=now + 30
+                conn, "task-4", "1004", "/d", "crashed", now=now + 30
             )
 
             rows = await list_active_tasks(conn)
@@ -517,7 +543,7 @@ class TestTasks:
         try:
             now = int(time.time())
             await upsert_task(
-                conn, "task-123", 999, "/tmp", "running", now=now
+                conn, "task-123", "999", "/tmp", "running", now=now
             )
             await log_approval(
                 conn,
@@ -559,7 +585,7 @@ class TestTasks:
             await upsert_task(
                 conn1,
                 "task-123",
-                thread_id=999,
+                thread_id="999",
                 cwd="/tmp/test",
                 status="running",
                 zellij_pane_id="terminal_1",
@@ -576,7 +602,7 @@ class TestTasks:
             row = await get_task(conn2, "task-123")
             assert row is not None
             assert row.task_id == "task-123"
-            assert row.thread_id == 999
+            assert row.thread_id == "999"
             assert row.cwd == "/tmp/test"
             assert row.status == "running"
             assert row.zellij_pane_id == "terminal_1"
@@ -614,7 +640,7 @@ class TestApprovalLog:
         try:
             now = int(time.time())
             await upsert_task(
-                conn, "task-123", 999, "/tmp", "running", now=now
+                conn, "task-123", "999", "/tmp", "running", now=now
             )
             await log_approval(
                 conn,
@@ -648,7 +674,7 @@ class TestApprovalLog:
         try:
             now = int(time.time())
             await upsert_task(
-                conn, "task-123", 999, "/tmp", "running", now=now
+                conn, "task-123", "999", "/tmp", "running", now=now
             )
             await log_approval(
                 conn,
@@ -688,7 +714,7 @@ class TestApprovalLog:
         try:
             now = int(time.time())
             await upsert_task(
-                conn, "task-123", 999, "/tmp", "running", now=now
+                conn, "task-123", "999", "/tmp", "running", now=now
             )
             await log_approval(
                 conn, "req-1", "task-123", "tool_a", "{}", "allow", "a", now=now

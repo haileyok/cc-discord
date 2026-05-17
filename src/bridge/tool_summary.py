@@ -1,4 +1,4 @@
-"""Pure formatter: convert PostToolUse payloads into one-line Discord messages."""
+"""Pure formatter: convert PostToolUse payloads into one-line messages for chat platforms."""
 
 from typing import Any
 
@@ -168,7 +168,7 @@ def _diff_summary(tool_input: dict) -> str:
     return f"+{plus} -{minus}"
 
 
-# Discord's hard limit is 2000 chars per message; bot.py chunks at 1900
+# Chat platforms have a message size limit (e.g. Discord 2000 chars); bot.py chunks at 1900
 # (`MAX_CHUNK`) to leave attribution-header headroom. Diff/code blocks get
 # wrapped in a fenced container (` ```diff\n…\n``` ` ≈ 12 chars) and may
 # also append a `\n…` truncation marker, so the body budget must stay
@@ -180,10 +180,10 @@ _DIFF_BUDGET = 1850
 
 
 def diff_block(tool_name: str, tool_input: dict) -> str | None:
-    """Return a fenced Discord-renderable diff/content block for Edit / MultiEdit
+    """Return a fenced diff/content block for Edit / MultiEdit
     / Write / TodoWrite, or None for tools that don't have a block to emit.
 
-    Truncates at ~_DISCORD_LIMIT to fit a single Discord message.
+    Truncates at ~_DISCORD_LIMIT to fit a single message in the chat platform.
     """
     if tool_name == "Edit":
         return _format_edit_diff(
@@ -217,7 +217,7 @@ def diff_block(tool_name: str, tool_input: dict) -> str | None:
 
 
 def _format_todo_checklist(todos: list) -> str:
-    """Render a Claude TodoWrite payload as a Discord-friendly checklist.
+    """Render a Claude TodoWrite payload as a chat-platform-friendly checklist.
 
     Each todo has `content`, `status` (pending|in_progress|completed), and
     `activeForm`. Use ▶ for in_progress, [x] for completed, [ ] otherwise.

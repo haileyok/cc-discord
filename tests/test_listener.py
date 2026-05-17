@@ -379,7 +379,7 @@ class TestListener:
         asked_at = datetime.now(timezone.utc)
         ask = _PendingAsk(asked_at, grace_secs=0.05)
 
-        await listener.register(456, ask)
+        await listener.register("456", ask)
 
         msg = FakeMsg(
             author=FakeUser(id=123),
@@ -415,7 +415,7 @@ class TestListener:
         asked_at = datetime.now(timezone.utc)
         ask = _PendingAsk(asked_at, grace_secs=1.0)
 
-        await listener.register(456, ask)
+        await listener.register("456", ask)
 
         msg = FakeMsg(
             author=FakeUser(id=123),
@@ -426,7 +426,7 @@ class TestListener:
         await listener.deliver(msg)
 
         # Unregister while coalesce task is pending
-        await listener.unregister(456, ask)
+        await listener.unregister("456", ask)
 
         # Give it time to clean up
         await asyncio.sleep(0.1)
@@ -441,12 +441,12 @@ class TestListener:
         asked_at = datetime.now(timezone.utc)
         ask = _PendingAsk(asked_at, grace_secs=0.05)
 
-        await listener.register(456, ask)
+        await listener.register("456", ask)
 
         # Manually cancel the future (simulating asyncio.wait_for timeout)
         ask.future.cancel()
 
-        await listener.unregister(456, ask)
+        await listener.unregister("456", ask)
 
         # Thread should be gone, no exception raised
         assert 456 not in listener._pending

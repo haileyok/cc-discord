@@ -1,4 +1,4 @@
-"""Task and TaskRegistry for managing discord-driven sessions."""
+"""Task and TaskRegistry for managing chat-platform-driven sessions."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,25 +16,24 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
-import discord
 
 import bridge as _bridge_pkg
 from bridge import tool_summary, transcript, usage, voice
-from bridge.bot import BotNotReady
+from bridge.exceptions import BotNotReady
 from bridge.listener import MessageLike
+from bridge.platform import ChatPlatform, RichFormatter
 from bridge.state import TaskRow, list_active_tasks, upsert_task
 from bridge.zellij import ZellijError, ZellijManager
 
 if TYPE_CHECKING:
     from bridge.approvals import ApprovalRouter
-    from bridge.bot import Bot
 
 logger = logging.getLogger(__name__)
 
 # Task-scoped settings directory
-TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
+TASK_SETTINGS_DIR = Path.home() / ".local" / "state" / "cc-bridge" / "task-settings"
 # Per-task attachment directory for files relayed from Discord.
-ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "claude-discord-bridge" / "attachments"
+ATTACHMENTS_DIR = Path.home() / ".local" / "state" / "cc-bridge" / "attachments"
 
 # Hook scripts directory — resolved at import time for test monkeypatch support.
 # BRIDGE_HOOKS_DIR overrides the package-relative path; required when installed
@@ -62,9 +62,23 @@ _MAX_ATTACHMENTS_PER_POST = 10
 _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
+def _get_claude_command() -> list[str]:
+    """Return the tokenized command for launching Claude sessions.
+
+    Reads BRIDGE_CLAUDE_COMMAND from the environment (default: "claude").
+    For claude-mode usage, include the -- separator in the value, e.g.:
+        BRIDGE_CLAUDE_COMMAND="claude-mode extend --"
+    """
+    raw = os.environ.get("BRIDGE_CLAUDE_COMMAND", "claude")
+    tokens = shlex.split(raw)
+    if not tokens:
+        raise ValueError("BRIDGE_CLAUDE_COMMAND must not be empty")
+    return [os.path.expanduser(t) for t in tokens]
+
+
 @dataclass
 class SubagentBlock:
-    """Per-subagent live-updating Discord message: tracks state for one
+    """Per-subagent live-updating message: tracks state for one
     subagent (identified by `agent_id`) so we can edit a single message in
     place as the subagent runs, instead of streaming each tool call as its
     own message.
@@ -155,6 +169,7 @@ def _write_task_layout(
     task_id: str,
     *,
     env: dict[str, str],
+    claude_command: list[str],
     claude_argv: list[str],
     tab_name: str,
     settings_dir: Path = TASK_SETTINGS_DIR,
@@ -186,13 +201,18 @@ def _write_task_layout(
         # rather than escape them. Defense-in-depth: callers also
         # validate session_id at ingest, but this keeps us safe even if
         # a new field flows in unsanitized later.
-        cleaned = "".join(ch for ch in s if ch >= " " or ch == " ")
+        # Strip C0 (0x00-0x1F except space) and C1 (0x80-0x9F) control chars
+        cleaned = "".join(
+            ch for ch in s
+            if not ((ord(ch) < 0x20 and ch != " ") or (0x80 <= ord(ch) <= 0x9f))
+        )
         return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
     args_tokens: list[str] = []
     for k, v in env.items():
         args_tokens.append(_kdl_quote(f"{k}={v}"))
-    args_tokens.append(_kdl_quote("claude"))
+    for token in claude_command:
+        args_tokens.append(_kdl_quote(token))
     for arg in claude_argv:
         args_tokens.append(_kdl_quote(arg))
     args_line = " ".join(args_tokens)
@@ -305,7 +325,7 @@ class TaskRestartError(Exception):
 
 
 class _ToolSummaryAggregator:
-    """Collects PostToolUse summaries within a 1s window and flushes as one Discord message.
+    """Collects PostToolUse summaries within a 1s window and flushes as one message.
 
     On 429 rate limit, enters slow mode (5s window) for the task's lifetime.
     """
@@ -313,7 +333,7 @@ class _ToolSummaryAggregator:
     FLUSH_WINDOW = 1.0  # seconds
     SLOW_FLUSH_WINDOW = 5.0  # seconds (when rate-limited)
 
-    def __init__(self, bot: Bot, thread_id: int) -> None:
+    def __init__(self, bot: ChatPlatform, thread_id: str) -> None:
         self._bot = bot
         self._thread_id = thread_id
         self._lines: list[str] = []
@@ -376,7 +396,7 @@ class Task:
     """An in-memory task representation."""
 
     task_id: str
-    thread_id: int
+    thread_id: str
     zellij_pane_id: str | None
     cwd: str
     status: str
@@ -407,6 +427,9 @@ class Task:
     # string means "not set yet" (so the first state transition takes effect
     # even if the thread name happens to already start with a green dot).
     status_indicator: str = ""
+    # Prompt to deliver after SessionStart fires. Set by spawn_task when a
+    # prompt is provided; consumed by _on_session_start (startup matcher).
+    pending_prompt: str | None = None
 
     @classmethod
     def from_row(cls, row: TaskRow) -> "Task":
@@ -443,9 +466,12 @@ class TaskRegistry:
     def __init__(
         self,
         conn: aiosqlite.Connection,
-        bot: "Bot | None",
+        bot: ChatPlatform | None,
         zellij: ZellijManager,
         approval_router: "ApprovalRouter | None" = None,
+        *,
+        bind_host: str = "127.0.0.1",
+        bind_port: int = 8787,
     ) -> None:
         """Initialize with database connection, bot, zellij manager, and optional approval router.
 
@@ -453,13 +479,19 @@ class TaskRegistry:
         registry before the Bot exists (load_from_db must run before the HTTP
         server accepts requests, but the Bot logs in later) and calls
         `bind_bot` once the Bot is constructed.
+
+        `bind_host`/`bind_port` are the server's listen address, used to
+        infer BRIDGE_URL for spawned hooks when the env var isn't set.
         """
         self._conn = conn
         self._bot = bot
+        self._formatter: RichFormatter | None = None
         self._zellij = zellij
         self._approval_router = approval_router
+        self._bind_host = bind_host
+        self._bind_port = bind_port
         self._by_task_id: dict[str, Task] = {}
-        self._by_thread_id: dict[int, Task] = {}
+        self._by_thread_id: dict[str, Task] = {}
         self._by_session_id: dict[str, Task] = {}
         self._stop_futures: dict[str, asyncio.Future] = {}
         self._typing_tasks: dict[str, asyncio.Task] = {}
@@ -474,22 +506,31 @@ class TaskRegistry:
         # flush_startup_notices() once the bot is ready.
         self._pending_startup_notices: list[dict] = []
 
-    def bind_bot(self, bot: "Bot") -> None:
+    def bind_bot(self, bot: ChatPlatform) -> None:
         """Attach the Bot instance after construction. Called once by
         `server.serve` after the Bot is created."""
         self._bot = bot
 
-    @staticmethod
-    def _notify_mention_prefix() -> str:
-        """Return `<@USER_ID> ` to prepend to interactive TUI prompts so the
-        configured user gets a Discord notification when claude is blocking
-        on input. Empty string if `BRIDGE_NOTIFY_USER_ID` isn't set —
-        keeps the prompt body unchanged for users who don't want pings.
+    def bind_formatter(self, formatter: RichFormatter) -> None:
+        """Attach the RichFormatter instance. Called once by `server.serve`
+        after the formatter is created."""
+        self._formatter = formatter
+
+    def _notify_mention_prefix(self) -> str:
+        """Return a formatted mention to prepend to interactive TUI prompts so the
+        configured user gets a notification when claude is blocking on input.
+        Empty string if `BRIDGE_NOTIFY_USER_ID` isn't set — keeps the prompt
+        body unchanged for users who don't want pings.
+
+        Uses the bot's format_mention method for platform-specific formatting.
         """
         user_id = os.environ.get("BRIDGE_NOTIFY_USER_ID", "").strip()
         if not user_id.isdigit():
             return ""
-        return f"<@{user_id}> "
+        if self._bot is None:
+            # Fallback during early initialization before bot is bound
+            return f"<@{user_id}> "
+        return f"{self._bot.format_mention(user_id)} "
 
     async def load_from_db(self, *, reconcile_with_zellij: bool = False) -> None:
         """Restore in-memory task map from SQLite.
@@ -593,7 +634,7 @@ class TaskRegistry:
         """Get task by task_id."""
         return self._by_task_id.get(task_id)
 
-    def get_by_thread_id(self, thread_id: int) -> Task | None:
+    def get_by_thread_id(self, thread_id: str) -> Task | None:
         """Get task by thread_id."""
         return self._by_thread_id.get(thread_id)
 
@@ -644,9 +685,14 @@ class TaskRegistry:
         `env(1)`, on top of whatever env the zellij server was started with
         (which already carries PATH, HOME, etc).
         """
+        bridge_url = os.environ.get("BRIDGE_URL")
+        if not bridge_url:
+            hook_host = "127.0.0.1" if self._bind_host == "0.0.0.0" else self._bind_host
+            bridge_url = f"http://{hook_host}:{self._bind_port}"
         return {
-            "CC_DISCORD_TASK_ID": task_id,
-            "BRIDGE_URL": os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787"),
+            "CC_BRIDGE_TASK_ID": task_id,
+            "CC_DISCORD_TASK_ID": task_id,  # backward compat, remove in future release
+            "BRIDGE_URL": bridge_url,
         }
 
     async def _is_pane_alive(self, pane_id: str) -> bool:
@@ -688,12 +734,12 @@ class TaskRegistry:
         # Clean up the task-scoped settings file
         _cleanup_task_artifacts(task.task_id)
 
-    async def _archive_thread(self, thread_id: int) -> None:
-        """Archive a Discord thread."""
+    async def _archive_thread(self, thread_id: str) -> None:
+        """Archive a chat platform thread."""
         try:
             await self._bot.archive_thread(thread_id)
         except Exception:
-            logger.exception("Failed to archive thread %d", thread_id)
+            logger.exception("Failed to archive thread %s", thread_id)
 
     async def _start_typing(self, task: Task) -> None:
         """Start a typing indicator for a task. Cancels any prior typing task."""
@@ -707,11 +753,8 @@ class TaskRegistry:
     async def _run_typing(self, task: Task) -> None:
         """Run typing indicator in background. Lives until cancelled."""
         try:
-            channel = await self._bot.fetch_messageable(task.thread_id)
-            async with channel.typing():
-                # Sleep until cancelled (Stop/Notification cancels us). Discord.py auto-renews
-                # the indicator every 5s under the hood; we just need the context to stay open.
-                await asyncio.Future()  # never resolves; we live until cancelled
+            async with self._bot.start_typing(task.thread_id):
+                await asyncio.Future()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -733,22 +776,21 @@ class TaskRegistry:
         return agg
 
     async def spawn_task(self, cwd: str, *, prompt: str | None = None) -> Task:
-        """Spawn a new claude session in a Discord-bound task.
+        """Spawn a new claude session in a chat-platform-bound task.
 
         1. Validates cwd is a directory.
         2. Generates a task_id UUID.
-        3. Creates a Discord thread.
+        3. Creates a chat platform thread.
         4. Persists a row with status='spawning'.
-        5. Builds env with CC_DISCORD_TASK_ID and BRIDGE_URL.
+        5. Builds env with CC_BRIDGE_TASK_ID (and CC_DISCORD_TASK_ID for backward compat) and BRIDGE_URL.
         6. Spawns claude in zellij via ZellijManager.
         7. Updates row with zellij_pane_id.
         8. Indexes the task in memory.
         9. Returns the Task.
 
-        The `prompt` parameter is accepted but not used here — the slash-command
-        layer in `commands.py` waits for SessionStart binding and then calls
-        `write_initial_prompt` separately, since the pane isn't writable until
-        the per-task settings file is loaded by claude.
+        When `prompt` is provided, it's stored as `pending_prompt` on the Task
+        and delivered via `write_initial_prompt` after SessionStart fires. Claude
+        is always launched interactively so multi-turn conversation works.
 
         Raises TaskSpawnError if cwd is not a directory or zellij spawn fails.
         """
@@ -785,13 +827,19 @@ class TaskRegistry:
 
         # Generate a zellij layout that opens the new tab as a single
         # claude pane (no default shell). claude_argv is what runs after
-        # `env K=V ...`. `tab_name` matches what we'll use to address the
-        # tab via `go-to-tab-name` later.
+        # the claude command tokens. `tab_name` matches what we'll use to
+        # address the tab via `go-to-tab-name` later.
         tab_name = f"cc-{task_id[:8]}"
+        claude_command = _get_claude_command()
+        claude_argv = [
+            "--settings", str(settings_path),
+            "--dangerously-skip-permissions",
+        ]
         layout_path = _write_task_layout(
             task_id,
             env=env,
-            claude_argv=["--settings", str(settings_path)],
+            claude_command=claude_command,
+            claude_argv=claude_argv,
             tab_name=tab_name,
         )
 
@@ -857,6 +905,7 @@ class TaskRegistry:
             current_transcript_path=None,
             created_at=now,
             last_activity=now,
+            pending_prompt=prompt,
         )
         await self._index(task)
 
@@ -866,11 +915,11 @@ class TaskRegistry:
         """If msg is in a task-bound thread, write to its zellij pane and return True.
         Otherwise return False so the caller falls through to the existing /v1/ask listener.
 
-        Attachments are downloaded to ~/.local/state/claude-discord-bridge/attachments/<task>/
+        Attachments are downloaded to ~/.local/state/cc-bridge/attachments/<task>/
         and their absolute paths are appended to the relayed text so Claude can read them
         with the Read tool (handles images, PDFs, JSON, plain text, etc.).
         """
-        thread_id = msg.channel.id
+        thread_id = str(msg.channel.id)
         task = self.get_by_thread_id(thread_id)
         if task is None:
             return False
@@ -981,7 +1030,7 @@ class TaskRegistry:
         return False
 
     async def _save_attachments(self, task_id: str, msg: MessageLike) -> list[Path]:
-        """Download Discord attachments to disk under ATTACHMENTS_DIR/<task_id>/.
+        """Download chat platform attachments to disk under ATTACHMENTS_DIR/<task_id>/.
 
         Filenames are sanitized to the basename and prefixed with the message id
         to avoid collisions when the same name is attached multiple times.
@@ -1038,21 +1087,21 @@ class TaskRegistry:
         """Handle SessionStart event.
 
         Branches on matcher value:
-        - 'startup': first bind. Look up by CC_DISCORD_TASK_ID, populate session/transcript,
-          flip status to running, post '🟢 Task started' notice.
+        - 'startup': first bind. Look up by CC_BRIDGE_TASK_ID (or CC_DISCORD_TASK_ID for backward compat),
+          populate session/transcript, flip status to running, post '🟢 Task started' notice.
         - 'clear':   /clear inside TUI. Rebind same task to new session id, post '🧹' notice.
         - 'compact': /compact inside TUI. Rebind same task to new session id, post '🧰' notice.
         - 'resume':  claude --resume by /restart. Same as startup but no notice (user already
                      saw the /restart command's reply).
         - default:   unknown matcher → fall through to startup behavior (safest).
 
-        Per AC2.4: silently drops SessionStart events with no CC_DISCORD_TASK_ID.
+        Per AC2.4: silently drops SessionStart events with no CC_BRIDGE_TASK_ID or CC_DISCORD_TASK_ID.
         Also drops if session_id or transcript_path is missing.
         """
         session_id = body.get("session_id")
         transcript_path = body.get("transcript_path")
         env_passthrough = body.get("env_passthrough", {})
-        task_id = env_passthrough.get("CC_DISCORD_TASK_ID")
+        task_id = env_passthrough.get("CC_BRIDGE_TASK_ID") or env_passthrough.get("CC_DISCORD_TASK_ID")
         matcher = body.get("matcher") or "startup"
 
         logger.info(f"SessionStart: session_id={session_id}, task_id={task_id}, matcher={matcher}")
@@ -1060,7 +1109,7 @@ class TaskRegistry:
         # AC2.4: drop SessionStart without task_id, session_id, or transcript_path
         if not task_id or not session_id or not transcript_path:
             if not task_id:
-                logger.debug("SessionStart: no CC_DISCORD_TASK_ID in env_passthrough")
+                logger.debug("SessionStart: no CC_BRIDGE_TASK_ID or CC_DISCORD_TASK_ID in env_passthrough")
             elif not session_id:
                 logger.warning("SessionStart: no session_id in body")
             elif not transcript_path:
@@ -1130,6 +1179,12 @@ class TaskRegistry:
                 await self._bot.post(notice, thread_id=task.thread_id)
             except Exception:
                 logger.exception("failed to post session start notice")
+
+        # Deliver pending prompt now that Claude is ready
+        if task.pending_prompt and matcher in ("startup", None):
+            prompt = task.pending_prompt
+            task.pending_prompt = None
+            await self.write_initial_prompt(task.task_id, prompt)
 
     async def _on_user_prompt_submit(self, body: dict) -> None:
         """Handle UserPromptSubmit event. Start typing indicator and cancel pending TUI prompts."""
@@ -1340,7 +1395,7 @@ class TaskRegistry:
             return
         if not task.task_list_state:
             return
-        embed = self._render_task_list_embed(task)
+        data = self._render_task_list_embed(task)
 
         # If our most recent task-list post is STILL the most recent
         # message in the thread (i.e. nothing else has been posted since),
@@ -1352,11 +1407,12 @@ class TaskRegistry:
             try:
                 channel = await self._bot.fetch_messageable(task.thread_id)
                 last_id = getattr(channel, "last_message_id", None)
-                if last_id == task.last_task_list_message_id:
-                    await self._bot.edit_message(
+                if last_id == task.last_task_list_message_id and self._formatter:
+                    await self._formatter.edit_rich(
                         task.thread_id,
                         task.last_task_list_message_id,
-                        embed=embed,
+                        "task_list",
+                        data,
                     )
                     return
             except BotNotReady:
@@ -1368,8 +1424,10 @@ class TaskRegistry:
                 )
 
         try:
-            task.last_task_list_message_id = await self._bot.post_embed(
-                embed, thread_id=task.thread_id
+            if not self._formatter:
+                return
+            task.last_task_list_message_id = await self._formatter.post_rich(
+                task.thread_id, "task_list", data
             )
         except BotNotReady:
             return
@@ -1377,9 +1435,18 @@ class TaskRegistry:
             logger.exception("failed to post task list for task %s", task.task_id)
 
     @staticmethod
-    def _render_task_list_embed(task: Task) -> discord.Embed:
-        """Render the task_list_state mirror as a Discord embed so it stands
-        apart from the thread's prose flow with a colored border."""
+    def _render_task_list_embed(task: Task) -> dict:
+        """Render the task_list_state mirror as a plain data dict.
+
+        Returns a dict with keys:
+          - "entries": list of dicts with "id", "status", "subject" keys
+          - "done": int count of completed tasks
+          - "total": int count of all tasks
+          - "in_progress": int count of in-progress tasks
+
+        The RichFormatter for each backend is responsible for rendering
+        this data into its native format (Discord embed, markdown, etc.).
+        """
         # Sort by id; ids are typically integer-stringy so try numeric sort.
         def _sort_key(tid: str) -> tuple[int, int | str]:
             try:
@@ -1387,7 +1454,7 @@ class TaskRegistry:
             except ValueError:
                 return (1, tid)
 
-        lines: list[str] = []
+        entries: list[dict] = []
         total = 0
         done = 0
         in_progress = 0
@@ -1396,39 +1463,18 @@ class TaskRegistry:
             status = entry.get("status") or "pending"
             subject = (entry.get("subject") or "").strip()
             if status == "completed":
-                mark, done = "✅", done + 1
+                done += 1
             elif status == "in_progress":
-                mark, in_progress = "▶️", in_progress + 1
-            elif status == "deleted":
-                mark = "🗑"
-            else:
-                mark = "⬜"
+                in_progress += 1
             total += 1
-            line = f"{mark} #{tid}"
-            if subject:
-                line += f" {subject}"
-            lines.append(line)
+            entries.append({"id": tid, "status": status, "subject": subject})
 
-        description = "\n".join(lines) or "_(no tasks)_"
-        if len(description) > 4000:
-            description = description[:3997] + "…"
-
-        # Color: green when everything's done, yellow if any in progress,
-        # otherwise neutral grey.
-        if total > 0 and done == total:
-            color = 0x57F287
-        elif in_progress > 0:
-            color = 0xFEE75C
-        else:
-            color = 0x95A5A6
-
-        embed = discord.Embed(
-            title="📋 Tasks",
-            description=description,
-            color=color,
-        )
-        embed.set_footer(text=f"{done}/{total} done")
-        return embed
+        return {
+            "entries": entries,
+            "done": done,
+            "total": total,
+            "in_progress": in_progress,
+        }
 
     def _is_sidechain_tool(self, body: dict, tool_name: str) -> bool:
         """Best-effort: did the most recent `tool_use` of `tool_name` come from
@@ -1559,7 +1605,7 @@ class TaskRegistry:
             logger.info("Stop: no transcript_path in body or task; skipping final stream")
 
     async def _post_stats_footer(self, task: Task, transcript_path: Path) -> None:
-        """After Stop, post a one-line model/tokens/cost summary to Discord."""
+        """After Stop, post a one-line model/tokens/cost summary to chat platform."""
         try:
             stats = usage.compute_stats(transcript_path)
         except Exception:
@@ -1731,12 +1777,12 @@ class TaskRegistry:
 
     @staticmethod
     def _format_thinking(text: str) -> str:
-        """Discord-render a thinking block: 🤔 + multi-line italics."""
+        """Render a thinking block: 🤔 + multi-line italics."""
         return f"🤔 *{text.strip()}*"
 
     async def _refresh_subagent_blocks(self, task: Task) -> None:
         """Scan `<session>/subagents/agent-*.jsonl` and create/update one
-        `SubagentBlock` per file. Each block is a single Discord message
+        `SubagentBlock` per file. Each block is a single message
         edited in place to show the last N actions of that subagent.
 
         Idempotent — uses `last_entry_uuid` for change detection so we only
@@ -1816,7 +1862,7 @@ class TaskRegistry:
                 last_edit_at=now,
                 finished_at=now if finished else None,
             )
-            embed = self._render_subagent_embed(
+            data = self._render_subagent_embed(
                 block, last_actions, total_actions, finished
             )
             # Post FIRST, persist only on success. If the post fails (most
@@ -1826,8 +1872,10 @@ class TaskRegistry:
             # refresh re-try as if fresh, instead of leaving a zombie block
             # whose `message_id is None` blocks future edits.
             try:
-                block.message_id = await self._bot.post_embed(
-                    embed, thread_id=task.thread_id
+                if not self._formatter:
+                    return
+                block.message_id = await self._formatter.post_rich(
+                    task.thread_id, "subagent_block", data
                 )
             except BotNotReady:
                 logger.info(
@@ -1857,12 +1905,14 @@ class TaskRegistry:
 
         if block.message_id is None:
             return  # initial post failed; nothing to edit
-        embed = self._render_subagent_embed(
+        data = self._render_subagent_embed(
             block, last_actions, total_actions, finished
         )
         try:
-            await self._bot.edit_message(
-                task.thread_id, block.message_id, embed=embed
+            if not self._formatter:
+                return
+            await self._formatter.edit_rich(
+                task.thread_id, block.message_id, "subagent_block", data
             )
         except Exception:
             logger.exception(
@@ -1914,8 +1964,19 @@ class TaskRegistry:
         last_actions: list[str],
         total_actions: int,
         finished: bool,
-    ) -> discord.Embed:
-        status = "finished" if finished else "running"
+    ) -> dict:
+        """Render a subagent block as a plain data dict.
+
+        Returns a dict with keys:
+          - "attribution": str agent name/label
+          - "actions": list[str] of recent action lines
+          - "total_actions": int total action count
+          - "finished": bool whether the subagent has finished
+          - "duration": str human-readable elapsed time (e.g. "30s", "1.5m")
+
+        The RichFormatter for each backend is responsible for rendering
+        this data into its native format (Discord embed, markdown, etc.).
+        """
         # finished_at may not have been set yet on the first observed-finished
         # refresh; fall back to now to avoid a None subtraction.
         end = (block.finished_at if finished else None) or time.time()
@@ -1923,21 +1984,13 @@ class TaskRegistry:
         dur = (
             f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
         )
-        # Color cues: yellow while running, green when finished cleanly.
-        color = 0x57F287 if finished else 0xFEE75C  # discord brand yellow/green
-
-        # Discord embed.description hard cap is 4096; truncate safely.
-        description = "\n".join(last_actions)
-        if len(description) > 3900:
-            description = description[:3897] + "…"
-
-        embed = discord.Embed(
-            title=f"🤖 {block.attribution}",
-            description=description or "_(no actions yet)_",
-            color=color,
-        )
-        embed.set_footer(text=f"{status} · {total_actions} actions · {dur}")
-        return embed
+        return {
+            "attribution": block.attribution,
+            "actions": last_actions,
+            "total_actions": total_actions,
+            "finished": finished,
+            "duration": dur,
+        }
 
     def _track_tui_handler_task(self, task_id: str, handler_task: asyncio.Task) -> None:
         """Track a TUI handler task and remove it from tracking when it completes.
@@ -2106,7 +2159,7 @@ class TaskRegistry:
             )
 
     async def _handle_ask_user_question(self, task: Task, pending: dict) -> None:
-        """Handle AskUserQuestion prompt: post each question to Discord with
+        """Handle AskUserQuestion prompt: post each question to chat platform with
         option reactions, in sequence.
 
         Single-select: numeric reactions resolve immediately to the selected
@@ -2242,7 +2295,7 @@ class TaskRegistry:
                 )
 
     async def _handle_exit_plan_mode(self, task: Task, pending: dict) -> None:
-        """Handle ExitPlanMode prompt: post plan to Discord with approve/reject reactions."""
+        """Handle ExitPlanMode prompt: post plan to chat platform with approve/reject reactions."""
         await self._flush_pending_text_before_prompt(task)
         if not self._approval_router:
             logger.warning("approval_router not configured; cannot dispatch TUI prompt for task %s", task.task_id)
@@ -2300,7 +2353,8 @@ class TaskRegistry:
         """Write initial prompt to a task's zellij pane after session bind.
 
         Looks up the task by task_id. If pane_id is None or task is missing,
-        logs warning and returns. Otherwise writes prompt + newline and bumps last_activity.
+        logs warning and returns. Otherwise writes prompt + newline (with retry)
+        and bumps last_activity.
         """
         task = self.get_by_task_id(task_id)
         if task is None:
@@ -2309,7 +2363,8 @@ class TaskRegistry:
         if task.zellij_pane_id is None:
             logger.warning("write_initial_prompt: task %s has no pane_id", task_id)
             return
-        await self._zellij.write_to_pane(task.zellij_pane_id, prompt + "\n")
+        if not await self._write_with_retry(task, prompt + "\n"):
+            return
         task.last_activity = int(time.time())
         await self._persist(task)
 
@@ -2526,10 +2581,9 @@ class TaskRegistry:
 
         if pane_alive:
             # Just write the resume command into the existing pane; user sees the new banner.
-            await self._zellij.write_to_pane(
-                pane_id,
-                f"\nclaude --resume {task.current_claude_session_id}\n",
-            )
+            claude_command = _get_claude_command()
+            resume_cmd = shlex.join([*claude_command, "--resume", task.current_claude_session_id])
+            await self._zellij.write_to_pane(pane_id, f"\n{resume_cmd}\n")
             # Status stays 'running' — SessionStart will rebind on the new session id
             task.last_activity = int(time.time())
             await self._persist(task)
@@ -2539,9 +2593,11 @@ class TaskRegistry:
         settings_path = _write_task_settings(task.task_id)
         env = self._build_spawn_env(task.task_id)
         tab_name = f"cc-{task.task_id[:8]}"
+        claude_command = _get_claude_command()
         layout_path = _write_task_layout(
             task.task_id,
             env=env,
+            claude_command=claude_command,
             claude_argv=[
                 "--settings", str(settings_path),
                 "--resume", task.current_claude_session_id,

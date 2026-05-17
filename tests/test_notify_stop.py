@@ -412,3 +412,58 @@ async def test_webhook_url_whitespace_stripped(fake_webhook, tmp_path):
 
     # Verify webhook received the POST (URL was correctly stripped)
     assert len(fake_webhook["seen"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_file_permissions_enforced(fake_webhook, tmp_path):
+    """
+    Webhook file with insecure permissions (not 0600) → hook fixes permissions.
+    """
+    import stat
+
+    # Build transcript with user message 800s ago
+    now = datetime.now(timezone.utc)
+    last_user_ts = (now - timedelta(seconds=800)).isoformat()
+    transcript_path = tmp_path / "transcript.jsonl"
+    transcript_path.write_text(_build_transcript(last_user_ts))
+
+    # Create fake home with webhook file with insecure permissions
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    claude_dir = fake_home / ".claude"
+    claude_dir.mkdir()
+    webhook_file = claude_dir / "discord-notify-webhook"
+    webhook_file.write_text(fake_webhook["url"])
+    # Set to world-readable (0644) - insecure
+    webhook_file.chmod(0o644)
+
+    # Verify file starts with insecure permissions
+    initial_mode = webhook_file.stat().st_mode & 0o777
+    assert initial_mode == 0o644
+
+    # Build payload
+    payload = {
+        "session_id": "perms-test",
+        "cwd": "/tmp/hhh",
+    }
+
+    # Use a closed port so bridge fails and fallback webhook is triggered
+    closed_port = 54324
+
+    # Run hook
+    result = await _run_hook(
+        payload,
+        transcript_path=transcript_path,
+        bridge_url=f"http://127.0.0.1:{closed_port}",
+        home_dir=fake_home,
+    )
+
+    # Verify exit code
+    assert result.returncode == 0
+
+    # Verify webhook received the POST
+    assert len(fake_webhook["seen"]) == 1
+
+    # Verify file permissions were fixed to 0600
+    final_mode = webhook_file.stat().st_mode & 0o777
+    assert final_mode == 0o600

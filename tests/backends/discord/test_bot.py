@@ -1,11 +1,11 @@
-"""Tests for the discord bot wrapper."""
+"""Tests for the Discord bot wrapper."""
 
 from unittest import mock
 
 import discord
 import pytest
 
-from bridge.bot import MAX_CHUNK, _chunk, Bot, BotNotReady
+from bridge.backends.discord.bot import MAX_CHUNK, _chunk, DiscordBot, BotNotReady
 
 
 class Test_chunk:
@@ -138,39 +138,39 @@ class TestBot:
 
     def test_bot_init(self):
         """Bot initializes with token and channel_id."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         assert bot.channel_id == 12345
 
     def test_bot_not_ready_initially(self):
         """Bot is not ready immediately after creation."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         assert not bot.is_ready
 
     @pytest.mark.asyncio
     async def test_bot_post_not_ready_raises(self):
         """Bot.post() raises BotNotReady if bot is not connected."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         with pytest.raises(BotNotReady, match="not connected"):
             await bot.post("test message")
 
     @pytest.mark.asyncio
     async def test_bot_close_without_start(self):
         """Bot.close() works even if start() was never called."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         # Should not raise
         await bot.close()
 
     @pytest.mark.asyncio
     async def test_bot_create_thread_not_ready_raises(self):
         """Bot.create_thread() raises BotNotReady if bot is not connected."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         with pytest.raises(BotNotReady, match="not connected"):
             await bot.create_thread("test thread")
 
     @pytest.mark.asyncio
     async def test_bot_on_message_callback_without_callback(self):
         """Bot init without on_message callback doesn't register dispatcher."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         # Should not have registered an on_message listener
         # (we can't easily verify this without mocking, but at least it shouldn't crash)
         assert bot._on_message_cb is None
@@ -184,7 +184,7 @@ class TestBot:
             nonlocal call_count
             call_count += 1
 
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
+        bot = DiscordBot("test_token", 12345, on_message=dummy_callback)
         assert bot._on_message_cb is dummy_callback
 
     @pytest.mark.asyncio
@@ -196,7 +196,7 @@ class TestBot:
             nonlocal call_count
             call_count += 1
 
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
+        bot = DiscordBot("test_token", 12345, on_message=dummy_callback)
 
         # Create a mock message where author == client.user
         mock_msg = mock.MagicMock()
@@ -218,7 +218,7 @@ class TestBot:
             call_count += 1
             received_msg = msg
 
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
+        bot = DiscordBot("test_token", 12345, on_message=dummy_callback)
 
         # Create a mock message where author != client.user
         mock_author = mock.MagicMock()
@@ -243,7 +243,7 @@ class TestBot:
             nonlocal call_count
             call_count += 1
 
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
+        bot = DiscordBot("test_token", 12345, on_message=dummy_callback)
 
         # Create a mock message from a non-bot author
         mock_author = mock.MagicMock()
@@ -272,7 +272,7 @@ class TestBot:
             nonlocal call_count
             call_count += 1
 
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
+        bot = DiscordBot("test_token", 12345, on_message=dummy_callback)
 
         # Create a mock message where author == client.user
         mock_msg = mock.MagicMock()
@@ -287,29 +287,29 @@ class TestBot:
 
     def test_bot_client_property(self):
         """Bot.client returns the underlying discord.Client."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         assert bot.client is bot._client
 
     def test_bot_channel_property_before_ready(self):
         """Bot.channel is None before on_ready is called."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         assert bot.channel is None
 
     @pytest.mark.asyncio
     async def test_archive_thread_raises_when_not_ready(self):
         """archive_thread raises BotNotReady if bot is not ready."""
-        from bridge.bot import BotNotReady
+        from bridge.backends.discord.bot import BotNotReady
 
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         # Bot is not ready yet
 
         with pytest.raises(BotNotReady):
-            await bot.archive_thread(9999)
+            await bot.archive_thread("9999")
 
     @pytest.mark.asyncio
     async def test_archive_thread_swallows_404(self):
         """archive_thread silently ignores discord.NotFound (404)."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         # Set ready event and channel manually
         bot._ready.set()
         bot._channel = mock.MagicMock(spec=discord.TextChannel)
@@ -328,7 +328,7 @@ class TestBot:
     @pytest.mark.asyncio
     async def test_archive_thread_ignores_non_thread(self):
         """archive_thread does nothing if fetch_channel returns non-Thread."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         bot._ready.set()
         bot._channel = mock.MagicMock(spec=discord.TextChannel)
 
@@ -348,7 +348,7 @@ class TestBot:
     @pytest.mark.asyncio
     async def test_archive_thread_happy_path(self):
         """archive_thread calls thread.edit(archived=True) for a Thread."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         bot._ready.set()
         bot._channel = mock.MagicMock(spec=discord.TextChannel)
 
@@ -370,7 +370,7 @@ class TestBot:
     @pytest.mark.asyncio
     async def test_add_reactions_calls_add_reaction(self):
         """add_reactions calls add_reaction for each emoji."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         bot._ready.set()
 
         # Mock fetch_channel to return a channel with fetch_message
@@ -396,7 +396,7 @@ class TestBot:
     @pytest.mark.asyncio
     async def test_add_reactions_raises_when_not_ready(self):
         """add_reactions raises BotNotReady if bot not connected."""
-        bot = Bot("test_token", 12345)
+        bot = DiscordBot("test_token", 12345)
         # Don't set _ready
         with pytest.raises(BotNotReady):
             await bot.add_reactions(1001, 1002, ["✅"])
@@ -409,7 +409,7 @@ class TestBot:
         async def mock_callback(payload):
             callback_called.append(payload)
 
-        bot = Bot("test_token", 12345, on_reaction=mock_callback)
+        bot = DiscordBot("test_token", 12345, on_reaction=mock_callback)
 
         # Create a mock RawReactionActionEvent
         payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
@@ -424,10 +424,101 @@ class TestBot:
     @pytest.mark.asyncio
     async def test_on_raw_reaction_add_no_callback(self):
         """on_raw_reaction_add does nothing if no callback registered."""
-        bot = Bot("test_token", 12345)  # No on_reaction callback
+        bot = DiscordBot("test_token", 12345)  # No on_reaction callback
 
         # Create a mock RawReactionActionEvent
         payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
 
         # Should not raise
         await bot.on_raw_reaction_add(payload)
+
+
+class TestAllowedUserIds:
+    """Tests for allowed_user_ids filtering on incoming messages."""
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_none_permits_all_users(self):
+        """When allowed_user_ids is None, all users are allowed (backward compat)."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=None)
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 999
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_permits_listed_user(self):
+        """Messages from a user whose ID is in allowed_user_ids are processed."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=["111", "222"])
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 111
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_blocks_unlisted_user(self):
+        """Messages from a user whose ID is NOT in allowed_user_ids are silently dropped."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=["111", "222"])
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 999  # not in allowed list
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 0
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_stored_as_set_internally(self):
+        """allowed_user_ids is converted to a set for O(1) lookup."""
+        bot = DiscordBot("tok", 1, allowed_user_ids=["111", "222", "333"])
+        assert bot._allowed_user_ids == {"111", "222", "333"}
+
+    def test_allowed_user_ids_none_stored_as_none(self):
+        """When allowed_user_ids is None, internal attribute is None."""
+        bot = DiscordBot("tok", 1, allowed_user_ids=None)
+        assert bot._allowed_user_ids is None
+
+    @pytest.mark.asyncio
+    async def test_allowed_user_ids_empty_list_blocks_all(self):
+        """An empty allowed_user_ids list blocks all non-bot users."""
+        received = []
+
+        async def callback(msg):
+            received.append(msg)
+
+        bot = DiscordBot("tok", 1, on_message=callback, allowed_user_ids=[])
+
+        mock_author = mock.MagicMock()
+        mock_author.id = 42
+        mock_msg = mock.MagicMock()
+        mock_msg.author = mock_author
+
+        await bot.on_message(mock_msg)
+
+        assert len(received) == 0

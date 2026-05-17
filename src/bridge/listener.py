@@ -1,4 +1,4 @@
-"""Listener for routing Discord messages to pending /v1/ask calls.
+"""Listener for routing chat platform messages to pending /v1/ask calls.
 
 Implements sliding-window coalescing for multi-message replies within a grace
 period. At most one pending ask per thread; FIFO ordering is enforced by
@@ -22,8 +22,8 @@ class AskResult:
     replied_at: str  # ISO8601 of the *last* coalesced message
 
 
-# Anything with the discord.py-Message shape we care about. Tests pass
-# small dataclasses; runtime passes real discord.Message objects.
+# Anything with the message shape we care about. Tests pass
+# small dataclasses; runtime passes real Message objects from the platform backend.
 class MessageLike(Protocol):
     """Protocol for message-like objects."""
 
@@ -92,7 +92,7 @@ class _PendingAsk:
 
 
 class Listener:
-    """Routes incoming Discord messages to pending /v1/ask calls.
+    """Routes incoming chat platform messages to pending /v1/ask calls.
 
     At most one pending ask per thread. FIFO ordering is enforced by
     server.AskLockMap — the lock is acquired before register(), so by the
@@ -100,10 +100,10 @@ class Listener:
     """
 
     def __init__(self) -> None:
-        self._pending: dict[int, _PendingAsk] = {}
+        self._pending: dict[str, _PendingAsk] = {}
         self._lock = asyncio.Lock()  # guards _pending mutation
 
-    async def register(self, thread_id: int, ask: _PendingAsk) -> None:
+    async def register(self, thread_id: str, ask: _PendingAsk) -> None:
         """Register an ask for a thread.
 
         Raises RuntimeError if the thread already has a pending ask
@@ -116,7 +116,7 @@ class Listener:
                 raise RuntimeError(f"thread {thread_id} already has a pending ask")
             self._pending[thread_id] = ask
 
-    async def unregister(self, thread_id: int, ask: _PendingAsk) -> None:
+    async def unregister(self, thread_id: str, ask: _PendingAsk) -> None:
         """Unregister an ask from a thread.
 
         Cancels any pending coalesce task to prevent task leak.
@@ -128,7 +128,7 @@ class Listener:
 
     async def deliver(self, msg: MessageLike) -> None:
         """Deliver an incoming message to the pending ask for its thread (if any)."""
-        thread_id = msg.channel.id
+        thread_id = str(msg.channel.id)
         async with self._lock:
             ask = self._pending.get(thread_id)
         if ask is None:

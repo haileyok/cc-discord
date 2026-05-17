@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Session name is configurable via env var so users can colocate bridge tasks
 # with their existing zellij session (e.g. the one their SSH RemoteCommand
-# attaches to). Defaults to `meow` to match Hailey's typical setup.
-SESSION_NAME = os.environ.get("BRIDGE_ZELLIJ_SESSION", "meow")
+# attaches to). Defaults to `cc-bridge-worker` to match the bridge's purpose.
+SESSION_NAME = os.environ.get("BRIDGE_ZELLIJ_SESSION", "cc-bridge-worker")
 
 
 def _session_already_exists(stderr: str) -> bool:
@@ -115,6 +115,9 @@ class ZellijManager:
         the session is already running; treat that as success. If we're running
         inside the target session itself, skip the attach (zellij panics on
         self-attach).
+
+        After creation, dismiss any floating plugin panes (e.g. the "About
+        Zellij" startup tip) that steal focus from task tabs.
         """
         if _running_inside_target_session():
             return
@@ -123,6 +126,46 @@ class ZellijManager:
         )
         if returncode != 0 and not _session_already_exists(stderr):
             raise ZellijSessionMissing(f"Failed to create/attach session: {stderr}")
+        # Zellij launches plugins asynchronously after session creation;
+        # the About pane may not exist yet. Brief delay for plugins to load.
+        await asyncio.sleep(1.5)
+        await self._close_floating_plugins()
+
+    async def _close_floating_plugins(self) -> None:
+        """Close any floating plugin panes (e.g. "About Zellij" startup tip).
+
+        Zellij 0.44 shows an "About Zellij" floating pane on first session
+        start that steals focus from task tabs and eats keyboard input.
+        The config keys setup_wizard/show_release_notes don't suppress it.
+        Best-effort: list all panes, find floating plugins, close them.
+        """
+        rc, stdout, _ = await self._run(
+            self._executable, "--session", SESSION_NAME,
+            "action", "list-panes", "--json",
+        )
+        if rc != 0:
+            return
+        try:
+            panes = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            return
+        for pane in panes:
+            if (
+                isinstance(pane, dict)
+                and pane.get("is_plugin")
+                and pane.get("is_floating")
+                and not pane.get("is_suppressed")
+            ):
+                pane_id = pane.get("id")
+                if pane_id is not None:
+                    logger.info(
+                        "closing floating plugin pane %s (%s)",
+                        pane_id, pane.get("title", "?"),
+                    )
+                    await self._run(
+                        self._executable, "--session", SESSION_NAME,
+                        "action", "close-pane", "--pane-id", f"plugin_{pane_id}",
+                    )
 
     async def list_panes(self) -> list[dict]:
         """List bridge-owned task tabs in the session.

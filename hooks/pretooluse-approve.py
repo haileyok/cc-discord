@@ -12,6 +12,7 @@ import uuid
 
 
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787")
+BRIDGE_API_SECRET = os.environ.get("BRIDGE_API_SECRET", "")
 HTTP_TIMEOUT = 605  # 600s router timeout + 5s slack — must exceed it
 
 
@@ -35,7 +36,7 @@ def main() -> None:
         _emit("deny", "approval bridge received malformed input")
         return
 
-    task_id = os.environ.get("CC_DISCORD_TASK_ID")
+    task_id = os.environ.get("CC_BRIDGE_TASK_ID") or os.environ.get("CC_DISCORD_TASK_ID")
     if not task_id:
         # Not a bridge-driven session — fall through to default Claude permission UI.
         # Emit "ask" to keep behavior identical to no-hook.
@@ -52,10 +53,13 @@ def main() -> None:
 
     try:
         data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if BRIDGE_API_SECRET:
+            headers["Authorization"] = f"Bearer {BRIDGE_API_SECRET}"
         req = urllib.request.Request(
             BRIDGE_URL + "/v1/hook/pretooluse",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:

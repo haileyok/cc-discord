@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json
 import os
+import stat
 import sys
 import time
 import urllib.error
@@ -13,6 +14,7 @@ from pathlib import Path
 
 THRESHOLD_SECS = 600
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787")
+BRIDGE_API_SECRET = os.environ.get("BRIDGE_API_SECRET", "")
 WEBHOOK_FILE = Path.home() / ".claude" / "discord-notify-webhook"
 HTTP_TIMEOUT = 5  # seconds — the daemon should respond instantly; longer would block Stop
 
@@ -26,10 +28,13 @@ def _post(url: str, body: dict) -> None:
     """POST JSON body to url. Raise _BridgeUnavailable on any failure."""
     try:
         data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if BRIDGE_API_SECRET:
+            headers["Authorization"] = f"Bearer {BRIDGE_API_SECRET}"
         req = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
@@ -50,6 +55,10 @@ def _try_webhook_fallback(msg: str) -> None:
     """Try to POST to the webhook URL if the file exists."""
     if not WEBHOOK_FILE.exists():
         return
+    # Enforce secure permissions on webhook file
+    current_mode = WEBHOOK_FILE.stat().st_mode & 0o777
+    if current_mode != 0o600:
+        WEBHOOK_FILE.chmod(0o600)
     url = WEBHOOK_FILE.read_text().strip()
     if not url:
         return

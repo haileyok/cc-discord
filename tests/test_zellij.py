@@ -61,6 +61,7 @@ def fixed_session_name(monkeypatch):
 class TestZellijManager:
     async def test_ensure_session_alive_success(self, patch_exec):
         patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"[]", stderr_data=b""))
         mgr = ZellijManager()
         await mgr.ensure_session_alive()
         argv, _ = patch_exec._call_log[0]
@@ -68,11 +69,13 @@ class TestZellijManager:
 
     async def test_ensure_session_alive_idempotent(self, patch_exec):
         patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"[]", stderr_data=b""))
         patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"[]", stderr_data=b""))
         mgr = ZellijManager()
         await mgr.ensure_session_alive()
         await mgr.ensure_session_alive()
-        assert len(patch_exec._call_log) == 2
+        assert len(patch_exec._call_log) == 4
 
     async def test_ensure_session_alive_failure(self, patch_exec):
         patch_exec._queue.append(
@@ -87,6 +90,7 @@ class TestZellijManager:
         patch_exec._queue.append(
             FakeProc(returncode=2, stdout_data=b"", stderr_data=b"Session already exists")
         )
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"[]", stderr_data=b""))
         mgr = ZellijManager()
         await mgr.ensure_session_alive()  # should not raise
 
@@ -100,12 +104,40 @@ class TestZellijManager:
         await mgr.ensure_session_alive()
         assert patch_exec._call_log == []
 
+    async def test_ensure_session_alive_closes_floating_plugins(self, patch_exec):
+        """Floating plugin panes (like About Zellij) are closed after session creation."""
+        import json
+        about_panes = [
+            {"id": 3, "is_plugin": True, "is_floating": True, "is_suppressed": False, "title": "About Zellij"},
+            {"id": 0, "is_plugin": False, "is_floating": False, "is_suppressed": False, "title": "Pane #1"},
+        ]
+        # attach
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        # list-panes returns floating plugin
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=json.dumps(about_panes).encode(), stderr_data=b""))
+        # close-pane for the floating plugin
+        patch_exec._queue.append(FakeProc(returncode=0, stdout_data=b"", stderr_data=b""))
+        mgr = ZellijManager()
+        await mgr.ensure_session_alive()
+        # Should have: attach, list-panes, close-pane
+        assert len(patch_exec._call_log) == 3
+        close_argv, _ = patch_exec._call_log[2]
+        assert "close-pane" in close_argv
+        assert "plugin_3" in close_argv
+
     async def test_list_panes_filters_cc_prefix(self, patch_exec):
-        """list_panes runs query-tab-names and returns only cc- prefixed tabs."""
+        """list_panes runs list-panes --json and returns only cc- prefixed tabs."""
+        import json
+        panes_data = [
+            {"tab_name": "Tab #1", "exited": False},
+            {"tab_name": "cc-aa429dc4", "exited": False},
+            {"tab_name": "Tab #2", "exited": False},
+            {"tab_name": "cc-deadbeef", "exited": True},
+        ]
         patch_exec._queue.append(
             FakeProc(
                 returncode=0,
-                stdout_data=b"Tab #1\ncc-aa429dc4\nTab #2\ncc-deadbeef\n",
+                stdout_data=json.dumps(panes_data).encode(),
                 stderr_data=b"",
             )
         )
@@ -113,12 +145,18 @@ class TestZellijManager:
         panes = await mgr.list_panes()
         assert panes == [
             {"id": "cc-aa429dc4", "exited": False},
-            {"id": "cc-deadbeef", "exited": False},
+            {"id": "cc-deadbeef", "exited": True},
         ]
         argv, _ = patch_exec._call_log[0]
-        assert argv == ("zellij", "--session", "bridge", "action", "query-tab-names")
+        assert argv == ("zellij", "--session", "bridge", "action", "list-panes", "--json", "--state", "--tab")
 
     async def test_list_panes_failure(self, patch_exec):
+        """list_panes falls back to query-tab-names when list-panes fails, then fails if that also fails."""
+        # First call: list-panes fails
+        patch_exec._queue.append(
+            FakeProc(returncode=1, stdout_data=b"", stderr_data=b"session not found")
+        )
+        # Second call: query-tab-names also fails
         patch_exec._queue.append(
             FakeProc(returncode=1, stdout_data=b"", stderr_data=b"session not found")
         )

@@ -11,7 +11,7 @@ from aiohttp import test_utils
 
 from bridge import state
 from bridge.approvals import ApprovalRouter
-from bridge.bot import BotNotReady
+from bridge.backends.discord.bot import BotNotReady
 from bridge.listener import Listener
 from bridge.server import (
     build_app, _clamp_timeout, _format_question,
@@ -56,7 +56,7 @@ class FakeBot:
         self._post_calls: list[dict] = []
         self._create_thread_calls: list[dict] = []
         self._next_thread_id = 2000
-        self._thread_alive_map: dict[int, bool] = {}
+        self._thread_alive_map: dict[str, bool] = {}
         self._client = None  # Stub for commands.py compatibility
 
     @property
@@ -75,7 +75,7 @@ class FakeBot:
     def set_ready(self, ready: bool) -> None:
         self._is_ready = ready
 
-    async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
+    async def post(self, message: str, *, thread_id: str | None = None) -> list[str]:
         """Fake post: record the call, return a fake message ID."""
         self._post_calls.append(
             {"message": message, "thread_id": thread_id}
@@ -83,29 +83,29 @@ class FakeBot:
         if not self.is_ready:
             raise BotNotReady("bot not connected to Discord")
         # Return a fake ID (first chunk always gets ID 1001)
-        return [1001]
+        return ["1001"]
 
-    async def create_thread(self, name: str) -> int:
+    async def create_thread(self, name: str) -> str:
         """Fake create_thread: record the call and return a fake thread ID."""
         thread_id = self._next_thread_id
         self._next_thread_id += 1
         self._create_thread_calls.append({"name": name, "id": thread_id})
-        self._thread_alive_map[thread_id] = True
-        return thread_id
+        self._thread_alive_map[str(thread_id)] = True
+        return str(thread_id)
 
-    async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
+    async def add_reactions(self, message_id: str, thread_id: str, emoji: list[str]) -> None:
         """Fake add_reactions: do nothing for testing."""
         if not self.is_ready:
             raise BotNotReady("bot not connected to Discord")
         # Just do nothing for testing
 
-    async def thread_alive(self, thread_id: int) -> bool:
+    async def thread_alive(self, thread_id: str) -> bool:
         """Fake thread_alive: check the map."""
         return self._thread_alive_map.get(thread_id, True)
 
-    def set_thread_alive(self, thread_id: int, alive: bool) -> None:
+    def set_thread_alive(self, thread_id: str | int, alive: bool) -> None:
         """Set whether a thread is considered alive."""
-        self._thread_alive_map[thread_id] = alive
+        self._thread_alive_map[str(thread_id)] = alive
 
     def get_post_calls(self) -> list[dict]:
         return self._post_calls
@@ -188,8 +188,8 @@ async def test_notify_success(client, fake_bot):
     )
     assert resp.status == 200
     body = await resp.json()
-    assert isinstance(body["thread_id"], int)
-    assert body["message_id"] == 1001
+    assert isinstance(body["thread_id"], str)
+    assert body["message_id"] == "1001"
 
     # Verify bot.post was called with the right thread_id
     calls = fake_bot.get_post_calls()
@@ -332,8 +332,8 @@ async def test_notify_recovers_after_error(client, fake_bot):
     )
     assert resp2.status == 200
     body = await resp2.json()
-    assert isinstance(body["thread_id"], int)
-    assert body["message_id"] == 1001
+    assert isinstance(body["thread_id"], str)
+    assert body["message_id"] == "1001"
 
 
 @pytest.mark.asyncio
@@ -352,8 +352,8 @@ async def test_notify_with_optional_fields(client, fake_bot):
     )
     assert resp.status == 200
     body = await resp.json()
-    assert isinstance(body["thread_id"], int)
-    assert body["message_id"] == 1001
+    assert isinstance(body["thread_id"], str)
+    assert body["message_id"] == "1001"
 
 
 @pytest.mark.asyncio
@@ -1120,7 +1120,7 @@ class TestHookEvent:
         await upsert_task(
             in_memory_db,
             "task-123",
-            999,
+            "999",
             "/tmp",
             "spawning",
             now=now,
@@ -1134,10 +1134,10 @@ class TestHookEvent:
             "/v1/hook/event",
             json={
                 "hook_event_name": "SessionStart",
-                "session_id": "sess-abc",
+                "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 "cwd": "/tmp",
                 "transcript_path": "/path",
-                "env_passthrough": {"CC_DISCORD_TASK_ID": "task-123"},
+                "env_passthrough": {"CC_BRIDGE_TASK_ID": "task-123"},
             },
         )
         assert resp.status == 200
@@ -1147,7 +1147,7 @@ class TestHookEvent:
         # Verify bot.post was called
         posts = fake_bot.get_post_calls()
         assert len(posts) == 1
-        assert posts[0]["thread_id"] == 999
+        assert posts[0]["thread_id"] == "999"
 
     async def test_hook_event_stop(self, client, fake_bot):
         """POST /v1/hook/event with Stop event returns 200."""
@@ -1421,7 +1421,7 @@ class TestDispatcher:
 
         # Create a task in the database
         task_id = "task-123"
-        thread_id = 5000
+        thread_id = "5000"
         pane_id = "pane_1"
         now = int(__import__('time').time())
         await upsert_task(
@@ -1600,3 +1600,121 @@ async def test_pretooluse_unknown_task_id(client, in_memory_db):
     body = await resp.json()
     assert body["decision"] == "deny"
     assert "unknown" in body["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+async def authed_client(fake_bot, in_memory_db, monkeypatch):
+    """Test client with BRIDGE_API_SECRET set to 'mysecret'."""
+    monkeypatch.setenv("BRIDGE_API_SECRET", "mysecret")
+    started_at = time.monotonic()
+    app = await build_app(fake_bot, started_at=started_at)
+    registry = ThreadRegistry(fake_bot, in_memory_db)
+    zellij = ZellijManager()
+
+    async def mock_run(*argv, env=None, timeout=10.0):
+        return (0, "", "")
+
+    monkeypatch.setattr(zellij, "_run", mock_run)
+    task_registry = TaskRegistry(in_memory_db, fake_bot, zellij)
+    await task_registry.load_from_db()
+    from bridge.server import AskLockMap, APPROVAL_ROUTER_KEY
+    from bridge.approvals import ApprovalRouter
+    app[THREADS_KEY] = registry
+    app[LISTENER_KEY] = Listener()
+    app[ASK_LOCKS_KEY] = AskLockMap()
+    app[TASK_REGISTRY_KEY] = task_registry
+    app[ZELLIJ_KEY] = zellij
+    app[APPROVAL_ROUTER_KEY] = ApprovalRouter(fake_bot, in_memory_db, timeout=0.5)
+    async with test_utils.TestClient(test_utils.TestServer(app)) as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_auth_no_secret_env_passes_all(client, fake_bot):
+    """Without BRIDGE_API_SECRET set, all requests pass through (backward compat)."""
+    # /v1/health — unauthenticated GET
+    resp = await client.get("/v1/health")
+    assert resp.status == 200
+
+    # /v1/notify — unauthenticated POST (bot not ready → 503, not 401)
+    fake_bot.set_ready(False)
+    resp = await client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+    )
+    assert resp.status == 503  # Not 401; auth passed, bot not ready
+
+
+@pytest.mark.asyncio
+async def test_auth_missing_header_returns_401(authed_client, fake_bot):
+    """With BRIDGE_API_SECRET set and no Authorization header, /v1/notify returns 401."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_auth_wrong_secret_returns_401(authed_client, fake_bot):
+    """With BRIDGE_API_SECRET set and wrong secret, /v1/notify returns 401."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+        headers={"Authorization": "Bearer wrongsecret"},
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_auth_correct_secret_passes(authed_client, fake_bot):
+    """With correct Authorization: Bearer <secret>, request reaches endpoint."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/notify",
+        json={"session_id": "s", "cwd": "/", "message": "m"},
+        headers={"Authorization": "Bearer mysecret"},
+    )
+    # Auth passes; endpoint runs normally and returns 200
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_health_always_passes(authed_client):
+    """/v1/health is exempt from auth even when BRIDGE_API_SECRET is set."""
+    resp = await authed_client.get("/v1/health")
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_hook_event_with_correct_secret(authed_client, fake_bot):
+    """With correct secret, /v1/hook/event returns 200."""
+    fake_bot.set_ready(True)
+    resp = await authed_client.post(
+        "/v1/hook/event",
+        json={"hook_event_name": "Stop", "session_id": "sess-abc"},
+        headers={"Authorization": "Bearer mysecret"},
+    )
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_hook_event_without_secret_returns_401(authed_client):
+    """With BRIDGE_API_SECRET set and no header, /v1/hook/event returns 401."""
+    resp = await authed_client.post(
+        "/v1/hook/event",
+        json={"hook_event_name": "Stop", "session_id": "sess-abc"},
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "unauthorized"
