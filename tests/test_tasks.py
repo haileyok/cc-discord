@@ -136,15 +136,25 @@ class TestLifecycle:
         assert reg.get_by_thread_id(task.thread_id) is None
         assert bot.get_archive_calls()
 
-    async def test_stop_warns_on_terminate_http_error(self, in_memory_db) -> None:
-        # An HTTP-error terminate (daemon alive but rejecting) warns the user
-        # but still tears down bridge-side state.
+    async def test_stop_does_not_strand_on_terminate_http_error(self, in_memory_db) -> None:
+        # An HTTP-error terminate (daemon alive but rejecting) must NOT tear the
+        # task down — that would strand a live daemon. It stays running/tracked.
         reg, bot, _ = _make_registry(in_memory_db)
         task, fclient = await _bind_running_task(reg)
         fclient.terminate_error_status = 500
-        await reg.stop_task(task.task_id)
-        assert task.status == "stopped"
+        result = await reg.stop_task(task.task_id)
+        assert result is False
+        assert task.status == "running"
+        assert reg.get_by_thread_id(task.thread_id) is task  # still tracked
         assert any("rejected terminate" in c["content"] for c in bot.get_post_calls())
+
+    async def test_kill_does_not_strand_on_terminate_http_error(self, in_memory_db) -> None:
+        reg, bot, _ = _make_registry(in_memory_db)
+        task, fclient = await _bind_running_task(reg)
+        fclient.terminate_error_status = 500
+        result = await reg.kill_task(task.task_id)
+        assert result is False
+        assert task.status == "running"
 
     async def test_kill_terminates_and_marks_crashed(self, in_memory_db) -> None:
         reg, _, _ = _make_registry(in_memory_db)

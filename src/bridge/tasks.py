@@ -1166,7 +1166,12 @@ class TaskRegistry:
         )
 
     async def stop_task(self, task_id: str, *, timeout: float = 5.0) -> bool:
-        """Stop a task: cancel any in-flight turn, then terminate the daemon."""
+        """Stop a task: cancel any in-flight turn, then terminate the daemon.
+
+        Returns True on success (terminated, or already gone). Returns False if
+        the daemon answered but *rejected* terminate — in that case the task is
+        left running/tracked (the daemon is still alive) rather than stranded.
+        """
         task = self.get_by_task_id(task_id)
         if task is None:
             raise TaskNotFound(task_id)
@@ -1175,40 +1180,52 @@ class TaskRegistry:
         client = self._client_for(task)
         with contextlib.suppress(PolytokenClientError):
             await client.cancel_turn()
-        await self._terminate_daemon(task)
+        if not await self._terminate_daemon(task):
+            return False
         await self._teardown_task(task, status="stopped", archive=True)
         return True
 
-    async def kill_task(self, task_id: str) -> None:
-        """Immediately terminate a task's daemon and mark it crashed."""
+    async def kill_task(self, task_id: str) -> bool:
+        """Immediately terminate a task's daemon and mark it crashed.
+
+        Returns True on success (terminated, or already gone). Returns False if
+        the daemon rejected terminate — the task is left running rather than
+        marked crashed while the daemon is actually still alive.
+        """
         task = self.get_by_task_id(task_id)
         if task is None:
             raise TaskNotFound(task_id)
         if task.status not in {"running", "spawning"}:
-            return
-        await self._terminate_daemon(task)
+            return True
+        if not await self._terminate_daemon(task):
+            return False
         await self._teardown_task(task, status="crashed", archive=True)
+        return True
 
-    async def _terminate_daemon(self, task: Task) -> None:
-        """Ask the daemon to terminate, distinguishing failure modes.
+    async def _terminate_daemon(self, task: Task) -> bool:
+        """Ask the daemon to terminate. Return whether it's gone.
 
-        A transport failure means the daemon is already unreachable (gone) —
-        nothing to warn about. An HTTP error means the daemon answered but
-        rejected terminate, so it may still be running; warn the user it could
-        linger. Either way the caller proceeds to tear down bridge-side state.
+        ``True`` when the daemon terminated, or when it's already unreachable (a
+        transport failure == already gone). ``False`` when the daemon answered
+        but *rejected* terminate (HTTP error) — it may still be running, so the
+        caller must NOT tear down bridge state and strand it; we post a thread
+        notice and let the user retry.
         """
         client = self._client_for(task)
         try:
             await client.terminate()
+            return True
         except PolytokenClientError as exc:
-            if exc.status is not None:
-                logger.warning("terminate for %s returned HTTP %s", task.task_id[:8], exc.status)
-                with contextlib.suppress(Exception):
-                    await self._bot.post(
-                        "⚠ The daemon rejected terminate — it may still be running; "
-                        "check `polytoken sessions` if it lingers.",
-                        thread_id=task.thread_id,
-                    )
+            if exc.status is None:
+                return True  # unreachable == already gone
+            logger.warning("terminate for %s returned HTTP %s", task.task_id[:8], exc.status)
+            with contextlib.suppress(Exception):
+                await self._bot.post(
+                    "⚠ The daemon rejected terminate and is still running — the task "
+                    "stays active. Retry, or check `polytoken sessions` and terminate it manually.",
+                    thread_id=task.thread_id,
+                )
+            return False
 
     async def restart_task(self, task_id: str) -> Task:
         """Not supported with the Polytoken daemon backend."""

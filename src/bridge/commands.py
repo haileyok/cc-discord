@@ -154,11 +154,18 @@ def build_tree(
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         try:
-            await registry.stop_task(task.task_id)
+            stopped = await registry.stop_task(task.task_id)
         except TaskNotFound:
             await interaction.followup.send("❌ Task not found", ephemeral=True)
             return
-        await interaction.followup.send(f"✅ Stopped `{task.task_id[:8]}`", ephemeral=True)
+        if stopped:
+            await interaction.followup.send(f"✅ Stopped `{task.task_id[:8]}`", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"⚠️ Couldn't terminate `{task.task_id[:8]}` — the daemon rejected it and is "
+                "still running. The task stays active; see the thread for details.",
+                ephemeral=True,
+            )
 
     @tree.command(name="kill", description="Immediately terminate a task's daemon")
     @app_commands.describe(thread="Thread to kill (defaults to invocation thread)")
@@ -173,11 +180,18 @@ def build_tree(
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         try:
-            await registry.kill_task(task.task_id)
+            killed = await registry.kill_task(task.task_id)
         except TaskNotFound:
             await interaction.followup.send("❌ Task not found", ephemeral=True)
             return
-        await interaction.followup.send(f"💥 Killed `{task.task_id[:8]}`", ephemeral=True)
+        if killed:
+            await interaction.followup.send(f"💥 Killed `{task.task_id[:8]}`", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"⚠️ Couldn't terminate `{task.task_id[:8]}` — the daemon rejected it and is "
+                "still running. Check `polytoken sessions` and terminate it manually.",
+                ephemeral=True,
+            )
 
     @tree.command(name="restart", description="(Unsupported with the daemon backend)")
     @app_commands.describe(thread="Thread to restart (defaults to invocation thread)")

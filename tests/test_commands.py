@@ -114,6 +114,14 @@ class TestLifecycleCommands:
         assert fake.terminated == 1
         assert "Killed" in inter.followup._sends[0]["content"]
 
+    async def test_kill_reports_failure_when_terminate_rejected(self, in_memory_db, tmp_path) -> None:
+        bot, reg, tree = _make(in_memory_db)
+        task, fake = await _spawn_inject(reg, tmp_path)
+        fake.terminate_error_status = 500
+        inter = FakeInteraction(channel_id=task.thread_id)
+        await tree.get_command("kill").callback(inter, thread=None)
+        assert "Couldn't terminate" in inter.followup._sends[0]["content"]
+
     async def test_restart_unsupported(self, in_memory_db, tmp_path) -> None:
         bot, reg, tree = _make(in_memory_db)
         task, _ = await _spawn_inject(reg, tmp_path)
