@@ -1,5 +1,6 @@
 """Tests for the daemon-backed TaskRegistry."""
 
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
@@ -315,7 +316,36 @@ class TestReconcileAction:
     async def test_reconcile_posts_notice_and_resyncs(self, in_memory_db) -> None:
         reg, bot, _ = _make_registry(in_memory_db)
         task, _ = await _bind_running_task(reg)
+        reg._translators[task.task_id] = events.Translator()
         await reg._render(task, events.Reconcile(reason="stream_discontinuity missed=3"))
         assert any("gap" in c["content"].lower() for c in bot.get_post_calls())
         # re-synced the session title from /state
         assert bot._rename_calls and bot._rename_calls[0]["name"] == "fake-title"
+
+    async def test_reconcile_recovers_pending_interrogative(self, in_memory_db) -> None:
+        # A gap covering an interrogative must not strand the daemon: reconcile
+        # re-registers it from /state.pending_interrogatives.
+        reg, bot, fake = _make_registry(in_memory_db)
+        task, fclient = await _bind_running_task(reg)
+        reg._translators[task.task_id] = events.Translator()
+        fclient.state_payload = dict(fclient.state_payload)
+        fclient.state_payload["pending_interrogatives"] = [
+            {"type": "interrogative", "interrogative_id": "i9",
+             "question": "pick one?", "interrogative_type": "confirmation"}
+        ]
+        await reg._render(task, events.Reconcile(reason="gap"))
+        pending = reg._pending_interrogatives.get(task.task_id)
+        assert pending is not None and pending.interrogative_id == "i9"
+        assert any("pick one?" in c["content"] for c in bot.get_post_calls())
+
+
+class TestShutdown:
+    async def test_shutdown_cancels_consumers_and_closes_clients(self, in_memory_db) -> None:
+        reg, _, _ = _make_registry(in_memory_db)
+        task, fclient = await _bind_running_task(reg)
+        consumer = asyncio.create_task(asyncio.sleep(100))
+        reg._consumers[task.task_id] = consumer
+        await reg.shutdown()
+        assert consumer.cancelled() or consumer.done()
+        assert fclient.closed is True
+        assert reg._clients == {}

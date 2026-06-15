@@ -50,7 +50,7 @@ from bridge.events import (
     TurnStarted,
 )
 from bridge.listener import MessageLike
-from bridge.polytoken_client import PolytokenClient, PolytokenClientError, TurnInFlight
+from bridge.polytoken_client import PolytokenClient, PolytokenClientError, SseEnvelope, TurnInFlight
 from bridge.state import (
     PinRow,
     TaskRow,
@@ -391,6 +391,28 @@ class TaskRegistry:
             if task.status in ("running", "spawning"):
                 self._start_consumer(task)
 
+    async def shutdown(self) -> None:
+        """Cancel all event consumers and close cached daemon clients.
+
+        Called on bridge shutdown so SSE consumers (blocked in `GET /events`)
+        and their aiohttp client sessions close cleanly via the registry
+        lifecycle, instead of being force-cancelled by loop teardown. The
+        per-task daemons themselves are intentionally left running — they
+        survive a bridge restart and are reconciled on next startup.
+        """
+        for consumer in list(self._consumers.values()):
+            if not consumer.done():
+                consumer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consumer
+        self._consumers.clear()
+        for task_id in list(self._typing_tasks):
+            await self._stop_typing(task_id)
+        for client in list(self._clients.values()):
+            with contextlib.suppress(Exception):
+                await client.aclose()
+        self._clients.clear()
+
     # -- lookups ----------------------------------------------------------
 
     def get_by_task_id(self, task_id: str) -> Task | None:
@@ -577,6 +599,20 @@ class TaskRegistry:
             title = (state.get("session_title") or "").strip()
             if title:
                 await self._rename_thread(task, title)
+            # Re-register any interrogative the gap may have hidden, so the
+            # daemon doesn't stay blocked waiting for an answer the user can't
+            # give. `/state.pending_interrogatives` is the durable source of
+            # truth (already-answered ones aren't listed), so re-feeding them
+            # through the translator re-posts the question + re-stashes the
+            # pending slot without double-posting answered ones.
+            translator = self._translators.get(task.task_id)
+            if translator is not None:
+                for ev in state.get("pending_interrogatives") or []:
+                    if not isinstance(ev, dict):
+                        continue
+                    env = SseEnvelope(seq=None, session_id=None, emitted_at=None, event=ev)
+                    for action in translator.handle(env):
+                        await self._render(task, action)
 
     async def _post_assistant_text(self, task: Task, text: str) -> None:
         cleaned, attach_paths = _parse_attach_markers(text)

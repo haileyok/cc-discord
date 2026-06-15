@@ -151,6 +151,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
         sweep_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sweep_task
+        await task_registry.shutdown()
         await bot.close()
         await runner.cleanup()
         await state.close_db(conn)
