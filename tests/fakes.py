@@ -149,6 +149,7 @@ class FakeSupervisor:
     sessions: list[_SessionInfo] = field(default_factory=list)
     terminated: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
+    fail_list: bool = False
 
     async def spawn(self, cwd: str, *, config_dir: str | None = None) -> _SpawnResult:
         if self.fail_spawn:
@@ -162,8 +163,22 @@ class FakeSupervisor:
         self.sessions.append(_SessionInfo(sid, self._next_port, project_path=cwd))
         return _SpawnResult(sid, self._next_port)
 
+    def _maybe_fail(self):
+        if self.fail_list:
+            from bridge.daemon_supervisor import DaemonSupervisorError
+
+            raise DaemonSupervisorError("registry listing failed")
+
     async def list_sessions(self) -> list[_SessionInfo]:
+        self._maybe_fail()
         return list(self.sessions)
+
+    async def find_session(self, session_id: str):
+        self._maybe_fail()
+        for s in self.sessions:
+            if s.session_id == session_id:
+                return s
+        return None
 
     async def list_models(self) -> list[str]:
         return list(self.models) or ["anthropic/claude-opus-4-8", "openai/gpt-5.5"]

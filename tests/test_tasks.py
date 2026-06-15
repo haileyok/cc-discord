@@ -233,3 +233,56 @@ class TestReconcile:
         assert live is not None and live.status == "running" and live.port == 55555
         dead_row = await state.get_task(in_memory_db, "dead")
         assert dead_row.status == "crashed"
+
+    async def test_reconcile_keeps_rows_when_listing_fails(self, in_memory_db) -> None:
+        # A transient `polytoken sessions` failure must NOT mass-crash tasks.
+        reg, bot, sup = _make_registry(in_memory_db)
+        await state.upsert_task(in_memory_db, "t1", 100, "/w", "running", polytoken_session_id="sess-1", port=7)
+        sup.fail_list = True
+        await reg.load_from_db(reconcile_with_daemons=True)
+        task = reg.get_by_task_id("t1")
+        assert task is not None and task.status == "running"
+        row = await state.get_task(in_memory_db, "t1")
+        assert row.status == "running"  # not crashed
+        assert not bot.get_archive_calls()
+
+
+class TestDaemonDeath:
+    async def test_daemon_is_gone_true_when_absent(self, in_memory_db) -> None:
+        reg, _, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        sup.sessions = []  # session not in registry
+        assert await reg._daemon_is_gone(task) is True
+
+    async def test_daemon_is_gone_false_when_present(self, in_memory_db) -> None:
+        reg, _, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        from tests.fakes import _SessionInfo
+
+        sup.sessions = [_SessionInfo(task.polytoken_session_id, task.port)]
+        assert await reg._daemon_is_gone(task) is False
+
+    async def test_daemon_is_gone_false_when_listing_fails(self, in_memory_db) -> None:
+        reg, _, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        sup.fail_list = True  # inconclusive -> keep retrying
+        assert await reg._daemon_is_gone(task) is False
+
+    async def test_handle_daemon_death_marks_crashed(self, in_memory_db) -> None:
+        reg, bot, _ = _make_registry(in_memory_db)
+        task, fake = await _bind_running_task(reg)
+        await reg._handle_daemon_death(task)
+        assert task.status == "crashed"
+        assert reg.get_by_thread_id(task.thread_id) is None
+        assert bot.get_archive_calls()
+        assert any("daemon" in c["content"].lower() for c in bot.get_post_calls())
+
+
+class TestReconcileAction:
+    async def test_reconcile_posts_notice_and_resyncs(self, in_memory_db) -> None:
+        reg, bot, _ = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        await reg._render(task, events.Reconcile(reason="stream_discontinuity missed=3"))
+        assert any("gap" in c["content"].lower() for c in bot.get_post_calls())
+        # re-synced the session title from /state
+        assert bot._rename_calls and bot._rename_calls[0]["name"] == "fake-title"

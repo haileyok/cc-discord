@@ -315,10 +315,12 @@ class TaskRegistry:
                 await self._index(Task.from_row(row))
             return
 
+        listing_ok = True
         try:
             live = {s.session_id: s for s in await self._supervisor.list_sessions()}
         except DaemonSupervisorError:
             logger.exception("failed to list polytoken sessions during recovery; keeping rows as-is")
+            listing_ok = False
             live = {}
 
         for row in rows:
@@ -333,7 +335,17 @@ class TaskRegistry:
                 self._start_consumer(task)
                 logger.info("recovered task %s on session %s:%d", task.task_id[:8], sid, info.port)
                 continue
-            # Daemon is gone — mark crashed (defer Discord notices; bot not ready yet).
+            if not listing_ok:
+                # We couldn't confirm the daemon is gone (the registry listing
+                # failed). Don't tear the task down on a transient CLI error —
+                # keep it as-is and let the event consumer detect a truly-dead
+                # daemon at runtime (and mark it crashed then).
+                await self._index(task)
+                self._start_consumer(task)
+                logger.info("kept task %s as-is (session listing unavailable)", task.task_id[:8])
+                continue
+            # The listing succeeded and this session isn't in it — genuinely
+            # gone. Mark crashed (defer Discord notices; bot not ready yet).
             task.status = "crashed"
             task.last_activity = int(time.time())
             await self._index(task)
@@ -414,8 +426,10 @@ class TaskRegistry:
     async def _consume_events(self, task_id: str) -> None:
         """Long-lived: follow the daemon's /events, translate, render.
 
-        Reconnects with backoff on stream drops; resumes from the last seq via
-        the client's ``Last-Event-ID`` header so the daemon replays any gap.
+        Reconnects with backoff on stream drops (resuming from the last seq via
+        the client's ``Last-Event-ID`` header). If the daemon has actually
+        disappeared from the session registry, stop and mark the task crashed
+        instead of retrying forever.
         """
         translator = self._translators.setdefault(task_id, Translator())
         backoff = 1.0
@@ -433,10 +447,41 @@ class TaskRegistry:
                 return
             except PolytokenClientError as exc:
                 logger.warning("event stream for %s dropped: %s", task_id[:8], exc)
+                if await self._daemon_is_gone(task):
+                    await self._handle_daemon_death(task)
+                    return
             except Exception:
                 logger.exception("event consumer error for %s", task_id[:8])
             await asyncio.sleep(min(backoff, 10.0))
             backoff = min(backoff * 2, 10.0)
+
+    async def _daemon_is_gone(self, task: Task) -> bool:
+        """True only if the session is confirmed absent from `polytoken sessions`.
+
+        Returns False when we can't tell (no session id, or the registry listing
+        itself failed) so the consumer keeps retrying rather than tearing down a
+        possibly-live task on an inconclusive signal.
+        """
+        if not task.polytoken_session_id:
+            return False
+        try:
+            return await self._supervisor.find_session(task.polytoken_session_id) is None
+        except DaemonSupervisorError:
+            return False
+
+    async def _handle_daemon_death(self, task: Task) -> None:
+        """The daemon for this task is gone — notify, mark crashed, tear down."""
+        logger.warning("daemon for task %s is gone; marking crashed", task.task_id[:8])
+        try:
+            await self._bot.post(
+                "💥 The session's daemon has exited — marking this task crashed. "
+                "Use `/start` to begin a new one.",
+                thread_id=task.thread_id,
+            )
+        except Exception:
+            logger.exception("failed to post daemon-death notice for task %s", task.task_id[:8])
+        # cancel_consumer=False: we ARE the consumer and return right after.
+        await self._teardown_task(task, status="crashed", archive=True, cancel_consumer=False)
 
     # -- action rendering -------------------------------------------------
 
@@ -487,9 +532,35 @@ class TaskRegistry:
             elif isinstance(action, StateRefresh):
                 pass  # nothing to mirror eagerly today
             elif isinstance(action, Reconcile):
-                logger.info("reconcile hint for %s: %s (resuming via Last-Event-ID)", task.task_id[:8], action.reason)
+                await self._handle_reconcile(task, action.reason)
         except Exception:
             logger.exception("failed to render %s for task %s", type(action).__name__, task.task_id[:8])
+
+    async def _handle_reconcile(self, task: Task, reason: str) -> None:
+        """Surface an event-stream gap to the user and re-sync session state.
+
+        The daemon retains durable history, but this bridge does not yet replay
+        missed `/events` frames item-by-item — so rather than silently drop
+        possibly-important output (assistant text, tool results, a question),
+        we make the gap visible and re-sync the cheap state (title/todos via
+        `/state`). Connection drops are already recovered by `Last-Event-ID`
+        resume on reconnect; this path is for in-stream `stream_discontinuity`
+        / seq jumps.
+        """
+        logger.warning("event gap for task %s: %s", task.task_id[:8], reason)
+        try:
+            await self._bot.post(
+                "⚠️ Detected a gap in the daemon's event stream — some intermediate "
+                "output may be missing. Re-syncing session state.",
+                thread_id=task.thread_id,
+            )
+        except Exception:
+            logger.exception("failed to post reconcile notice for task %s", task.task_id[:8])
+        state = await self.get_state(task.task_id)
+        if state:
+            title = (state.get("session_title") or "").strip()
+            if title:
+                await self._rename_thread(task, title)
 
     async def _post_assistant_text(self, task: Task, text: str) -> None:
         cleaned, attach_paths = _parse_attach_markers(text)
@@ -900,7 +971,9 @@ class TaskRegistry:
             local = out_dir / f"{msg_id}-{safe_name}"
             try:
                 data = await att.read()
-                local.write_bytes(data)
+                # Write off-loop: a large attachment must not block the shared
+                # asyncio loop (which serves both HTTP and the Discord gateway).
+                await asyncio.to_thread(local.write_bytes, data)
                 saved.append(local)
             except Exception:
                 logger.exception("failed to save attachment %s", raw_name)
@@ -1067,14 +1140,16 @@ class TaskRegistry:
             "use /kill to end this task and /start to begin a new one."
         )
 
-    async def _teardown_task(self, task: Task, *, status: str, archive: bool) -> None:
+    async def _teardown_task(self, task: Task, *, status: str, archive: bool, cancel_consumer: bool = True) -> None:
         """Common terminal path for stop/kill: stop consumer, persist, archive, clean up."""
         task.status = status
         task.last_activity = int(time.time())
         await self._persist(task)
 
         consumer = self._consumers.pop(task.task_id, None)
-        if consumer is not None and not consumer.done():
+        # ``cancel_consumer=False`` when called from within the consumer itself
+        # (daemon-death path) — it can't cancel-and-await itself.
+        if cancel_consumer and consumer is not None and not consumer.done():
             consumer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await consumer
