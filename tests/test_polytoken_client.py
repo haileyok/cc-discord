@@ -1,0 +1,190 @@
+"""Tests for bridge.polytoken_client against a small local aiohttp stub."""
+
+import json
+
+import pytest
+from aiohttp import test_utils, web
+
+from bridge.polytoken_client import (
+    PolytokenClient,
+    PolytokenClientError,
+    PromptDenied,
+    SseEnvelope,
+    TurnInFlight,
+)
+
+
+def _build_stub_app() -> web.Application:
+    app = web.Application()
+
+    async def prompt(request: web.Request) -> web.Response:
+        body = await request.json()
+        mode = request.headers.get("X-Test-Mode")
+        if mode == "409":
+            return web.json_response({"error": "in flight"}, status=409)
+        if mode == "422":
+            return web.json_response({"error": "denied"}, status=422)
+        return web.json_response(
+            {
+                "prompt_id": "p-1",
+                "session_id": "s-1",
+                "resolved_references": [{"kind": "file", "name": body["content"]}],
+            },
+            status=202,
+        )
+
+    async def state(_request: web.Request) -> web.Response:
+        return web.json_response({"active_facet": "execute", "todos": []})
+
+    async def title(request: web.Request) -> web.Response:
+        body = await request.json()
+        return web.json_response({"title": body["title"]})
+
+    async def model(request: web.Request) -> web.Response:
+        return web.json_response(await request.json())
+
+    async def cancel(_request: web.Request) -> web.Response:
+        return web.json_response({"status": "cancel_requested"}, status=202)
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    async def events(request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse(
+            status=200, headers={"Content-Type": "text/event-stream"}
+        )
+        await resp.prepare(request)
+        frames = [
+            {"seq": 0, "session_id": "s-1", "emitted_at": "t0",
+             "event": {"type": "message_start", "prompt_id": "p-1"}},
+            {"seq": 1, "session_id": "s-1", "emitted_at": "t1",
+             "event": {"type": "tool_call", "prompt_id": "p-1", "call_id": "c1",
+                       "name": "shell_exec", "subagent_handle": "agent-7"}},
+            {"seq": 2, "session_id": "s-1", "emitted_at": "t2",
+             "event": {"type": "message_complete", "prompt_id": "p-1"}},
+        ]
+        for f in frames:
+            await resp.write(f": keep-alive\n".encode())
+            await resp.write(f"id: {f['seq']}\n".encode())
+            await resp.write(f"data: {json.dumps(f)}\n\n".encode())
+        await resp.write_eof()
+        return resp
+
+    app.router.add_post("/prompt", prompt)
+    app.router.add_get("/state", state)
+    app.router.add_post("/title", title)
+    app.router.add_post("/model", model)
+    app.router.add_post("/turn/cancel", cancel)
+    app.router.add_get("/health", health)
+    app.router.add_get("/events", events)
+    return app
+
+
+@pytest.fixture
+async def stub_port():
+    server = test_utils.TestServer(_build_stub_app())
+    await server.start_server()
+    try:
+        yield server.port
+    finally:
+        await server.close()
+
+
+class TestPolytokenClient:
+    async def test_prompt_happy_path(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            accepted = await client.prompt("hello @/tmp/x.txt")
+        assert accepted.prompt_id == "p-1"
+        assert accepted.session_id == "s-1"
+        assert accepted.resolved_references == [{"kind": "file", "name": "hello @/tmp/x.txt"}]
+
+    async def test_prompt_max_tool_turns_included(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            accepted = await client.prompt("hi", max_tool_turns=3)
+        assert accepted.prompt_id == "p-1"
+
+    async def test_prompt_409_turn_in_flight(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            client._timeout = client._timeout  # keep ref
+            with pytest.raises(TurnInFlight):
+                # Inject the test-mode header via a one-off session call.
+                await _prompt_with_header(client, "hi", "409")
+
+    async def test_prompt_422_denied(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            with pytest.raises(PromptDenied):
+                await _prompt_with_header(client, "hi", "422")
+
+    async def test_state(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            st = await client.state()
+        assert st["active_facet"] == "execute"
+
+    async def test_set_title(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            res = await client.set_title("my title")
+        assert res["title"] == "my title"
+
+    async def test_set_model_with_effort(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            res = await client.set_model("anthropic/claude-opus-4-8", reasoning_effort="high")
+        assert res == {"model": "anthropic/claude-opus-4-8", "reasoning_effort": "high"}
+
+    async def test_cancel_turn(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            res = await client.cancel_turn()
+        assert res["status"] == "cancel_requested"
+
+    async def test_health_true(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            assert await client.health() is True
+
+    async def test_health_false_on_dead_port(self) -> None:
+        # Nothing is listening on this port.
+        async with PolytokenClient(59999) as client:
+            assert await client.health() is False
+
+    async def test_transport_error_has_none_status(self) -> None:
+        async with PolytokenClient(59999) as client:
+            with pytest.raises(PolytokenClientError) as ei:
+                await client.state()
+        assert ei.value.status is None
+
+    async def test_stream_events_parses_and_routes(self, stub_port) -> None:
+        envs: list[SseEnvelope] = []
+        async with PolytokenClient(stub_port) as client:
+            async for env in client.stream_events():
+                envs.append(env)
+        assert [e.event_type for e in envs] == ["message_start", "tool_call", "message_complete"]
+        assert [e.seq for e in envs] == [0, 1, 2]
+        # subagent_handle is the routing key.
+        assert envs[0].subagent_handle is None
+        assert envs[1].subagent_handle == "agent-7"
+
+
+def test_parse_envelope_bad_json() -> None:
+    assert PolytokenClient._parse_envelope("{not json") is None
+
+
+def test_parse_envelope_missing_event() -> None:
+    assert PolytokenClient._parse_envelope('{"seq": 1}') is None
+
+
+def test_parse_envelope_ok() -> None:
+    env = PolytokenClient._parse_envelope(
+        '{"seq": 5, "session_id": "s", "emitted_at": "t", "event": {"type": "heartbeat"}}'
+    )
+    assert env is not None
+    assert env.seq == 5
+    assert env.event_type == "heartbeat"
+
+
+async def _prompt_with_header(client: PolytokenClient, content: str, mode: str):
+    """Drive /prompt with a test-mode header to exercise error mapping."""
+    session = client._ensure_session()
+    async with session.post(
+        client._url("/prompt"), json={"content": content}, headers={"X-Test-Mode": mode}
+    ) as resp:
+        text = await resp.text()
+        if resp.status >= 400:
+            client._raise_for_status("POST", "/prompt", resp.status, text)
