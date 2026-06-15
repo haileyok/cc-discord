@@ -12,7 +12,7 @@ Runs as a small Python daemon (`aiohttp` + `discord.py`) on `127.0.0.1:8787`. Ea
 - The agent's structured questions (`ask_user_question`, clarification/confirmation interrogatives) post to the thread; your next reply answers them.
 - The agent can attach files back by emitting `[[attach: /absolute/path]]` markers in its replies.
 
-Permissions run in **bypass mode** — there's no Discord approval round-trip; the daemon is trusted.
+Permissions run in **bypass mode** — there's no Discord approval round-trip; the daemon is trusted. That means **anyone who can post in the configured channel can drive the agent fully** (it has `shell_exec` and resolves `@<path>` references). Treat the bot's channel as local-operator-level trust: don't invite untrusted users.
 
 ## Prereqs
 

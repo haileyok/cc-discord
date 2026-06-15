@@ -98,6 +98,9 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     while not bot.is_ready:
         await asyncio.sleep(0.1)
     await task_registry.flush_startup_notices()
+    # Now that the bot is bound + ready, start the SSE consumers for any tasks
+    # recovered during reconcile (deferred so they never post before the bot).
+    await task_registry.start_event_consumers()
     guild_id = bot.channel.guild.id  # type: ignore[union-attr]
     guild = discord.Object(id=guild_id)
     tree.copy_global_to(guild=guild)

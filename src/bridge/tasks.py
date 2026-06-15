@@ -282,6 +282,7 @@ class TaskRegistry:
         self._consumers: dict[str, asyncio.Task] = {}
         self._translators: dict[str, Translator] = {}
         self._pending_interrogatives: dict[str, PendingInterrogative] = {}
+        self._torn_down: set[str] = set()
         self._pending_startup_notices: list[dict] = []
         self._pin_spawn_locks: dict[int, asyncio.Lock] = {}
 
@@ -332,7 +333,9 @@ class TaskRegistry:
                 task.status = "running"
                 await self._index(task)
                 await self._persist(task)
-                self._start_consumer(task)
+                # Don't start the consumer here — the bot isn't bound/ready
+                # yet at reconcile time. `serve` calls start_event_consumers()
+                # after `bot.is_ready`.
                 logger.info("recovered task %s on session %s:%d", task.task_id[:8], sid, info.port)
                 continue
             if not listing_ok:
@@ -341,7 +344,7 @@ class TaskRegistry:
                 # keep it as-is and let the event consumer detect a truly-dead
                 # daemon at runtime (and mark it crashed then).
                 await self._index(task)
-                self._start_consumer(task)
+                # Consumer deferred to start_event_consumers() (bot not ready yet).
                 logger.info("kept task %s as-is (session listing unavailable)", task.task_id[:8])
                 continue
             # The listing succeeded and this session isn't in it — genuinely
@@ -374,6 +377,19 @@ class TaskRegistry:
                     await self._archive_thread(notice["thread_id"])
                 except Exception:
                     logger.exception("failed to archive thread for task %s", notice["task_id"])
+
+    async def start_event_consumers(self) -> None:
+        """Start a `/events` consumer for every live in-memory task.
+
+        Called by `serve` **after** the Discord bot is bound and ready —
+        consumers post to Discord, so they must not run during
+        `load_from_db` reconcile (when ``self._bot`` is still ``None``).
+        Idempotent: `_start_consumer` skips tasks that already have a running
+        consumer, so this is safe to call once at startup.
+        """
+        for task in list(self._by_task_id.values()):
+            if task.status in ("running", "spawning"):
+                self._start_consumer(task)
 
     # -- lookups ----------------------------------------------------------
 
@@ -1141,7 +1157,15 @@ class TaskRegistry:
         )
 
     async def _teardown_task(self, task: Task, *, status: str, archive: bool, cancel_consumer: bool = True) -> None:
-        """Common terminal path for stop/kill: stop consumer, persist, archive, clean up."""
+        """Common terminal path for stop/kill: stop consumer, persist, archive, clean up.
+
+        Idempotent: the first terminal transition wins. A later teardown (e.g.
+        `_handle_daemon_death` racing a user `/stop`) is a no-op, so the status
+        and side effects (archive, cleanup) can't be duplicated or overwritten.
+        """
+        if task.task_id in self._torn_down:
+            return
+        self._torn_down.add(task.task_id)
         task.status = status
         task.last_activity = int(time.time())
         await self._persist(task)

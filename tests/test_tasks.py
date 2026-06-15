@@ -278,6 +278,39 @@ class TestDaemonDeath:
         assert any("daemon" in c["content"].lower() for c in bot.get_post_calls())
 
 
+class TestConsumerStartup:
+    async def test_consumers_deferred_until_bot_ready(self, in_memory_db, monkeypatch) -> None:
+        # load_from_db must NOT start consumers (bot isn't ready yet);
+        # start_event_consumers() does, after serve binds the bot.
+        started: list[str] = []
+        monkeypatch.setattr(
+            TaskRegistry, "_start_consumer", lambda self, task: started.append(task.task_id)
+        )
+        reg, bot, sup = _make_registry(in_memory_db)
+        from tests.fakes import _SessionInfo
+
+        await state.upsert_task(
+            in_memory_db, "t1", 100, "/w", "running", polytoken_session_id="sess-1", port=1
+        )
+        sup.sessions = [_SessionInfo("sess-1", 5, project_path="/w")]
+        await reg.load_from_db(reconcile_with_daemons=True)
+        assert started == []  # deferred — not started during reconcile
+        await reg.start_event_consumers()
+        assert "t1" in started
+
+
+class TestTeardownIdempotent:
+    async def test_first_terminal_transition_wins(self, in_memory_db) -> None:
+        reg, bot, _ = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        await reg._teardown_task(task, status="stopped", archive=True)
+        archives = len(bot.get_archive_calls())
+        # A racing teardown (e.g. daemon-death after /stop) is a no-op.
+        await reg._teardown_task(task, status="crashed", archive=True)
+        assert task.status == "stopped"
+        assert len(bot.get_archive_calls()) == archives
+
+
 class TestReconcileAction:
     async def test_reconcile_posts_notice_and_resyncs(self, in_memory_db) -> None:
         reg, bot, _ = _make_registry(in_memory_db)
