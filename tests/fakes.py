@@ -148,6 +148,7 @@ class FakeSupervisor:
     fail_spawn: bool = False
     sessions: list[_SessionInfo] = field(default_factory=list)
     terminated: list[str] = field(default_factory=list)
+    models: list[str] = field(default_factory=list)
 
     async def spawn(self, cwd: str, *, config_dir: str | None = None) -> _SpawnResult:
         if self.fail_spawn:
@@ -164,6 +165,9 @@ class FakeSupervisor:
     async def list_sessions(self) -> list[_SessionInfo]:
         return list(self.sessions)
 
+    async def list_models(self) -> list[str]:
+        return list(self.models) or ["anthropic/claude-opus-4-8", "openai/gpt-5.5"]
+
     async def terminate(self, session_id: str) -> bool:
         self.terminated.append(session_id)
         return True
@@ -179,8 +183,10 @@ class FakePolytokenClient:
     terminated: int = 0
     interrogative_responses: list[dict] = field(default_factory=list)
     model_calls: list[dict] = field(default_factory=list)
+    facet_calls: list[str] = field(default_factory=list)
     state_payload: dict = field(default_factory=lambda: {
         "active_model": "anthropic/claude-opus-4-8",
+        "active_facet": "execute",
         "active_reasoning_effort": "high",
         "available_skills": ["brainstorming", "code-review"],
         "session_title": "fake-title",
@@ -209,6 +215,9 @@ class FakePolytokenClient:
 
     async def set_model(self, model: str, *, reasoning_effort=None):
         self.model_calls.append({"model": model, "reasoning_effort": reasoning_effort})
+
+    async def set_facet(self, facet: str):
+        self.facet_calls.append(facet)
 
     async def respond_interrogative(self, interrogative_id: str, response: dict):
         self.interrogative_responses.append({"id": interrogative_id, "response": response})

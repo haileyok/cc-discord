@@ -76,8 +76,10 @@ Checks: secrets file present + 0600, daemon health, the `polytoken` binary prese
 | `/restart [thread:<#thread>]` | Not supported with the daemon backend (headless resume isn't available); use `/kill` + `/start`. |
 | `/skill <name> [args:<text>]` | Invoke a skill via an `@<name>` reference prompt. Autocomplete shows the session's available skills. |
 | `/effort <level>` | Change the session's reasoning effort (re-selects the active model with the new effort). |
+| `/model name:<model> [effort:<level>]` | Switch the active model (autocomplete from `polytoken models`); a bare switch resets effort to the model default, or set it inline. |
+| `/facet <name>` | Switch the active facet (free-text; the daemon validates and rejects unknowns). |
 | `/rename [name:<text>]` | Rename the thread; omit `name` to use the daemon's auto-generated session title. |
-| `/stats [thread:<#thread>]` | Model, reasoning effort, and context-window usage from the daemon's `/state`. |
+| `/stats [thread:<#thread>]` | Model, reasoning effort, facet, and context-window usage from the daemon's `/state`. |
 | `/tasks [thread:<#thread>]` | Show the session's todo list. |
 | `/pin [name:<text>] [project:<picker>]` | Create a Discord channel bound to a cwd; messages in it auto-spawn a session. Requires `Manage Channels`. |
 | `/unpin` | Remove the pin from the current channel. |

@@ -955,6 +955,48 @@ class TaskRegistry:
         task.last_activity = int(time.time())
         await self._persist(task)
 
+    async def set_model(self, task_id: str, model: str, *, reasoning_effort: str | None = None) -> None:
+        """Switch the session's active model (optionally setting reasoning effort).
+
+        A bare model switch resets reasoning effort to the model's default;
+        pass ``reasoning_effort`` to set it in the same call.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(f"task {task_id[:8]} not found")
+        if task.port is None:
+            raise TaskSpawnError(f"task {task_id[:8]} isn't ready yet")
+        client = self._client_for(task)
+        try:
+            await client.set_model(model, reasoning_effort=reasoning_effort)
+        except PolytokenClientError as exc:
+            raise TaskSpawnError(f"daemon rejected model change: {exc}") from exc
+        task.last_activity = int(time.time())
+        await self._persist(task)
+
+    async def set_facet(self, task_id: str, facet: str) -> None:
+        """Switch the session's active facet."""
+        task = self.get_by_task_id(task_id)
+        if task is None:
+            raise TaskNotFound(f"task {task_id[:8]} not found")
+        if task.port is None:
+            raise TaskSpawnError(f"task {task_id[:8]} isn't ready yet")
+        client = self._client_for(task)
+        try:
+            await client.set_facet(facet)
+        except PolytokenClientError as exc:
+            raise TaskSpawnError(f"daemon rejected facet change: {exc}") from exc
+        task.last_activity = int(time.time())
+        await self._persist(task)
+
+    async def list_models(self) -> list[str]:
+        """Return the selectable model names (config-level, for autocomplete)."""
+        try:
+            return await self._supervisor.list_models()
+        except DaemonSupervisorError:
+            logger.warning("failed to list polytoken models")
+            return []
+
     async def generate_thread_name(self, task_id: str, *, timeout: float = 30.0) -> str | None:
         """Return the daemon's current session title (it auto-titles sessions)."""
         task = self.get_by_task_id(task_id)

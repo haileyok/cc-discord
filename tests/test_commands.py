@@ -153,9 +153,35 @@ class TestSessionCommands:
         await tree.get_command("rename").callback(inter, name="my feature")
         assert bot._rename_calls[0]["name"] == "my feature"
 
-    async def test_stats(self, in_memory_db, tmp_path) -> None:
+    async def test_stats_shows_model_and_facet(self, in_memory_db, tmp_path) -> None:
         bot, reg, tree = _make(in_memory_db)
         task, _ = await _spawn_inject(reg, tmp_path)
         inter = FakeInteraction(channel_id=task.thread_id)
         await tree.get_command("stats").callback(inter, thread=None)
-        assert "claude-opus-4-8" in inter.followup._sends[0]["content"]
+        content = inter.followup._sends[0]["content"]
+        assert "claude-opus-4-8" in content
+        assert "execute" in content  # active_facet now shown
+
+    async def test_model_switch(self, in_memory_db, tmp_path) -> None:
+        bot, reg, tree = _make(in_memory_db)
+        task, fake = await _spawn_inject(reg, tmp_path)
+        inter = FakeInteraction(channel_id=task.thread_id)
+        await tree.get_command("model").callback(inter, name="openai/gpt-5.5", effort=None)
+        assert fake.model_calls[-1] == {"model": "openai/gpt-5.5", "reasoning_effort": None}
+        assert "gpt-5.5" in inter.followup._sends[0]["content"]
+
+    async def test_model_switch_with_effort(self, in_memory_db, tmp_path) -> None:
+        bot, reg, tree = _make(in_memory_db)
+        task, fake = await _spawn_inject(reg, tmp_path)
+        inter = FakeInteraction(channel_id=task.thread_id)
+        choice = app_commands.Choice(name="high", value="high")
+        await tree.get_command("model").callback(inter, name="openai/gpt-5.5", effort=choice)
+        assert fake.model_calls[-1] == {"model": "openai/gpt-5.5", "reasoning_effort": "high"}
+
+    async def test_facet_switch(self, in_memory_db, tmp_path) -> None:
+        bot, reg, tree = _make(in_memory_db)
+        task, fake = await _spawn_inject(reg, tmp_path)
+        inter = FakeInteraction(channel_id=task.thread_id)
+        await tree.get_command("facet").callback(inter, facet="plan")
+        assert fake.facet_calls == ["plan"]
+        assert "plan" in inter.followup._sends[0]["content"]

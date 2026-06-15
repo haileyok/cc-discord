@@ -173,6 +173,23 @@ class TestEffortAndState:
         await reg.invoke_skill(task.task_id, "brainstorming", "go")
         assert fake.prompts == ["@brainstorming go"]
 
+    async def test_set_model(self, in_memory_db) -> None:
+        reg, _, _ = _make_registry(in_memory_db)
+        task, fake = await _bind_running_task(reg)
+        await reg.set_model(task.task_id, "openai/gpt-5.5", reasoning_effort="high")
+        assert fake.model_calls[-1] == {"model": "openai/gpt-5.5", "reasoning_effort": "high"}
+
+    async def test_set_facet(self, in_memory_db) -> None:
+        reg, _, _ = _make_registry(in_memory_db)
+        task, fake = await _bind_running_task(reg)
+        await reg.set_facet(task.task_id, "plan")
+        assert fake.facet_calls == ["plan"]
+
+    async def test_list_models(self, in_memory_db) -> None:
+        reg, _, _ = _make_registry(in_memory_db)
+        models = await reg.list_models()
+        assert "anthropic/claude-opus-4-8" in models
+
 
 class TestRender:
     async def test_tool_line_appends_aggregator_then_flush_posts(self, in_memory_db) -> None:

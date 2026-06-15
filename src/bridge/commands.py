@@ -271,6 +271,72 @@ def build_tree(
             f"⚙️ Set effort to `{level.value}` for `{task.task_id[:8]}`", ephemeral=True
         )
 
+    _models_cache: list[str] = []
+
+    async def _model_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if not _models_cache:
+            _models_cache.extend(await registry.list_models())
+        cur = current.lower()
+        out: list[app_commands.Choice[str]] = []
+        for name in _models_cache:
+            if cur and cur not in name.lower():
+                continue
+            out.append(app_commands.Choice(name=name[:100], value=name[:100]))
+            if len(out) >= 25:
+                break
+        return out
+
+    @tree.command(name="model", description="Switch the session's active model")
+    @app_commands.describe(
+        name="Model registry key (autocomplete shows configured models)",
+        effort="Optional reasoning effort to apply with the switch",
+    )
+    @app_commands.autocomplete(name=_model_autocomplete)
+    @app_commands.choices(
+        effort=[app_commands.Choice(name=lvl, value=lvl) for lvl in _EFFORT_LEVELS]
+    )
+    async def model_cmd(
+        interaction: discord.Interaction,
+        name: str,
+        effort: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        eff = effort.value if effort is not None else None
+        try:
+            await registry.set_model(task.task_id, name, reasoning_effort=eff)
+        except (TaskNotFound, TaskSpawnError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        suffix = f" (effort `{eff}`)" if eff else ""
+        await interaction.followup.send(
+            f"🔧 Switched `{task.task_id[:8]}` to `{name}`{suffix}", ephemeral=True
+        )
+
+    @tree.command(name="facet", description="Switch the session's active facet")
+    @app_commands.describe(facet="Facet name (the daemon validates it and rejects unknowns)")
+    async def facet_cmd(interaction: discord.Interaction, facet: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        try:
+            await registry.set_facet(task.task_id, facet)
+        except (TaskNotFound, TaskSpawnError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"🎭 Switched `{task.task_id[:8]}` to facet `{facet}`", ephemeral=True
+        )
+
     @tree.command(
         name="rename",
         description="Rename the task's thread (omit name to use the daemon's session title)",

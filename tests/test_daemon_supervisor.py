@@ -110,6 +110,38 @@ class TestListSessions:
         assert await sup.find_session("missing") is None
 
 
+_MODELS_OUT = """default_model: anthropic/claude-opus-4-8
+default_small_model: anthropic/claude-haiku-4-5
+
+models:
+- anthropic/claude-fable-5
+  provider: anthropic/claude-fable-5
+  reasoning: effort set=...
+- anthropic/claude-opus-4-8 (default)
+  provider: anthropic/claude-opus-4-8
+- anthropic/claude-haiku-4-5 (small)
+  reasoning: none
+"""
+
+
+class TestListModels:
+    async def test_parses_model_names(self) -> None:
+        runner = make_runner({("models",): (0, _MODELS_OUT, "")})
+        sup = DaemonSupervisor(runner=runner)
+        models = await sup.list_models()
+        assert models == [
+            "anthropic/claude-fable-5",
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-haiku-4-5",
+        ]
+
+    async def test_nonzero_raises(self) -> None:
+        runner = make_runner({("models",): (3, "", "err")})
+        sup = DaemonSupervisor(runner=runner)
+        with pytest.raises(DaemonSupervisorError):
+            await sup.list_models()
+
+
 class TestTerminate:
     async def test_terminate_live_session(self) -> None:
         runner = make_runner({("sessions",): (0, _SESSIONS_OUT, "")})

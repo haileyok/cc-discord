@@ -44,6 +44,13 @@ def format_state_summary(state: dict) -> str:
     if effort:
         parts.append(f"effort `{effort}`")
 
+    facet = state.get("active_facet")
+    if facet:
+        parts.append(f"facet `{facet}`")
+
+    if state.get("active_plan"):
+        parts.append("📋 plan active")
+
     cu = state.get("context_usage")
     override = context_limit_override()
     if isinstance(cu, dict):

@@ -147,6 +147,31 @@ class DaemonSupervisor:
             )
         return rows
 
+    async def list_models(self) -> list[str]:
+        """Parse ``polytoken models`` into the selectable model registry keys.
+
+        Returns the base model names (the ``- <name>`` lines), stripping any
+        trailing `` (default)`` / `` (small)`` annotation. Used for the
+        ``/model`` autocomplete; the call is config-level, not per-session.
+        """
+        rc, out, err = await self._runner([self._binary, "models"])
+        if rc != 0:
+            raise DaemonSupervisorError(
+                f"`polytoken models` exited {rc}: {(err or out).strip()[:500]}"
+            )
+        return self._parse_models(out)
+
+    @staticmethod
+    def _parse_models(out: str) -> list[str]:
+        names: list[str] = []
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                name = stripped[2:].split()[0]
+                if name and name not in names:
+                    names.append(name)
+        return names
+
     async def find_session(self, session_id: str) -> SessionInfo | None:
         """Return the live registry entry for ``session_id``, or ``None``."""
         for info in await self.list_sessions():
