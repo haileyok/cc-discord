@@ -12,6 +12,7 @@ existing HTTP stack (no extra dependency).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -157,7 +158,7 @@ class PolytokenClient:
                     return json.loads(text)
                 except json.JSONDecodeError:
                     return text
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise PolytokenClientError(
                 f"{method} {path} failed: {exc!r}", status=None
             ) from exc
@@ -306,7 +307,7 @@ class PolytokenClient:
                     env = self._parse_envelope("\n".join(data_lines))
                     if env is not None:
                         yield env
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise PolytokenClientError(f"GET /events failed: {exc!r}", status=None) from exc
 
     @staticmethod

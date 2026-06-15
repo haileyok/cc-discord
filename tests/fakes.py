@@ -199,6 +199,7 @@ class FakePolytokenClient:
     interrogative_responses: list[dict] = field(default_factory=list)
     model_calls: list[dict] = field(default_factory=list)
     facet_calls: list[str] = field(default_factory=list)
+    terminate_error_status: int | None = None
     state_payload: dict = field(default_factory=lambda: {
         "active_model": "anthropic/claude-opus-4-8",
         "active_facet": "execute",
@@ -226,6 +227,10 @@ class FakePolytokenClient:
         self.cancelled += 1
 
     async def terminate(self):
+        if self.terminate_error_status is not None:
+            from bridge.polytoken_client import PolytokenClientError
+
+            raise PolytokenClientError("rejected", status=self.terminate_error_status)
         self.terminated += 1
 
     async def set_model(self, model: str, *, reasoning_effort=None):

@@ -695,6 +695,15 @@ class TaskRegistry:
     # -- interrogatives ---------------------------------------------------
 
     async def _post_interrogative(self, task: Task, action) -> None:
+        # Idempotency: if this exact interrogative is already the pending one,
+        # don't re-post it. This makes a reconcile re-feed of `/state`'s pending
+        # interrogatives and the live render of the same question converge on a
+        # single post (the translator emits `[Reconcile, AskQuestion]` when a
+        # gap's first event is the interrogative itself).
+        iid = getattr(action, "interrogative_id", None)
+        existing = self._pending_interrogatives.get(task.task_id)
+        if iid and existing is not None and existing.interrogative_id == iid:
+            return
         prefix = self._notify_mention_prefix()
         if isinstance(action, Confirmation):
             self._pending_interrogatives[task.task_id] = PendingInterrogative(
@@ -1166,8 +1175,7 @@ class TaskRegistry:
         client = self._client_for(task)
         with contextlib.suppress(PolytokenClientError):
             await client.cancel_turn()
-        with contextlib.suppress(PolytokenClientError):
-            await client.terminate()
+        await self._terminate_daemon(task)
         await self._teardown_task(task, status="stopped", archive=True)
         return True
 
@@ -1178,10 +1186,29 @@ class TaskRegistry:
             raise TaskNotFound(task_id)
         if task.status not in {"running", "spawning"}:
             return
-        client = self._client_for(task)
-        with contextlib.suppress(PolytokenClientError):
-            await client.terminate()
+        await self._terminate_daemon(task)
         await self._teardown_task(task, status="crashed", archive=True)
+
+    async def _terminate_daemon(self, task: Task) -> None:
+        """Ask the daemon to terminate, distinguishing failure modes.
+
+        A transport failure means the daemon is already unreachable (gone) —
+        nothing to warn about. An HTTP error means the daemon answered but
+        rejected terminate, so it may still be running; warn the user it could
+        linger. Either way the caller proceeds to tear down bridge-side state.
+        """
+        client = self._client_for(task)
+        try:
+            await client.terminate()
+        except PolytokenClientError as exc:
+            if exc.status is not None:
+                logger.warning("terminate for %s returned HTTP %s", task.task_id[:8], exc.status)
+                with contextlib.suppress(Exception):
+                    await self._bot.post(
+                        "⚠ The daemon rejected terminate — it may still be running; "
+                        "check `polytoken sessions` if it lingers.",
+                        thread_id=task.thread_id,
+                    )
 
     async def restart_task(self, task_id: str) -> Task:
         """Not supported with the Polytoken daemon backend."""

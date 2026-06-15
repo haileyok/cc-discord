@@ -136,6 +136,16 @@ class TestLifecycle:
         assert reg.get_by_thread_id(task.thread_id) is None
         assert bot.get_archive_calls()
 
+    async def test_stop_warns_on_terminate_http_error(self, in_memory_db) -> None:
+        # An HTTP-error terminate (daemon alive but rejecting) warns the user
+        # but still tears down bridge-side state.
+        reg, bot, _ = _make_registry(in_memory_db)
+        task, fclient = await _bind_running_task(reg)
+        fclient.terminate_error_status = 500
+        await reg.stop_task(task.task_id)
+        assert task.status == "stopped"
+        assert any("rejected terminate" in c["content"] for c in bot.get_post_calls())
+
     async def test_kill_terminates_and_marks_crashed(self, in_memory_db) -> None:
         reg, _, _ = _make_registry(in_memory_db)
         task, fake = await _bind_running_task(reg)
@@ -337,6 +347,30 @@ class TestReconcileAction:
         pending = reg._pending_interrogatives.get(task.task_id)
         assert pending is not None and pending.interrogative_id == "i9"
         assert any("pick one?" in c["content"] for c in bot.get_post_calls())
+
+    async def test_reconcile_does_not_double_post_gap_interrogative(self, in_memory_db) -> None:
+        # When a gap's first event IS the interrogative, the translator returns
+        # [Reconcile, Confirmation]. The reconcile re-feed + the direct render
+        # must converge on a SINGLE post.
+        from bridge.polytoken_client import SseEnvelope
+
+        reg, bot, _ = _make_registry(in_memory_db)
+        task, fclient = await _bind_running_task(reg)
+        translator = events.Translator()
+        reg._translators[task.task_id] = translator
+        ev = {"type": "interrogative", "interrogative_id": "i9",
+              "question": "pick one?", "interrogative_type": "confirmation"}
+        fclient.state_payload = dict(fclient.state_payload)
+        fclient.state_payload["pending_interrogatives"] = [ev]
+        # last_seq=0, then a gapped envelope (seq=2) whose event is the interrogative.
+        translator.handle(SseEnvelope(seq=0, session_id="s", emitted_at=None,
+                                      event={"type": "heartbeat", "timestamp": "t"}))
+        actions = translator.handle(SseEnvelope(seq=2, session_id="s", emitted_at=None, event=ev))
+        for a in actions:  # render in the same order _consume_events would
+            await reg._render(task, a)
+        posts = [c for c in bot.get_post_calls() if "pick one?" in c["content"]]
+        assert len(posts) == 1
+        assert reg._pending_interrogatives[task.task_id].interrogative_id == "i9"
 
 
 class TestShutdown:

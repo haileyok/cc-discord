@@ -70,6 +70,13 @@ def _build_stub_app() -> web.Application:
         await resp.write_eof()
         return resp
 
+    async def slow(_request: web.Request) -> web.Response:
+        import asyncio
+
+        await asyncio.sleep(2)
+        return web.json_response({"ok": True})
+
+    app.router.add_get("/slow", slow)
     app.router.add_post("/prompt", prompt)
     app.router.add_get("/state", state)
     app.router.add_post("/title", title)
@@ -148,6 +155,14 @@ class TestPolytokenClient:
         async with PolytokenClient(59999) as client:
             with pytest.raises(PolytokenClientError) as ei:
                 await client.state()
+        assert ei.value.status is None
+
+    async def test_request_timeout_wrapped(self, stub_port) -> None:
+        # A ClientTimeout raises asyncio.TimeoutError; it must surface as a
+        # PolytokenClientError (status None), not leak as an unhandled exception.
+        async with PolytokenClient(stub_port, timeout_secs=0.1) as client:
+            with pytest.raises(PolytokenClientError) as ei:
+                await client._request("GET", "/slow")
         assert ei.value.status is None
 
     async def test_stream_events_parses_and_routes(self, stub_port) -> None:
