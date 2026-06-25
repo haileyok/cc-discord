@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -22,6 +24,63 @@ from bridge.zellij import ZellijManager
 from bridge import state
 
 logger = logging.getLogger(__name__)
+
+
+def _phantom_enabled() -> bool:
+    """Whether the daemon should keep a headless phantom zellij client attached.
+
+    Default on — without an attached, sized terminal client zellij drops
+    `action write-chars`, so headless-driven TUIs (Claude Code) bind but never
+    render or receive keystrokes. Opt out with BRIDGE_PHANTOM=0 (e.g. when you
+    already attach a real terminal to the session yourself).
+    """
+    return os.environ.get("BRIDGE_PHANTOM", "1") != "0"
+
+
+def _phantom_command() -> list[str]:
+    """Argv for the phantom client. Run as a package module so it works under
+    both `uv run` and `uv tool install` (the wheel ships src/bridge, not
+    scripts/)."""
+    return [sys.executable, "-m", "bridge.phantom"]
+
+
+async def _phantom_supervisor() -> None:
+    """Spawn and keep the phantom zellij client alive for the daemon's lifetime.
+
+    Restarts the client (capped exponential backoff) if it exits — e.g. after a
+    session teardown/recreate — so the session always has a sized client. On
+    cancellation (daemon shutdown) the child is terminated. Never raises out of
+    the loop except CancelledError; transient spawn failures are logged and
+    retried so a flaky launch can't take the daemon down.
+    """
+    cmd = _phantom_command()
+    backoff = 1.0
+    while True:
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            logger.info("phantom client started (pid %s)", proc.pid)
+            backoff = 1.0  # reset after a clean start
+            rc = await proc.wait()
+            logger.warning(
+                "phantom client exited (rc=%s); restarting in %.0fs", rc, backoff
+            )
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+                with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+            raise
+        except Exception:
+            logger.exception("phantom supervisor error; retrying in %.0fs", backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)
 
 
 def _clamp_timeout(secs: float) -> float:
@@ -553,6 +612,16 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
         _attachment_sweep_loop(), name="attachment-sweep"
     )
 
+    # Phantom client: keep a sized, headless terminal client attached to the
+    # zellij session so TUIs spawned inside it (Claude Code) render and receive
+    # keystrokes without a human attaching a terminal. Default on; opt out with
+    # BRIDGE_PHANTOM=0. The session already exists (ensure_session_alive above).
+    phantom_task: asyncio.Task | None = None
+    if _phantom_enabled():
+        phantom_task = asyncio.create_task(_phantom_supervisor(), name="phantom-supervisor")
+    else:
+        logger.info("phantom client disabled (BRIDGE_PHANTOM=0)")
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -562,8 +631,13 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
         await stop.wait()
     finally:
         sweep_task.cancel()
+        if phantom_task is not None:
+            phantom_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sweep_task
+        if phantom_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await phantom_task
         await bot.close()
         await runner.cleanup()
         await state.close_db(conn)

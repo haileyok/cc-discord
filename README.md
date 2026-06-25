@@ -232,12 +232,39 @@ Commands without an explicit `thread:` argument operate on the task whose thread
 
 4. **Optional: get `@`-mentioned when claude is stuck**. Export `BRIDGE_NOTIFY_USER_ID=<your-discord-user-id>` so AskUserQuestion / ExitPlanMode / free-text-stall prompts prefix with a mention.
 
+### Headless rendering — the phantom client
+
+A zellij session with **no terminal client attached** doesn't render its panes
+and silently drops `zellij action write-chars`: the spawned TUI (Claude Code
+v2.1.x) blocks waiting on terminal queries (DA1/DA2/cursor-position) that nobody
+answers, so it never paints and never receives the keystrokes the bridge relays.
+The session reports a bogus screen size and relayed prompts vanish into the void.
+Symptom: `/start` binds (the `SessionStart` hook fires) but the first prompt
+produces no output, no tool call, no transcript — until a human runs
+`zellij attach` once, at which point everything that was queued suddenly drives.
+
+This makes a pure remote/headless deployment (drive entirely from Discord, no
+local terminal) impossible without a manual attach. **The daemon fixes this
+automatically**: `serve` spawns and supervises a *phantom client*
+(`python -m bridge.phantom`) that allocates a PTY at a real size
+(`PHANTOM_COLUMNS`×`PHANTOM_LINES`, default 200×60), claims it as a controlling
+tty, and `zellij attach`es headlessly — draining all output to `/dev/null`. That
+gives the session a real, sized client so panes render and keystrokes land, with
+no human in the loop. It restarts if it exits and is torn down on shutdown.
+
+Opt out with `BRIDGE_PHANTOM=0` if you already keep a real terminal attached to
+the session (a second client is then redundant). The client can also be run
+standalone for debugging: `python -m bridge.phantom`.
+
 ### Configuration env vars
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Where hooks POST events. Override only if you run the daemon on a non-default port. |
 | `BRIDGE_ZELLIJ_SESSION` | `meow` | zellij session name the bridge spawns task tabs into. |
+| `BRIDGE_PHANTOM` | `1` | Auto-spawn the headless phantom zellij client (see below). Set `0` to disable, e.g. when you attach a real terminal yourself. |
+| `PHANTOM_COLUMNS` | `200` | Phantom client PTY width. |
+| `PHANTOM_LINES` | `60` | Phantom client PTY height. |
 | `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on TUI-blocking prompts. |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
 | `BRIDGE_CONTEXT_LIMIT` | _(model default)_ | Override the per-model context window for `/stats` math (e.g. `1000000` for `[1m]`). |
@@ -271,6 +298,7 @@ Single-process Python daemon. `aiohttp.web.AppRunner` and `discord.py` share one
 | `src/bridge/commands.py` | discord.py slash-command tree (`/start`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/rename`, `/stats`, `/tasks`) |
 | `src/bridge/tasks.py` | `TaskRegistry`: Discord-driven task lifecycle, hook-event dispatch, transcript streaming, subagent block management, task-list mirror |
 | `src/bridge/zellij.py` | Async wrapper around the `zellij` CLI (≥ 0.44 recommended) |
+| `src/bridge/phantom.py` | Headless phantom client — attaches a sized PTY to the session so panes render without a human terminal (`serve` auto-spawns it; `BRIDGE_PHANTOM=0` to disable) |
 | `src/bridge/tool_summary.py` | One-liner formatter + fenced diff/code/checklist blocks per tool name |
 | `src/bridge/transcript.py` | Bounded utf-8 JSONL reader for claude transcripts |
 | `src/bridge/usage.py` | Token/cost/context-fill computation for `/stats` and Stop footer |
