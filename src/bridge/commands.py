@@ -200,10 +200,16 @@ def build_tree(
         thread: discord.Thread | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, thread)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        # /restart must resolve a stopped task even after a bridge restart, so it
+        # uses the DB-backed lookup (memory + DB) rather than the active-only
+        # _resolve_task used by live commands.
+        target_id = thread.id if thread else interaction.channel_id
+        task = await registry.resolve_for_restart(target_id or 0)
+        if task is None:
+            await interaction.followup.send(
+                "❌ This command must run in a task thread (or pass `thread:` arg).",
+                ephemeral=True,
+            )
             return
         try:
             await registry.restart_task(task.task_id)

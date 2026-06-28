@@ -56,6 +56,7 @@ from bridge.state import (
     TaskRow,
     delete_pin,
     get_pin,
+    get_task_by_thread_id,
     list_active_tasks,
     list_pins,
     touch_pin,
@@ -420,6 +421,25 @@ class TaskRegistry:
 
     def get_by_thread_id(self, thread_id: int) -> Task | None:
         return self._by_thread_id.get(thread_id)
+
+    async def resolve_for_restart(self, thread_id: int) -> Task | None:
+        """Find a task by thread for ``/restart`` (and ``/kill`` re-issues).
+
+        Checks the in-memory index first (handles stop→restart within one bridge
+        session), then falls back to the DB so a stopped/killed task is still
+        resolvable after a bridge restart (``load_from_db`` only loads active
+        rows, so stopped tasks aren't in memory until looked up here). A DB-only
+        task is indexed into memory on the way out.
+        """
+        task = self.get_by_thread_id(thread_id)
+        if task is not None:
+            return task
+        row = await get_task_by_thread_id(self._conn, thread_id)
+        if row is None:
+            return None
+        task = Task.from_row(row)
+        await self._index(task)
+        return task
 
     def get_by_session_id(self, session_id: str) -> Task | None:
         return self._by_session_id.get(session_id)

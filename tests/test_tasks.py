@@ -406,6 +406,27 @@ class TestRestart:
         assert await reg.maybe_route_message(msg) is True
         assert fake.prompts == []
 
+    async def test_restart_resolves_stopped_task_from_db_after_bridge_restart(self, in_memory_db) -> None:
+        # After a bridge restart, load_from_db only loads ACTIVE rows, so a
+        # stopped task is absent from memory. resolve_for_restart must fall back
+        # to the DB so /restart still works.
+        reg, _, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        await reg._teardown_task(task, status="stopped", archive=True)
+        # Simulate a bridge restart: a fresh registry loads only active tasks
+        # (none — the only task is stopped), so the in-memory index is empty.
+        reg2, _, sup2 = _make_registry(in_memory_db)
+        sup2._next_port = sup._next_port
+        assert reg2.get_by_thread_id(task.thread_id) is None
+        # resolve_for_restart finds it in the DB and indexes it.
+        found = await reg2.resolve_for_restart(task.thread_id)
+        assert found is not None and found.task_id == task.task_id
+        assert found.polytoken_session_id == "sess-1"
+        # And restart now succeeds (resume called, history session).
+        restarted = await reg2.restart_task(found.task_id)
+        assert restarted.status == "running"
+        assert sup2.resume_calls
+
 
 class TestReconcileAction:
     async def test_reconcile_posts_notice_and_resyncs(self, in_memory_db) -> None:
