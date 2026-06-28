@@ -1316,9 +1316,15 @@ class TaskRegistry:
         if client is not None:
             await client.aclose()
 
-        self._by_thread_id.pop(task.thread_id, None)
-        if task.polytoken_session_id is not None:
-            self._by_session_id.pop(task.polytoken_session_id, None)
+        # NOTE: the task is deliberately KEPT in `_by_thread_id` /
+        # `_by_session_id` after teardown. Removing it would make a stopped/killed
+        # task unresolvable by thread, breaking `/restart` (and a `/kill` re-issue),
+        # which look the task up via `_resolve_task` → `get_by_thread_id`. All
+        # consumers of those indexes gate on status: message routing
+        # (`maybe_route_message`) and pin auto-spawn only act on
+        # `running`/`spawning` tasks, so a stopped task indexed here is inert.
+        # `load_from_db` reconciliation only loads active rows, so stopped tasks
+        # don't survive a bridge restart — which is the intended bookkeeping.
 
         if archive:
             await self._archive_thread(task.thread_id)

@@ -133,7 +133,9 @@ class TestLifecycle:
         await reg.stop_task(task.task_id)
         assert fake.cancelled == 1 and fake.terminated == 1
         assert task.status == "stopped"
-        assert reg.get_by_thread_id(task.thread_id) is None
+        # The task stays indexed by thread so /restart (and a /kill re-issue) can
+        # resolve it; message routing gates on status, so it's inert while stopped.
+        assert reg.get_by_thread_id(task.thread_id) is task
         assert bot.get_archive_calls()
 
     async def test_stop_does_not_strand_on_terminate_http_error(self, in_memory_db) -> None:
@@ -288,7 +290,8 @@ class TestDaemonDeath:
         task, fake = await _bind_running_task(reg)
         await reg._handle_daemon_death(task)
         assert task.status == "crashed"
-        assert reg.get_by_thread_id(task.thread_id) is None
+        # Crashed tasks stay indexed so /restart can recover them by thread.
+        assert reg.get_by_thread_id(task.thread_id) is task
         assert bot.get_archive_calls()
         assert any("daemon" in c["content"].lower() for c in bot.get_post_calls())
 
@@ -388,6 +391,20 @@ class TestRestart:
         assert task.port == old_port  # no port change
         assert sup.resume_calls == []  # no relaunch
         assert reg._translators[task.task_id] is existing_tr  # translator untouched
+
+    async def test_stopped_task_remains_resolvable_by_thread(self, in_memory_db) -> None:
+        # Regression: after /stop, the task must stay indexed by thread_id so the
+        # /restart (and /kill) command, which resolves via get_by_thread_id, can
+        # find it. (Teardown used to remove the index, breaking /restart.)
+        reg, _, _ = _make_registry(in_memory_db)
+        task, fake = await _bind_running_task(reg)
+        await reg._teardown_task(task, status="stopped", archive=True)
+        assert reg.get_by_thread_id(task.thread_id) is task
+        # A message in the stopped thread is consumed (True) but NOT relayed to
+        # the dead daemon — fake.prompts stays empty.
+        msg = FakeMsg(channel=FakeChannel(id=task.thread_id), content="hi")
+        assert await reg.maybe_route_message(msg) is True
+        assert fake.prompts == []
 
 
 class TestReconcileAction:

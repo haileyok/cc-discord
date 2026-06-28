@@ -1,0 +1,16 @@
+2026-06-28 16:47:57,512 - bridge.secrets - INFO - loaded secrets from /Users/wire2k/.config/claude-discord-bridge/secrets.json
+2026-06-28 16:47:57,519 - bridge.server - INFO - polytoken version check: polytoken 0.3.3 is supported (requires 0.3.3+ on the 0.3.x line)
+2026-06-28 16:47:57,521 - discord.client - WARNING - PyNaCl is not installed, voice will NOT be supported
+2026-06-28 16:47:57,521 - discord.client - WARNING - davey is not installed, voice will NOT be supported
+2026-06-28 16:47:57,521 - bridge.server - INFO - listening on http://127.0.0.1:8787
+2026-06-28 16:47:57,523 - bridge.projects - INFO - Loaded 0 project(s) from 0 root(s)
+2026-06-28 16:47:57,524 - discord.client - INFO - logging in using static token
+2026-06-28 16:47:58,159 - discord.gateway - INFO - Shard ID None has connected to Gateway (Session ID: 004ec45a0fc71a9ff2690d4131a1c444).
+2026-06-28 16:48:00,164 - bridge.bot - INFO - Bot ready as Polybot#0364, watching #clodia
+2026-06-28 16:48:00,457 - bridge.server - INFO - synced 15 slash commands to guild 979595572707209317
+2026-06-28 16:48:32,884 - aiohttp.access - INFO - 127.0.0.1 [28/Jun/2026:16:48:32 -0500] "GET /v1/health HTTP/1.1" 200 236 "-" "curl/8.7.1"
+2026-06-28 16:55:23,904 - bridge.tasks - INFO - spawned task 0ede5a81 → session 04p22a-manor:60833
+2026-06-28 16:55:59,014 - bridge.tasks - INFO - relay → daemon (task=0ede5a81, 44 chars)
+2026-06-28 16:57:50,743 - bridge.tasks - INFO - relay → daemon (task=0ede5a81, 87 chars)
+2026-06-28 16:59:10,629 - bridge.tasks - INFO - relay → daemon (task=0ede5a81, 74 chars)
+2026-06-28 17:03:47,269 - bridge.tasks - INFO - attach marker skipped (not absolute / missing): '<path>'
