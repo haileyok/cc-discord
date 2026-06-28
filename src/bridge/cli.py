@@ -215,20 +215,32 @@ def doctor() -> None:
         click.echo(f"[fail] Daemon health — {bridge_url}/v1/health unreachable ({type(e).__name__})", err=True)
         failed = True
 
-    # Check 4: polytoken binary present
+    # Check 4: polytoken binary present + version pin
+    from bridge.version_guard import (
+        BRIDGE_POLYTOKEN_VERSION,
+        check_polytoken_version,
+        detect_polytoken_version,
+    )
+
     binary = _polytoken_bin()
     resolved = shutil.which(binary)
     if resolved is None:
         click.echo(f"[fail] polytoken CLI — `{binary}` not found on PATH", err=True)
         failed = True
     else:
-        try:
-            result = subprocess.run([binary, "--version"], capture_output=True, timeout=5, text=True)
-            version = (result.stdout or result.stderr).strip().splitlines()[0] if result.returncode == 0 else "?"
-            click.echo(f"[ok] polytoken CLI — {resolved} ({version})")
-        except Exception as e:
-            click.echo(f"[warn] polytoken CLI — {resolved} present but version check failed: {e}", err=True)
-            warned = True
+        version = detect_polytoken_version(binary)
+        ok, msg = check_polytoken_version(version)
+        if ok:
+            click.echo(f"[ok] polytoken CLI — {resolved} ({msg})")
+        else:
+            # A wrong version is a hard fail: the daemon contracts are pinned to
+            # {BRIDGE_POLYTOKEN_VERSION}; a mismatched binary can break silently.
+            click.echo(
+                f"[fail] polytoken CLI — {resolved} ({msg}). "
+                f"Bridge requires polytoken {BRIDGE_POLYTOKEN_VERSION}+.",
+                err=True,
+            )
+            failed = True
 
     # Check 5: polytoken can spawn a headless session
     if resolved is not None:

@@ -150,6 +150,8 @@ class FakeSupervisor:
     terminated: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
     fail_list: bool = False
+    resume_calls: list[dict] = field(default_factory=list)
+    fail_resume: bool = False
 
     async def spawn(self, cwd: str, *, config_dir: str | None = None) -> _SpawnResult:
         if self.fail_spawn:
@@ -162,6 +164,19 @@ class FakeSupervisor:
         self._spawn_calls.append({"cwd": cwd, "session_id": sid, "port": self._next_port})
         self.sessions.append(_SessionInfo(sid, self._next_port, project_path=cwd))
         return _SpawnResult(sid, self._next_port)
+
+    async def resume(self, session_id: str, cwd: str, *, config_dir: str | None = None, discover_timeout: float = 20.0) -> _SpawnResult:
+        if self.fail_resume:
+            from bridge.daemon_supervisor import DaemonSupervisorError
+
+            raise DaemonSupervisorError("resume failed")
+        self._next_port += 1
+        port = self._next_port
+        self.resume_calls.append({"session_id": session_id, "cwd": cwd, "port": port})
+        # The resumed daemon re-registers on a new port.
+        self.sessions = [s for s in self.sessions if s.session_id != session_id]
+        self.sessions.append(_SessionInfo(session_id, port, project_path=cwd))
+        return _SpawnResult(session_id, port)
 
     def _maybe_fail(self):
         if self.fail_list:

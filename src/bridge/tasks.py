@@ -1228,13 +1228,51 @@ class TaskRegistry:
             return False
 
     async def restart_task(self, task_id: str) -> Task:
-        """Not supported with the Polytoken daemon backend."""
-        if self.get_by_task_id(task_id) is None:
+        """Resume a stopped/killed task's daemon session and re-attach.
+
+        Spawns a resumed daemon (``polytoken daemon --resume``) for the task's
+        ``polytoken_session_id``, refreshes its port, flips status back to
+        ``running``, and restarts the ``/events`` consumer. The resumed daemon
+        retains the prior conversation history (verified against Polytoken 0.3.3).
+
+        Raises :class:`TaskNotFound` if the task isn't tracked, or
+        :class:`TaskRestartError` if the task has no session id to resume or the
+        resume/registration fails.
+        """
+        task = self.get_by_task_id(task_id)
+        if task is None:
             raise TaskNotFound(task_id)
-        raise TaskRestartError(
-            "Restart isn't supported with the Polytoken daemon backend; "
-            "use /kill to end this task and /start to begin a new one."
+        sid = task.polytoken_session_id
+        if not sid:
+            raise TaskRestartError(
+                f"task {task_id[:8]} has no polytoken session id to resume"
+            )
+        try:
+            result = await self._supervisor.resume(sid, task.cwd)
+        except DaemonSupervisorError as exc:
+            raise TaskRestartError(
+                f"could not resume session {sid[:8]}: {exc}"
+            ) from exc
+
+        # Refresh port + status, reset teardown state so the task can be torn
+        # down again later (a subsequent /stop or crash must still work).
+        task.port = result.port
+        task.status = "running"
+        task.last_activity = int(time.time())
+        self._torn_down.discard(task.task_id)
+        # Re-index (teardown removed the thread/session lookups) and re-bind.
+        await self._index(task)
+        await self._persist(task)
+        # Fresh translator: the resumed daemon's event stream restarts its seq
+        # baseline, so a stale last_seq would falsely trigger a Reconcile.
+        self._translators[task.task_id] = Translator()
+        self._start_consumer(task)
+        logger.info(
+            "restarted task %s on resumed session %s port %d",
+            task_id[:8], sid[:8], result.port,
         )
+        return task
+
 
     async def _teardown_task(self, task: Task, *, status: str, archive: bool, cancel_consumer: bool = True) -> None:
         """Common terminal path for stop/kill: stop consumer, persist, archive, clean up.

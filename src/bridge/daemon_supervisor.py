@@ -15,8 +15,11 @@ import asyncio
 import logging
 import re
 import shutil
+import subprocess
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from bridge.polytoken_client import PolytokenClient, PolytokenClientError
 
@@ -25,9 +28,43 @@ log = logging.getLogger(__name__)
 # `polytoken new --no-attach` prints one line: `session_id=<id> port=<port>`.
 _SPAWN_RE = re.compile(r"session_id=(?P<sid>\S+)\s+port=(?P<port>\d+)")
 
+# The daemon's global config directory. `polytoken new` auto-discovers this via
+# XDG, but `polytoken daemon --resume` does NOT — it must be passed explicitly
+# with `--global-config-dir`, or it fails with "no config file found".
+DEFAULT_GLOBAL_CONFIG_DIR = str(Path.home() / ".config" / "polytoken")
+
+# How long to wait for a resumed daemon to register in `polytoken sessions`.
+_RESUME_DISCOVER_TIMEOUT_SECS = 20.0
+_RESUME_POLL_INTERVAL_SECS = 0.5
+
 # Subprocess runner contract: (argv) -> (returncode, stdout, stderr).
 Runner = Callable[[list[str]], Awaitable[tuple[int, str, str]]]
 ClientFactory = Callable[[int], PolytokenClient]
+# Background launcher contract: (argv) -> pid | None. Launches a detached
+# long-running process (the resumed daemon runs in the foreground, so it can't
+# use the self-terminating ``Runner``). Returns the pid or None on launch error.
+Launcher = Callable[[list[str]], "int | None"]
+
+
+def _default_launcher(argv: list[str]) -> int | None:
+    """Launch ``argv`` as a detached background process and return its pid.
+
+    ``start_new_session=True`` detaches the daemon into its own session/process
+    group so it survives a bridge restart (it registers in ``polytoken sessions``
+    and is re-attached by reconcile). stdout/stderr are discarded — the port is
+    discovered via the session registry, not stdout parsing.
+    """
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return proc.pid
+    except OSError as exc:
+        log.warning("failed to launch resumed daemon %r: %s", argv[0], exc)
+        return None
 
 
 class DaemonSupervisorError(Exception):
@@ -72,10 +109,14 @@ class DaemonSupervisor:
         binary: str = "polytoken",
         runner: Runner | None = None,
         client_factory: ClientFactory | None = None,
+        launcher: Launcher | None = None,
+        global_config_dir: str | None = None,
     ) -> None:
         self._binary = binary
         self._runner = runner or _default_runner
         self._client_factory = client_factory or (lambda port: PolytokenClient(port))
+        self._launcher = launcher or _default_launcher
+        self._global_config_dir = global_config_dir or DEFAULT_GLOBAL_CONFIG_DIR
 
     # -- spawn ------------------------------------------------------------
 
@@ -100,6 +141,71 @@ class DaemonSupervisor:
                 f"could not parse session id/port from `polytoken new` output: {out.strip()[:500]!r}"
             )
         return SpawnResult(session_id=match.group("sid"), port=int(match.group("port")))
+
+    # -- resume -----------------------------------------------------------
+
+    async def resume(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        config_dir: str | None = None,
+        discover_timeout: float = _RESUME_DISCOVER_TIMEOUT_SECS,
+    ) -> SpawnResult:
+        """Resume a previously-terminated daemon session rooted at ``cwd``.
+
+        Runs ``polytoken daemon --resume --session-id <id> --project-dir <cwd>
+        --global-config-dir <dir> --listen 127.0.0.1:0`` as a detached background
+        process, then discovers its assigned port by polling ``polytoken sessions``
+        until the session re-appears (the resumed daemon registers itself).
+
+        Unlike :meth:`spawn` (which uses ``new --no-attach`` and a self-terminating
+        invocation), the resumed daemon runs in the foreground and is launched via
+        the injectable :attr:`_launcher` (detached via ``start_new_session``).
+
+        Idempotent: if the session is already live, returns its existing port
+        without relaunching. Raises :class:`DaemonSupervisorError` if the launcher
+        fails or the session doesn't register within ``discover_timeout``.
+        """
+        # Pre-check: a live daemon for this session is resumed as-is.
+        existing = await self.find_session(session_id)
+        if existing is not None:
+            log.info("resume %s: already live on port %d", session_id, existing.port)
+            return SpawnResult(session_id=session_id, port=existing.port)
+
+        gcfg = config_dir or self._global_config_dir
+        argv = [
+            self._binary,
+            "daemon",
+            "--resume",
+            "--session-id",
+            session_id,
+            "--project-dir",
+            cwd,
+            "--global-config-dir",
+            gcfg,
+            "--listen",
+            "127.0.0.1:0",
+        ]
+        pid = self._launcher(argv)
+        if pid is None:
+            raise DaemonSupervisorError(
+                f"failed to launch resumed daemon for session {session_id}"
+            )
+        log.info("resume %s: launched pid %d, discovering port", session_id, pid)
+
+        # Poll the registry until the resumed daemon registers with a port.
+        deadline = time.monotonic() + discover_timeout
+        while time.monotonic() < deadline:
+            info = await self.find_session(session_id)
+            if info is not None:
+                log.info("resume %s: registered on port %d", session_id, info.port)
+                return SpawnResult(session_id=session_id, port=info.port)
+            await asyncio.sleep(_RESUME_POLL_INTERVAL_SECS)
+        raise DaemonSupervisorError(
+            f"resumed daemon for session {session_id} did not register in "
+            f"`polytoken sessions` within {discover_timeout:.0f}s"
+        )
 
     # -- registry ---------------------------------------------------------
 

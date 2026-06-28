@@ -29,7 +29,18 @@ Permissions run in **bypass mode** — there's no Discord approval round-trip; t
 3. **OAuth2 → URL Generator** → scopes: `bot` → permissions: `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Read Message History` (+ `Manage Channels` if you'll use `/pin`) → open the URL → invite the bot.
 4. In Discord: User Settings → Advanced → **Developer Mode** → right-click the target channel → **Copy Channel ID**.
 
-### 2. Bridge daemon
+### 2. Polytoken daemon
+
+The bridge spawns one **Polytoken** daemon per task. It is pinned to **0.3.3** (the 0.3.x stable line); a mismatched version breaks the daemon HTTP/event contracts silently. `doctor` hard-fails on a wrong version, and `serve` warns.
+
+```bash
+brew install polytoken/tap/polytoken        # installs the 0.3.x stable line
+polytoken --version                          # expect: polytoken 0.3.3
+```
+
+If you also have `polytoken-unstable` installed, unlink it so `polytoken` on PATH resolves to 0.3.3: `brew unlink polytoken-unstable && brew link polytoken`.
+
+### 3. Bridge daemon
 
 ```bash
 git clone https://github.com/haileyok/cc-discord.git claude-discord-bridge
@@ -40,7 +51,7 @@ uv run claude-discord-bridge init
 
 `init` prompts for the bot token and channel ID, writes `~/.config/claude-discord-bridge/secrets.json` at mode `0600`, validates the token by connecting to Discord, and posts a confirmation message.
 
-### 3. Start the daemon
+### 4. Start the daemon
 
 **Foreground (simplest):**
 ```bash
@@ -57,12 +68,12 @@ systemctl --user enable --now claude-discord-bridge
 ```
 If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl enable-linger $USER` first.
 
-### 4. Verify
+### 5. Verify
 
 ```bash
 uv run claude-discord-bridge doctor
 ```
-Checks: secrets file present + 0600, daemon health, the `polytoken` binary present + a headless spawn smoke, and the attachments dir writable. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
+Checks: secrets file present + 0600, daemon health, the `polytoken` binary at the pinned 0.3.x version + a headless spawn smoke, and the attachments dir writable. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
 
 ## Slash commands
 
@@ -73,7 +84,7 @@ Checks: secrets file present + 0600, daemon health, the `polytoken` binary prese
 | `/list` | List active tasks with status, cwd leaf, age, and thread link. |
 | `/stop [thread:<#thread>]` | Cancel any in-flight turn and terminate the daemon. |
 | `/kill [thread:<#thread>]` | Immediately terminate the daemon. |
-| `/restart [thread:<#thread>]` | Not supported with the daemon backend (headless resume isn't available); use `/kill` + `/start`. |
+| `/restart [thread:<#thread>]` | Resume a stopped/killed task's daemon session — prior history retained, streaming resumes. |
 | `/skill <name> [args:<text>]` | Invoke a skill via an `@<name>` reference prompt. Autocomplete shows the session's available skills. |
 | `/effort <level>` | Change the session's reasoning effort (re-selects the active model with the new effort). |
 | `/model name:<model> [effort:<level>]` | Switch the active model (autocomplete from `polytoken models`); a bare switch resets effort to the model default, or set it inline. |

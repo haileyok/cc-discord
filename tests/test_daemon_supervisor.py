@@ -142,6 +142,83 @@ class TestListModels:
             await sup.list_models()
 
 
+class TestResume:
+    @staticmethod
+    def _sessions_row(sid: str, port: int) -> str:
+        return f"{sid:<48} {port:<7} 100      2026-06-28T00:00:00Z     /w\n"
+
+    async def test_resume_discovers_port(self) -> None:
+        registered = {"yes": False}
+
+        async def runner(argv: list[str]) -> tuple[int, str, str]:
+            if argv[-1] == "sessions":
+                out = "SESSION_ID PORT PID STARTED_AT PROJECT_PATH\n"
+                if registered["yes"]:
+                    out += self._sessions_row("04abc-resume", 41000)
+                out += self._sessions_row("03other-x", 41001)
+                return (0, out, "")
+            return (127, "", "nope")
+
+        launched: list[list[str]] = []
+
+        def launcher(argv: list[str]) -> int:
+            launched.append(argv)
+            registered["yes"] = True  # daemon registers after launch
+            return 99999
+
+        sup = DaemonSupervisor(runner=runner, launcher=launcher)
+        res = await sup.resume("04abc-resume", "/w", discover_timeout=5)
+        assert res.session_id == "04abc-resume"
+        assert res.port == 41000
+        assert launched  # launcher fired
+        # The resume argv is well-formed.
+        av = launched[0]
+        assert "--resume" in av and "--session-id" in av
+        assert "--global-config-dir" in av and "--listen" in av
+        assert "127.0.0.1:0" in av
+
+    async def test_resume_already_running_is_idempotent(self) -> None:
+        # A live session is returned without relaunching.
+        async def runner(argv: list[str]) -> tuple[int, str, str]:
+            out = "SESSION_ID PORT PID STARTED_AT PROJECT_PATH\n"
+            out += self._sessions_row("04abc-resume", 41200)
+            return (0, out, "")
+
+        launched: list[list[str]] = []
+
+        def launcher(argv: list[str]) -> int:
+            launched.append(argv)
+            return 1
+
+        sup = DaemonSupervisor(runner=runner, launcher=launcher)
+        res = await sup.resume("04abc-resume", "/w")
+        assert res.port == 41200
+        assert not launched  # no relaunch
+
+    async def test_resume_launch_failure_raises(self) -> None:
+        async def runner(argv: list[str]) -> tuple[int, str, str]:
+            return (0, "SESSION_ID PORT PID STARTED_AT PROJECT_PATH\n", "")
+
+        def launcher(argv: list[str]) -> None:
+            return None  # launch failed
+
+        sup = DaemonSupervisor(runner=runner, launcher=launcher)
+        with pytest.raises(DaemonSupervisorError):
+            await sup.resume("04abc-resume", "/w", discover_timeout=2)
+
+    async def test_resume_discover_timeout_raises(self) -> None:
+        # The resumed daemon never registers.
+        async def runner(argv: list[str]) -> tuple[int, str, str]:
+            return (0, "SESSION_ID PORT PID STARTED_AT PROJECT_PATH\n", "")
+
+        def launcher(argv: list[str]) -> int:
+            return 99999
+
+        sup = DaemonSupervisor(runner=runner, launcher=launcher)
+        with pytest.raises(DaemonSupervisorError, match="did not register"):
+            await sup.resume("04abc-resume", "/w", discover_timeout=0.6)
+
+
 class TestTerminate:
     async def test_terminate_live_session(self) -> None:
         runner = make_runner({("sessions",): (0, _SESSIONS_OUT, "")})

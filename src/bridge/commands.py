@@ -193,7 +193,7 @@ def build_tree(
                 ephemeral=True,
             )
 
-    @tree.command(name="restart", description="(Unsupported with the daemon backend)")
+    @tree.command(name="restart", description="Resume a stopped task's daemon session (history retained)")
     @app_commands.describe(thread="Thread to restart (defaults to invocation thread)")
     async def restart(
         interaction: discord.Interaction,
@@ -210,7 +210,10 @@ def build_tree(
         except (TaskNotFound, TaskRestartError) as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-        await interaction.followup.send(f"🔄 Restarted `{task.task_id[:8]}`", ephemeral=True)
+        await interaction.followup.send(
+            f"🔄 Resumed `{task.task_id[:8]}` — prior history retained, streaming resumed.",
+            ephemeral=True,
+        )
 
     async def _skill_autocomplete(
         interaction: discord.Interaction, current: str

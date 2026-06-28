@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 import time
 
@@ -70,6 +71,21 @@ async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Applica
 
 async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) -> None:
     """Run the bridge: HTTP health server + Discord bot, until SIGTERM/SIGINT."""
+    # Startup version guard: warn loudly if the polytoken binary is outside the
+    # pinned series. The daemon HTTP/event contracts are verified against a
+    # specific version; a mismatch can break the bridge silently. `doctor` is
+    # the hard gate; here we warn (and surface the version) but still start.
+    from bridge.version_guard import check_polytoken_version, detect_polytoken_version
+
+    v = detect_polytoken_version(os.environ.get("POLYTOKEN_BIN", "polytoken"))
+    ok, msg = check_polytoken_version(v)
+    if ok:
+        logger.info("polytoken version check: %s", msg)
+    else:
+        logger.warning("⚠️  polytoken VERSION MISMATCH: %s — the bridge is pinned to a "
+                       "specific daemon contract; expect breakage. Run "
+                       "`claude-discord-bridge doctor` for details.", msg)
+
     supervisor = DaemonSupervisor()
 
     conn = await state.open_db()

@@ -122,13 +122,12 @@ class TestLifecycleCommands:
         await tree.get_command("kill").callback(inter, thread=None)
         assert "Couldn't terminate" in inter.followup._sends[0]["content"]
 
-    async def test_restart_unsupported(self, in_memory_db, tmp_path) -> None:
+    async def test_restart_resumes_task(self, in_memory_db, tmp_path) -> None:
         bot, reg, tree = _make(in_memory_db)
         task, _ = await _spawn_inject(reg, tmp_path)
         inter = FakeInteraction(channel_id=task.thread_id)
         await tree.get_command("restart").callback(inter, thread=None)
-        assert "❌" in inter.followup._sends[0]["content"]
-        assert "supported" in inter.followup._sends[0]["content"].lower()
+        assert "Resumed" in inter.followup._sends[0]["content"]
 
     async def test_outside_thread_errors(self, in_memory_db) -> None:
         bot, reg, tree = _make(in_memory_db)

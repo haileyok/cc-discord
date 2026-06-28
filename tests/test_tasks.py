@@ -163,12 +163,6 @@ class TestLifecycle:
         assert fake.terminated == 1
         assert task.status == "crashed"
 
-    async def test_restart_unsupported(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        with pytest.raises(TaskRestartError):
-            await reg.restart_task(task.task_id)
-
     async def test_kill_unknown_raises(self, in_memory_db) -> None:
         reg, _, _ = _make_registry(in_memory_db)
         with pytest.raises(TaskNotFound):
@@ -330,6 +324,57 @@ class TestTeardownIdempotent:
         await reg._teardown_task(task, status="crashed", archive=True)
         assert task.status == "stopped"
         assert len(bot.get_archive_calls()) == archives
+
+
+class TestRestart:
+    async def test_restart_resumes_stopped_task(self, in_memory_db) -> None:
+        reg, bot, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        await reg._teardown_task(task, status="stopped", archive=True)
+        assert task.status == "stopped"
+        assert task.task_id in reg._torn_down
+
+        restarted = await reg.restart_task(task.task_id)
+
+        assert restarted is task
+        assert task.status == "running"
+        # Port refreshed to whatever resume returned.
+        assert sup.resume_calls
+        assert task.port == sup.resume_calls[0]["port"]
+        assert task.task_id not in reg._torn_down
+        # Resume was called with the session id + cwd.
+        assert sup.resume_calls == [
+            {"session_id": "sess-1", "cwd": "/w", "port": task.port}
+        ]
+        # Re-indexed: the thread/session lookups are restored.
+        assert reg.get_by_thread_id(task.thread_id) is task
+        assert reg.get_by_session_id("sess-1") is task
+        # Persisted as running with the new port.
+        row = await state.get_task(in_memory_db, task.task_id)
+        assert row.status == "running" and row.port == task.port
+
+    async def test_restart_no_session_id_raises(self, in_memory_db) -> None:
+        reg, _, _ = _make_registry(in_memory_db)
+        task = Task(
+            task_id="t9", thread_id=2099, cwd="/w", status="stopped",
+            polytoken_session_id=None, port=None, created_at=0, last_activity=0,
+        )
+        await reg._index(task)
+        with pytest.raises(TaskRestartError):
+            await reg.restart_task(task.task_id)
+
+    async def test_restart_resume_failure_raises(self, in_memory_db) -> None:
+        reg, _, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        await reg._teardown_task(task, status="stopped", archive=True)
+        sup.fail_resume = True
+        with pytest.raises(TaskRestartError):
+            await reg.restart_task(task.task_id)
+
+    async def test_restart_unknown_task_raises(self, in_memory_db) -> None:
+        reg, _, _ = _make_registry(in_memory_db)
+        with pytest.raises(TaskNotFound):
+            await reg.restart_task("nope")
 
 
 class TestReconcileAction:

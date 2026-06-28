@@ -92,6 +92,47 @@ class TestMigration:
         )
         assert await cur.fetchone() is None
 
+    async def test_migration_yields_working_new_schema(self) -> None:
+        """After migrating a legacy DB, the new schema is fully functional:
+        indexes are recreated on the new columns and a daemon task round-trips."""
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            await conn.execute(
+                "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, thread_id INTEGER, "
+                "zellij_pane_id TEXT, cwd TEXT, status TEXT, current_claude_session_id TEXT, "
+                "current_transcript_path TEXT, created_at INTEGER, last_activity INTEGER)"
+            )
+            # Old index was on the now-renamed column; migration must drop/recreate it.
+            await conn.execute(
+                "CREATE INDEX idx_tasks_session_id ON tasks(current_claude_session_id)"
+            )
+            await conn.execute("CREATE TABLE approval_log (request_id TEXT PRIMARY KEY)")
+            await conn.execute(
+                "INSERT INTO tasks (task_id, thread_id, cwd, status, created_at, last_activity) "
+                "VALUES ('old', 1, '/w', 'running', 0, 0)"
+            )
+            await conn.commit()
+
+            await state.init_schema(conn)
+
+            # A daemon task round-trips on the migrated schema.
+            await state.upsert_task(
+                conn, "new", 200, "/proj", "running",
+                polytoken_session_id="sess-new", port=59999, now=42,
+            )
+            row = await state.get_task(conn, "new")
+            assert row is not None
+            assert row.polytoken_session_id == "sess-new"
+            assert row.port == 59999
+            assert row.created_at == 42
+            # The new index on polytoken_session_id exists (recreated post-drop).
+            cur = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tasks_session_id'"
+            )
+            assert await cur.fetchone() is not None
+        finally:
+            await conn.close()
+
 
 class TestPins:
     async def test_pin_roundtrip(self, in_memory_db) -> None:

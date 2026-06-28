@@ -121,14 +121,14 @@ class TestInitCommand:
         assert any("init succeeded" in m for m in posted)
 
 
-def _mock_subprocess(*, which="/usr/local/bin/polytoken", version_rc=0, spawn_out="session_id=s1 port=33333", spawn_rc=0):
+def _mock_subprocess(*, which="/usr/local/bin/polytoken", version_rc=0, version="polytoken 0.3.3\n", spawn_out="session_id=s1 port=33333", spawn_rc=0):
     """Build a (which_patch, run_fn) pair for the polytoken doctor checks."""
 
     def run_fn(cmd, *args, **kwargs):
         result = MagicMock()
         if "--version" in cmd:
             result.returncode = version_rc
-            result.stdout = "polytoken 0.1.20\n"
+            result.stdout = version
             result.stderr = ""
         elif "new" in cmd:
             result.returncode = spawn_rc
@@ -193,6 +193,17 @@ class TestDoctorCommand:
         )
         assert result.exit_code == 1
         assert "[fail] polytoken spawn" in result.output
+
+    def test_doctor_version_mismatch_fails(self, tmp_path, monkeypatch) -> None:
+        # A wrong version (e.g. 0.4.0-unstable) is a hard fail under the pin.
+        which, run_fn = _mock_subprocess(version="polytoken 0.4.0-unstable.1\n")
+        result = self._run(
+            tmp_path, monkeypatch, which=which, run_fn=run_fn,
+            urlopen=lambda *a, **k: _health_mock(bot_connected=True),
+        )
+        assert result.exit_code == 1
+        assert "[fail] polytoken CLI" in result.output
+        assert "0.3.3" in result.output
 
     def test_doctor_bot_connected_false(self, tmp_path, monkeypatch) -> None:
         which, run_fn = _mock_subprocess()
