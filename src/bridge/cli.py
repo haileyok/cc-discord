@@ -287,6 +287,26 @@ def doctor() -> None:
         click.echo(f"[fail] attachments dir — error: {e}", err=True)
         failed = True
 
+    # Check 7: global Polytoken notification hook (covers all sessions, not just
+    # the bridge's). A warning, not a hard fail: the bridge works without it, but
+    # you won't be pinged when non-Discord sessions need input.
+    from bridge.hooks import hook_status
+
+    status = hook_status()
+    if status["installed"]:
+        click.echo(
+            f"[ok] notification hook — {status['script_path']} "
+            f"(events: {', '.join(status['registered_events'])})"
+        )
+    else:
+        click.echo(
+            "[warn] notification hook — not installed. Run "
+            "`claude-discord-bridge setup-hooks` to get pings for ALL Polytoken "
+            "sessions (not just Discord-driven ones).",
+            err=True,
+        )
+        warned = True
+
     click.echo()
     if failed:
         click.echo("Doctor: some checks failed. Please fix the issues above.", err=True)
@@ -297,6 +317,29 @@ def doctor() -> None:
     else:
         click.echo("Doctor: all checks passed. Bridge is ready.")
         sys.exit(0)
+
+
+@cli.command("setup-hooks")
+def setup_hooks() -> None:
+    """Install the global Polytoken notification hook.
+
+    Registers a hook in ~/.config/polytoken/hooks.json that fires for EVERY
+    Polytoken session (not just Discord-driven ones) on `stop` (session waiting
+    for input) and `notification` events, forwarding them to the bridge, which
+    posts to Discord with an @mention. Idempotent.
+
+    Set BRIDGE_NOTIFY_USER_ID to your Discord user ID to get a push (@mention)
+    on each notification.
+    """
+    from bridge.hooks import install_hook
+
+    path = install_hook()
+    click.echo(f"Installed global notification hook → {path}")
+    click.echo("Events: stop (waiting for input), notification.")
+    click.echo(
+        "Takes effect on the next Polytoken config reload. "
+        "Set BRIDGE_NOTIFY_USER_ID=<your Discord user ID> for push (@mention)."
+    )
 
 
 def main() -> None:

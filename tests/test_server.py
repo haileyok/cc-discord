@@ -35,9 +35,90 @@ class TestHealth:
         bot = FakeBot()
         app = await build_app(bot, started_at=0.0)
         async with test_utils.TestClient(test_utils.TestServer(app)) as client:
-            for path in ("/v1/notify", "/v1/ask", "/v1/hook/event", "/v1/hook/pretooluse"):
+            for path in ("/v1/ask", "/v1/hook/event", "/v1/hook/pretooluse"):
                 resp = await client.post(path, json={})
                 assert resp.status == 404
+
+
+class _NotifyRegistry:
+    """Minimal registry stub for /v1/notify: session lookup + mention prefix."""
+
+    def __init__(self, *, known_sessions=(), mention="") -> None:
+        self._known = set(known_sessions)
+        self._mention = mention
+
+    def get_by_session_id(self, session_id: str):
+        return object() if session_id in self._known else None
+
+    def notify_mention_prefix(self) -> str:
+        return self._mention
+
+
+class TestNotify:
+    async def _client(self, bot, registry):
+        from bridge.server import TASK_REGISTRY_KEY
+        app = await build_app(bot, started_at=0.0)
+        app[TASK_REGISTRY_KEY] = registry
+        return test_utils.TestClient(test_utils.TestServer(app))
+
+    async def test_notification_posts_with_mention(self) -> None:
+        bot = FakeBot()
+        reg = _NotifyRegistry(mention="<@111> ")
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={"summary": "job completed"},
+                headers={"X-Polytoken-Event": "notification", "X-Polytoken-Session": "sess-x"},
+            )
+            assert resp.status == 200
+            assert "job completed" in bot._post_calls[0]["content"]
+            assert bot._post_calls[0]["content"].startswith("<@111> ")
+
+    async def test_stop_for_unknown_session_posts(self) -> None:
+        # A session the bridge doesn't drive → ping (the whole point).
+        bot = FakeBot()
+        reg = _NotifyRegistry(known_sessions=())
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={},
+                headers={"X-Polytoken-Event": "stop", "X-Polytoken-Session": "sess-x"},
+            )
+            assert resp.status == 200
+            assert "waiting for input" in bot._post_calls[0]["content"]
+
+    async def test_stop_for_bridge_session_suppressed(self) -> None:
+        # A session the bridge already renders inline → suppress (no double ping).
+        bot = FakeBot()
+        reg = _NotifyRegistry(known_sessions=("sess-bridge",))
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={},
+                headers={"X-Polytoken-Event": "stop", "X-Polytoken-Session": "sess-bridge"},
+            )
+            assert resp.status == 200
+            assert "suppressed" in await resp.text()
+            assert bot._post_calls == []
+
+    async def test_notification_for_bridge_session_suppressed(self) -> None:
+        # A notification for a bridge-driven session is rendered inline (as an
+        # AttentionPing in its thread), so the channel hook ping is suppressed too.
+        bot = FakeBot()
+        reg = _NotifyRegistry(known_sessions=("sess-bridge",))
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={"summary": "job completed"},
+                headers={"X-Polytoken-Event": "notification", "X-Polytoken-Session": "sess-bridge"},
+            )
+            assert resp.status == 200
+            assert "suppressed" in await resp.text()
+            assert bot._post_calls == []
 
 
 class TestDispatcher:

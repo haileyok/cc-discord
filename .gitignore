@@ -7,6 +7,9 @@ dist/
 build/
 .python-version-local
 
+# Local run artifacts (logs, scratch)
+tmp/
+
 # Secrets / local config — never commit bot tokens or channel IDs
 secrets.json
 *.secrets.json

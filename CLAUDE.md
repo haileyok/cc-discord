@@ -50,6 +50,7 @@ Discord ──(discord.py)──> bot.py / commands.py            [Discord surfa
 - **Dollar cost is not derivable.** `/state.context_usage` is `{used_tokens, limit_tokens}` (context-window occupancy only); there are no per-turn token-usage events. `/stats` shows model + effort + context window; `usage.MODEL_PRICES` is kept dormant for if/when per-turn token counts become available.
 - **`load_from_db` defers Discord posts to `flush_startup_notices()`.** Reconcile-against-`polytoken sessions` happens before the bot logs in, so staged notices are flushed after `bot.is_ready`. Don't add `self._bot.*` calls inside the reconcile branch.
 - **Attachment cleanup + sweep.** Terminal lifecycle paths call `_cleanup_task_attachments(task_id)`; `sweep_old_attachments()` runs at startup and hourly, deleting files older than `BRIDGE_ATTACHMENT_TTL_SECS` (default 7 days).
+- **Cross-session notifications via a global Polytoken hook.** The bridge can't see sessions it doesn't drive, so "notify me when *any* Polytoken session needs input" is a **global hook** (`cli setup-hooks` → `bridge/hooks.py` writes `~/.config/polytoken/hooks/notify-discord.sh` + registers `stop`/`notification` entries in `~/.config/polytoken/hooks.json`). The hook fires for *every* session, `curl`s the bridge's `POST /v1/notify` with the event + `POLYTOKEN_*` context, and the bridge posts `🔔 …` to the bot channel with an @mention (`BRIDGE_NOTIFY_USER_ID`). `stop` pings for sessions the bridge already drives are suppressed (rendered inline in their thread) so you aren't double-notified. The hook always exits 0 (side-effect only; never changes what Polytoken does). Polytoken reloads hooks on config reload; the bridge must be reachable on `BRIDGE_URL` (default 8787).
 
 ## Schema
 
@@ -67,7 +68,7 @@ The `polytoken` binary must be on `PATH` for the daemon process (the supervisor 
 
 ## Architecture quick reference
 
-- `src/bridge/server.py` — aiohttp app, single endpoint `GET /v1/health`, plus `make_message_dispatcher` (routes Discord messages to `TaskRegistry.maybe_route_message`).
+- `src/bridge/server.py` — aiohttp app, endpoints `GET /v1/health` and `POST /v1/notify` (the global-hook receiver), plus `make_message_dispatcher` (routes Discord messages to `TaskRegistry.maybe_route_message`).
 - `src/bridge/bot.py` — discord.py wrapper. `_with_retry` wraps every `fetch_channel` / `send` with bounded backoff on transient 5xx. `post`, `post_with_attachments`, `post_embed`, `edit_message`, `rename_thread`, `create_thread`, `create_channel`.
 - `src/bridge/polytoken_client.py` — async (aiohttp) client for one daemon session: `prompt`, `stream_events` (SSE async-gen yielding `SseEnvelope`, seq + `Last-Event-ID`), `state`, `history`, `respond_interrogative`, `set_title`/`set_model`/`set_facet`, `cancel_turn`, `compact`, `terminate`, `health`.
 - `src/bridge/daemon_supervisor.py` — `spawn(cwd)` (parses `session_id=…port=…`), `list_sessions()`, `find_session()`, `terminate(session_id)`. Injectable subprocess runner + client factory for tests.
@@ -80,5 +81,6 @@ The `polytoken` binary must be on `PATH` for the daemon process (the supervisor 
 - `src/bridge/voice.py` — audio transcription (Wispr Flow API or local `whisper` CLI).
 - `src/bridge/skills.py` — filesystem fallback for `/skill` autocomplete; the primary source is the session's `/state.available_skills`.
 - `src/bridge/secrets.py` — 0600 JSON at `~/.config/claude-discord-bridge/secrets.json`.
-- `src/bridge/cli.py` — click CLI: `init`, `serve`, `doctor` (checks secrets, daemon health, the `polytoken` binary + a headless spawn smoke, attachments dir).
+- `src/bridge/cli.py` — click CLI: `init`, `serve`, `doctor` (checks secrets, daemon health, the `polytoken` binary + a headless spawn smoke, attachments dir, the notification hook), `setup-hooks` (installs the global Polytoken notification hook).
+- `src/bridge/hooks.py` — install/register/status for the global Polytoken notification hook (`~/.config/polytoken/hooks.json`); embeds the handler script so it's robust to the install method.
 - `src/bridge/threads.py`, `src/bridge/listener.py`, `src/bridge/transcript.py` — retained but no longer on the hot path (threads/listener were the old hook-notify/ask machinery; `MessageLike` still lives in `listener.py`).

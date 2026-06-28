@@ -73,7 +73,18 @@ If `systemctl --user` errors with `Operation not permitted`, run `sudo loginctl 
 ```bash
 uv run claude-discord-bridge doctor
 ```
-Checks: secrets file present + 0600, daemon health, the `polytoken` binary at the pinned 0.3.x version + a headless spawn smoke, and the attachments dir writable. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
+Checks: secrets file present + 0600, daemon health, the `polytoken` binary at the pinned 0.3.x version + a headless spawn smoke, the attachments dir writable, and whether the global notification hook is installed. `[fail]` lines tell you what to fix; `[warn]` lines are non-blocking.
+
+### 6. Cross-session notifications (optional)
+
+By default the bridge only posts about the sessions it drives (Discord `/start`). To get pinged when **any** Polytoken session — TUI, `exec`, or a daemon started elsewhere — finishes a turn and waits for input, install the global notification hook:
+
+```bash
+uv run claude-discord-bridge setup-hooks
+export BRIDGE_NOTIFY_USER_ID=<your Discord user id>   # for an @mention push
+```
+
+This registers a hook in `~/.config/polytoken/hooks.json` that fires on `stop` (a session is waiting for input) and `notification` events for every session, forwarding them to the bridge, which posts `🔔 …` to the bot channel. `stop` pings for sessions the bridge already renders inline in their thread are suppressed, so you aren't double-notified. Takes effect on the next Polytoken config reload. (Right-click yourself in Discord with Developer Mode on → **Copy User ID**.)
 
 ## Slash commands
 
@@ -112,7 +123,7 @@ Commands without an explicit `thread:` operate on the task whose thread you're i
 |---|---|---|
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Bridge health URL (used by `doctor`). |
 | `POLYTOKEN_BIN` | `polytoken` | Override the `polytoken` binary used by `doctor`'s checks. |
-| `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on questions / attention pings. |
+| `BRIDGE_NOTIFY_USER_ID` | _(unset)_ | Discord user id to `@`-mention on questions / attention pings (in-thread) and on cross-session hook notifications (see `setup-hooks`). |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | TTL for attachment cleanup (default 7 days). |
 | `BRIDGE_CONTEXT_LIMIT` | _(daemon value)_ | Override the context-window limit shown in `/stats`. |
 | `BRIDGE_PROJECT_ROOTS` | _(unset)_ | Colon-separated parent paths whose immediate subfolders are spawnable from `/spawn`. |

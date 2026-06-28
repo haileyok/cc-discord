@@ -290,9 +290,12 @@ class TaskRegistry:
     def bind_bot(self, bot: "Bot") -> None:
         self._bot = bot
 
-    @staticmethod
-    def _notify_mention_prefix() -> str:
-        """Return ``<@USER_ID> `` to ping the configured user on attention, or ''."""
+    def notify_mention_prefix(self) -> str:
+        """Return ``<@USER_ID> `` to ping the configured user on attention, or ''.
+
+        Reads ``BRIDGE_NOTIFY_USER_ID`` (your Discord user ID). Set it to get a
+        push notification when a session needs input or raises a notification.
+        """
         user_id = os.environ.get("BRIDGE_NOTIFY_USER_ID", "").strip()
         if not user_id.isdigit():
             return ""
@@ -583,7 +586,7 @@ class TaskRegistry:
                 await self._bot.post(action.text, thread_id=task.thread_id)
             elif isinstance(action, AttentionPing):
                 await self._bot.post(
-                    f"{self._notify_mention_prefix()}🔔 {action.summary}", thread_id=task.thread_id
+                    f"{self.notify_mention_prefix()}🔔 {action.summary}", thread_id=task.thread_id
                 )
             elif isinstance(action, ImageResolved):
                 logger.info("image reference resolved for %s: %s", task.task_id[:8], action.path)
@@ -724,7 +727,7 @@ class TaskRegistry:
         existing = self._pending_interrogatives.get(task.task_id)
         if iid and existing is not None and existing.interrogative_id == iid:
             return
-        prefix = self._notify_mention_prefix()
+        prefix = self.notify_mention_prefix()
         if isinstance(action, Confirmation):
             self._pending_interrogatives[task.task_id] = PendingInterrogative(
                 interrogative_id=action.interrogative_id, kind="confirmation"

@@ -60,12 +60,67 @@ def make_message_dispatcher(task_registry: TaskRegistry) -> callable:
     return _dispatch_message
 
 
+def _summarize_notify(event: str, session_id: str, project: str, body: dict) -> str:
+    """Build a one-line Discord summary from a Polytoken hook payload."""
+    sid = (session_id or "unknown")[:12]
+    leaf = ""
+    if project:
+        leaf = f" ({os.path.basename(project.rstrip('/'))})"
+    if event == "stop":
+        return f"🔔 Session `{sid}`{leaf} finished a turn — waiting for input."
+    if event == "notification":
+        summary = str(body.get("summary") or "needs your attention")
+        return f"🔔 Session `{sid}`{leaf}: {summary[:300]}"
+    detail = str(body.get("summary") or body.get("event") or event or "activity")
+    return f"🔔 Session `{sid}`{leaf}: {detail[:300]}"
+
+
+async def _handle_notify(request: web.Request) -> web.Response:
+    """Handle POST /v1/notify — a global Polytoken hook forwarding an event.
+
+    The hook (hooks/notify-discord.sh) posts here on `stop` (session waiting for
+    input) and `notification` events for ANY Polytoken session. The bridge posts
+    the summary to the bot channel with an @mention. Events for sessions the
+    bridge already drives are suppressed — those sessions render their turn
+    completion (typing indicator) and notifications (AttentionPing) inline in
+    their task thread, so a channel ping would double-notify. The hook's value is
+    the sessions the bridge can't see (TUI, `exec`, externally-started daemons).
+    """
+    bot: Bot = request.app[BOT_KEY]
+    registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
+    event = request.headers.get("X-Polytoken-Event", "")
+    session_id = request.headers.get("X-Polytoken-Session", "")
+    project = request.headers.get("X-Polytoken-Project", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Suppress for sessions the bridge already renders inline (any event type);
+    # the hook exists to cover sessions the bridge does not drive.
+    if session_id and registry.get_by_session_id(session_id) is not None:
+        return web.Response(status=200, text='{"status":"suppressed"}',
+                            content_type="application/json")
+
+    summary = _summarize_notify(event, session_id, project, body)
+    mention = registry.notify_mention_prefix()
+    try:
+        await bot.post(f"{mention}{summary}")
+    except Exception:
+        logger.exception("failed to post notify summary to Discord")
+        return web.Response(status=502, text='{"status":"post_failed"}',
+                            content_type="application/json")
+    return web.Response(status=200, text='{"status":"posted"}',
+                        content_type="application/json")
+
+
 async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
-    """Build and configure the aiohttp Application (health only)."""
+    """Build and configure the aiohttp Application (health + notify)."""
     app = web.Application()
     app[BOT_KEY] = bot
     app[STARTED_AT_KEY] = started_at if started_at is not None else time.monotonic()
     app.router.add_get("/v1/health", _handle_health)
+    app.router.add_post("/v1/notify", _handle_notify)
     return app
 
 
