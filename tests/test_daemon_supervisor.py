@@ -147,6 +147,20 @@ class TestResume:
     def _sessions_row(sid: str, port: int) -> str:
         return f"{sid:<48} {port:<7} 100      2026-06-28T00:00:00Z     /w\n"
 
+    @staticmethod
+    def _fake_proc(pid: int = 99999):
+        """A minimal stand-in for subprocess.Popen: has .pid and .terminate()."""
+
+        class _P:
+            def __init__(self) -> None:
+                self.pid = pid
+                self.terminated = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        return _P()
+
     async def test_resume_discovers_port(self) -> None:
         registered = {"yes": False}
 
@@ -160,17 +174,19 @@ class TestResume:
             return (127, "", "nope")
 
         launched: list[list[str]] = []
+        proc = self._fake_proc()
 
-        def launcher(argv: list[str]) -> int:
+        def launcher(argv: list[str]):
             launched.append(argv)
             registered["yes"] = True  # daemon registers after launch
-            return 99999
+            return proc
 
         sup = DaemonSupervisor(runner=runner, launcher=launcher)
         res = await sup.resume("04abc-resume", "/w", discover_timeout=5)
         assert res.session_id == "04abc-resume"
         assert res.port == 41000
         assert launched  # launcher fired
+        assert not proc.terminated  # discovery succeeded; no cleanup
         # The resume argv is well-formed.
         av = launched[0]
         assert "--resume" in av and "--session-id" in av
@@ -186,9 +202,9 @@ class TestResume:
 
         launched: list[list[str]] = []
 
-        def launcher(argv: list[str]) -> int:
+        def launcher(argv: list[str]):
             launched.append(argv)
-            return 1
+            return self._fake_proc()
 
         sup = DaemonSupervisor(runner=runner, launcher=launcher)
         res = await sup.resume("04abc-resume", "/w")
@@ -206,17 +222,21 @@ class TestResume:
         with pytest.raises(DaemonSupervisorError):
             await sup.resume("04abc-resume", "/w", discover_timeout=2)
 
-    async def test_resume_discover_timeout_raises(self) -> None:
-        # The resumed daemon never registers.
+    async def test_resume_discover_timeout_cleans_up(self) -> None:
+        # The resumed daemon never registers; resume must terminate the launched
+        # process so it can't orphan.
         async def runner(argv: list[str]) -> tuple[int, str, str]:
             return (0, "SESSION_ID PORT PID STARTED_AT PROJECT_PATH\n", "")
 
-        def launcher(argv: list[str]) -> int:
-            return 99999
+        proc = self._fake_proc()
+
+        def launcher(argv: list[str]):
+            return proc
 
         sup = DaemonSupervisor(runner=runner, launcher=launcher)
-        with pytest.raises(DaemonSupervisorError, match="did not register"):
+        with pytest.raises(DaemonSupervisorError, match="cleaned up"):
             await sup.resume("04abc-resume", "/w", discover_timeout=0.6)
+        assert proc.terminated  # orphan cleaned up
 
 
 class TestTerminate:

@@ -12,8 +12,15 @@ class TestParseVersion:
         assert vg.parse_polytoken_version(out) == (0, 3, 3)
 
     def test_prerelease_suffix_stripped(self) -> None:
-        # 0.4.0-unstable.1 collapses to (0, 4, 0) for numeric comparison.
+        # A different-minor pre-release collapses numerically, and the *numeric*
+        # value is what the series check sees.
         assert vg.parse_polytoken_version("polytoken 0.4.0-unstable.1") == (0, 4, 0)
+
+    def test_prerelease_detected(self) -> None:
+        # output_is_prerelease flags the suffix so a same-line pre-release can be
+        # rejected even though it parses to the supported triple.
+        assert vg.output_is_prerelease("polytoken 0.3.3-unstable.1") is True
+        assert vg.output_is_prerelease("polytoken 0.3.3") is False
 
     def test_patch_within_series(self) -> None:
         assert vg.parse_polytoken_version("polytoken 0.3.7") == (0, 3, 7)
@@ -56,6 +63,12 @@ class TestCheckVersion:
         ok, msg = vg.check_polytoken_version(None)
         assert ok is False
         assert "could not determine" in msg
+
+    def test_prerelease_rejected(self) -> None:
+        # A same-line pre-release (parses to (0,3,3)) is still rejected.
+        ok, msg = vg.check_polytoken_version((0, 3, 3), is_prerelease=True)
+        assert ok is False
+        assert "pre-release" in msg
 
 
 class TestDetectVersion:

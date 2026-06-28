@@ -28,17 +28,22 @@ BRIDGE_POLYTOKEN_MIN_VERSION: tuple[int, int, int] = (0, 3, 3)
 # Human-readable expected version, for messages.
 BRIDGE_POLYTOKEN_VERSION = ".".join(str(n) for n in BRIDGE_POLYTOKEN_MIN_VERSION)
 
-# Parses `polytoken 0.3.3` and similar. Pre-release suffixes
-# (`-unstable.1`, `a1`, `.dev0`) are stripped before numeric comparison.
-_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# Anchored to the `polytoken` token so a dotted build date elsewhere in the
+# output can't be mis-parsed as the version. Captures the numeric triple only.
+_VERSION_RE = re.compile(r"polytoken\s+(\d+)\.(\d+)\.(\d+)")
+# A pre-release/unstable build carries a `-suffix` right after the triple.
+_PRERELEASE_RE = re.compile(r"polytoken\s+\d+\.\d+\.\d+-\S")
 
 
 def parse_polytoken_version(output: str) -> tuple[int, int, int] | None:
     """Parse a version from ``polytoken --version`` output.
 
-    Accepts lines like ``polytoken 0.3.3`` and extracts ``(major, minor, patch)``.
-    Returns ``None`` if no ``N.N.N`` triple is present. Pre-release suffixes are
-    ignored for comparison (``0.4.0-unstable.1`` -> ``(0, 4, 0)``).
+    Accepts lines like ``polytoken 0.3.3`` and extracts ``(major, minor, patch)``
+    (anchored to the ``polytoken`` token so build dates can't shadow it). Returns
+    ``None`` if no ``N.N.N`` triple follows ``polytoken``. Pre-release suffixes
+    are ignored for the *numeric* value — use :func:`output_is_prerelease` to
+    detect them, since a same-line pre-release (0.3.3-unstable.1) must be rejected
+    even though it parses to (0, 3, 3).
     """
     if not output:
         return None
@@ -46,6 +51,11 @@ def parse_polytoken_version(output: str) -> tuple[int, int, int] | None:
     if m is None:
         return None
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def output_is_prerelease(output: str) -> bool:
+    """True if the version line carries a pre-release/unstable suffix."""
+    return bool(_PRERELEASE_RE.search(output or ""))
 
 
 def detect_polytoken_version(binary: str = "polytoken", *, timeout: float = 5.0) -> tuple[int, int, int] | None:
@@ -65,13 +75,36 @@ def detect_polytoken_version(binary: str = "polytoken", *, timeout: float = 5.0)
     return parse_polytoken_version(result.stdout or result.stderr)
 
 
-def check_polytoken_version(version: tuple[int, int, int] | None) -> tuple[bool, str]:
+def detect_polytoken_version_detail(
+    binary: str = "polytoken", *, timeout: float = 5.0
+) -> tuple[tuple[int, int, int] | None, bool]:
+    """Run ``<binary> --version`` once and return ``(version, is_prerelease)``.
+
+    ``is_prerelease`` is True when the version carries a pre-release/unstable
+    suffix (e.g. ``0.3.3-unstable.1``). Callers should pass it to
+    :func:`check_polytoken_version` so same-line pre-releases are rejected.
+    """
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, timeout=timeout, text=True
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None, False
+    if result.returncode != 0:
+        return None, False
+    raw = result.stdout or result.stderr
+    return parse_polytoken_version(raw), output_is_prerelease(raw)
+
+
+def check_polytoken_version(
+    version: tuple[int, int, int] | None, *, is_prerelease: bool = False
+) -> tuple[bool, str]:
     """Return ``(ok, message)`` for ``version`` against the supported pin.
 
     ``ok`` is True only when the version is within the supported series at or
-    above the minimum. ``version=None`` (unparseable/missing) is treated as a
-    failure with a clear message. The message is suitable for doctor output and
-    log warnings either way.
+    above the minimum **and** not a pre-release/unstable build.
+    ``version=None`` (unparseable/missing) is treated as a failure with a clear
+    message. The message is suitable for doctor output and log warnings either way.
     """
     if version is None:
         return False, (
@@ -80,6 +113,11 @@ def check_polytoken_version(version: tuple[int, int, int] | None) -> tuple[bool,
             f"{BRIDGE_POLYTOKEN_SERIES[1]} line"
         )
     major, minor, patch = version
+    if is_prerelease:
+        return False, (
+            f"polytoken {major}.{minor}.{patch} is a pre-release/unstable build; "
+            f"the bridge requires a stable {BRIDGE_POLYTOKEN_VERSION}+ release"
+        )
     expected_major, expected_minor = BRIDGE_POLYTOKEN_SERIES
     if major != expected_major or minor != expected_minor:
         return False, (

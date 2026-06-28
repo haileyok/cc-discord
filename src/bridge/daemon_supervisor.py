@@ -12,6 +12,7 @@ is unit-testable without a real ``polytoken`` binary or daemon.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import shutil
@@ -40,28 +41,29 @@ _RESUME_POLL_INTERVAL_SECS = 0.5
 # Subprocess runner contract: (argv) -> (returncode, stdout, stderr).
 Runner = Callable[[list[str]], Awaitable[tuple[int, str, str]]]
 ClientFactory = Callable[[int], PolytokenClient]
-# Background launcher contract: (argv) -> pid | None. Launches a detached
+# Background launcher contract: (argv) -> Popen | None. Launches a detached
 # long-running process (the resumed daemon runs in the foreground, so it can't
-# use the self-terminating ``Runner``). Returns the pid or None on launch error.
-Launcher = Callable[[list[str]], "int | None"]
+# use the self-terminating ``Runner``). Returns the process handle so the caller
+# can clean it up on a discovery timeout, or None on launch error.
+Launcher = Callable[[list[str]], "subprocess.Popen[bytes] | subprocess.Popen[str] | None"]
 
 
-def _default_launcher(argv: list[str]) -> int | None:
-    """Launch ``argv`` as a detached background process and return its pid.
+def _default_launcher(argv: list[str]):
+    """Launch ``argv`` as a detached background process and return its ``Popen``.
 
     ``start_new_session=True`` detaches the daemon into its own session/process
     group so it survives a bridge restart (it registers in ``polytoken sessions``
     and is re-attached by reconcile). stdout/stderr are discarded — the port is
-    discovered via the session registry, not stdout parsing.
+    discovered via the session registry, not stdout parsing. Returns the Popen so
+    the caller can terminate it if it fails to register (no orphan).
     """
     try:
-        proc = subprocess.Popen(
+        return subprocess.Popen(
             argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return proc.pid
     except OSError as exc:
         log.warning("failed to launch resumed daemon %r: %s", argv[0], exc)
         return None
@@ -187,12 +189,12 @@ class DaemonSupervisor:
             "--listen",
             "127.0.0.1:0",
         ]
-        pid = self._launcher(argv)
-        if pid is None:
+        proc = self._launcher(argv)
+        if proc is None:
             raise DaemonSupervisorError(
                 f"failed to launch resumed daemon for session {session_id}"
             )
-        log.info("resume %s: launched pid %d, discovering port", session_id, pid)
+        log.info("resume %s: launched pid %d, discovering port", session_id, proc.pid)
 
         # Poll the registry until the resumed daemon registers with a port.
         deadline = time.monotonic() + discover_timeout
@@ -202,9 +204,16 @@ class DaemonSupervisor:
                 log.info("resume %s: registered on port %d", session_id, info.port)
                 return SpawnResult(session_id=session_id, port=info.port)
             await asyncio.sleep(_RESUME_POLL_INTERVAL_SECS)
+        # Discovery timed out: clean up the launched daemon so it can't orphan.
+        # Best-effort HTTP terminate (it may have registered late), then kill the
+        # process directly (it may never have registered).
+        with contextlib.suppress(Exception):
+            await self.terminate(session_id)
+        with contextlib.suppress(Exception):
+            proc.terminate()
         raise DaemonSupervisorError(
             f"resumed daemon for session {session_id} did not register in "
-            f"`polytoken sessions` within {discover_timeout:.0f}s"
+            f"`polytoken sessions` within {discover_timeout:.0f}s; cleaned up"
         )
 
     # -- registry ---------------------------------------------------------

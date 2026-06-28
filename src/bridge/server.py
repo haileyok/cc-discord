@@ -75,10 +75,10 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     # pinned series. The daemon HTTP/event contracts are verified against a
     # specific version; a mismatch can break the bridge silently. `doctor` is
     # the hard gate; here we warn (and surface the version) but still start.
-    from bridge.version_guard import check_polytoken_version, detect_polytoken_version
+    from bridge.version_guard import check_polytoken_version, detect_polytoken_version_detail
 
-    v = detect_polytoken_version(os.environ.get("POLYTOKEN_BIN", "polytoken"))
-    ok, msg = check_polytoken_version(v)
+    v, is_prerelease = detect_polytoken_version_detail(os.environ.get("POLYTOKEN_BIN", "polytoken"))
+    ok, msg = check_polytoken_version(v, is_prerelease=is_prerelease)
     if ok:
         logger.info("polytoken version check: %s", msg)
     else:

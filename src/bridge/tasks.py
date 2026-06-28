@@ -1242,6 +1242,12 @@ class TaskRegistry:
         task = self.get_by_task_id(task_id)
         if task is None:
             raise TaskNotFound(task_id)
+        # A still-running, non-torn-down task is already live — resume is a no-op.
+        # Short-circuit before swapping the translator (a live consumer holds its
+        # own reference; replacing the dict entry would silently diverge them).
+        if task.status == "running" and task.task_id not in self._torn_down:
+            logger.info("restart %s: already running, no-op", task_id[:8])
+            return task
         sid = task.polytoken_session_id
         if not sid:
             raise TaskRestartError(
@@ -1263,6 +1269,11 @@ class TaskRegistry:
         # Re-index (teardown removed the thread/session lookups) and re-bind.
         await self._index(task)
         await self._persist(task)
+        # Un-archive the thread: /stop and /kill archived it; the resumed stream
+        # needs an open thread to post into.
+        if self._bot is not None:
+            with contextlib.suppress(Exception):
+                await self._bot.unarchive_thread(task.thread_id)
         # Fresh translator: the resumed daemon's event stream restarts its seq
         # baseline, so a stale last_seq would falsely trigger a Reconcile.
         self._translators[task.task_id] = Translator()

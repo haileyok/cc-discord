@@ -219,7 +219,7 @@ def doctor() -> None:
     from bridge.version_guard import (
         BRIDGE_POLYTOKEN_VERSION,
         check_polytoken_version,
-        detect_polytoken_version,
+        detect_polytoken_version_detail,
     )
 
     binary = _polytoken_bin()
@@ -228,8 +228,8 @@ def doctor() -> None:
         click.echo(f"[fail] polytoken CLI — `{binary}` not found on PATH", err=True)
         failed = True
     else:
-        version = detect_polytoken_version(binary)
-        ok, msg = check_polytoken_version(version)
+        version, is_prerelease = detect_polytoken_version_detail(binary)
+        ok, msg = check_polytoken_version(version, is_prerelease=is_prerelease)
         if ok:
             click.echo(f"[ok] polytoken CLI — {resolved} ({msg})")
         else:

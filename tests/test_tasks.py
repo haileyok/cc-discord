@@ -376,6 +376,19 @@ class TestRestart:
         with pytest.raises(TaskNotFound):
             await reg.restart_task("nope")
 
+    async def test_restart_running_task_is_noop(self, in_memory_db) -> None:
+        # Restarting a still-running task must not swap its translator or relaunch.
+        reg, _, sup = _make_registry(in_memory_db)
+        task, _ = await _bind_running_task(reg)
+        old_port = task.port
+        existing_tr = events.Translator()
+        reg._translators[task.task_id] = existing_tr
+        result = await reg.restart_task(task.task_id)
+        assert result is task
+        assert task.port == old_port  # no port change
+        assert sup.resume_calls == []  # no relaunch
+        assert reg._translators[task.task_id] is existing_tr  # translator untouched
+
 
 class TestReconcileAction:
     async def test_reconcile_posts_notice_and_resyncs(self, in_memory_db) -> None:

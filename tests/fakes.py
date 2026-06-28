@@ -105,6 +105,9 @@ class FakeBot:
     async def archive_thread(self, thread_id: int) -> None:
         self._archive_calls.append({"thread_id": thread_id})
 
+    async def unarchive_thread(self, thread_id: int) -> None:
+        self._thread_calls.append({"unarchive": thread_id})
+
     async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
         self._reaction_calls.append({"message_id": message_id, "thread_id": thread_id, "emoji": emoji})
 
