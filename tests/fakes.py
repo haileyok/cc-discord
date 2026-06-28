@@ -1,4 +1,4 @@
-"""Shared test fixtures for FakeBot and FakeZellij."""
+"""Shared test fakes for FakeBot, FakeSupervisor, and FakePolytokenClient."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ from typing import Any
 
 @dataclass
 class FakeTypingContext:
-    """Fake typing context manager."""
-
     entered: bool = False
     exited: bool = False
 
@@ -23,34 +21,25 @@ class FakeTypingContext:
 
 @dataclass
 class FakeBotChannel:
-    """Fake channel object from bot."""
-
     id: int = 1000
     typing_context: FakeTypingContext = field(default_factory=FakeTypingContext)
 
     def typing(self) -> FakeTypingContext:
-        """Return a fake typing context manager."""
         return self.typing_context
 
 
 @dataclass
 class FakeHTTP:
-    """Fake discord.http.HTTPClient."""
-
     pass
 
 
 @dataclass
 class FakeConnection:
-    """Fake discord.gateway.DiscordWebSocket state."""
-
     _command_tree: Any = None
 
 
 @dataclass
 class FakeClient:
-    """Fake discord.Client with minimal attributes needed for CommandTree."""
-
     http: FakeHTTP = field(default_factory=FakeHTTP)
     _connection: FakeConnection = field(default_factory=FakeConnection)
 
@@ -65,8 +54,14 @@ class FakeBot:
     _channel_calls: list[dict] = field(default_factory=list)
     _archive_calls: list[dict] = field(default_factory=list)
     _reaction_calls: list[dict] = field(default_factory=list)
+    _embed_calls: list[dict] = field(default_factory=list)
+    _edit_calls: list[dict] = field(default_factory=list)
+    _rename_calls: list[dict] = field(default_factory=list)
+    _attachment_calls: list[dict] = field(default_factory=list)
     _fake_channels: dict[int, FakeBotChannel] = field(default_factory=dict)
+    _next_embed_id: int = 5000
     is_ready: bool = True
+    channel_id: int = 12345
 
     @property
     def client(self) -> Any:
@@ -77,32 +72,43 @@ class FakeBot:
         return FakeBotChannel()
 
     async def post(self, content: str, *, thread_id: int | None = None) -> list[int]:
-        """Fake post: record the call, return a fake message ID."""
         self._post_calls.append({"content": content, "thread_id": thread_id})
         return [1001]
 
+    async def post_with_attachments(
+        self, file_paths: list[str], *, thread_id: int | None = None, text: str | None = None
+    ) -> list[int]:
+        self._attachment_calls.append({"files": file_paths, "thread_id": thread_id, "text": text})
+        return [1002]
+
+    async def post_embed(self, embed: Any, *, thread_id: int | None = None) -> int:
+        self._next_embed_id += 1
+        self._embed_calls.append({"embed": embed, "thread_id": thread_id, "id": self._next_embed_id})
+        return self._next_embed_id
+
+    async def edit_message(self, thread_id: int, message_id: int, *, content=None, embed=None) -> None:
+        self._edit_calls.append({"thread_id": thread_id, "message_id": message_id, "embed": embed})
+
+    async def rename_thread(self, thread_id: int, name: str) -> None:
+        self._rename_calls.append({"thread_id": thread_id, "name": name})
+
     async def create_thread(self, name: str) -> int:
-        """Fake create_thread: record the call, return a fake thread ID."""
         thread_id = 2000 + len(self._thread_calls)
         self._thread_calls.append({"name": name})
         return thread_id
 
     async def create_channel(self, name: str) -> int:
-        """Fake create_channel: record the call, return a fake channel ID."""
         channel_id = 3000 + len(self._channel_calls)
         self._channel_calls.append({"name": name})
         return channel_id
 
     async def archive_thread(self, thread_id: int) -> None:
-        """Fake archive_thread: record the call."""
         self._archive_calls.append({"thread_id": thread_id})
 
     async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
-        """Fake add_reactions: record the call."""
         self._reaction_calls.append({"message_id": message_id, "thread_id": thread_id, "emoji": emoji})
 
     async def fetch_messageable(self, thread_id: int) -> FakeBotChannel:
-        """Fake fetch_messageable: return a FakeBotChannel."""
         if thread_id not in self._fake_channels:
             self._fake_channels[thread_id] = FakeBotChannel(id=thread_id)
         return self._fake_channels[thread_id]
@@ -116,42 +122,125 @@ class FakeBot:
     def get_archive_calls(self) -> list[dict]:
         return self._archive_calls
 
-    def get_reaction_calls(self) -> list[dict]:
-        return self._reaction_calls
+
+@dataclass
+class _SpawnResult:
+    session_id: str
+    port: int
 
 
 @dataclass
-class FakeZellij:
-    """Minimal fake ZellijManager for testing."""
+class _SessionInfo:
+    session_id: str
+    port: int
+    pid: int = 1234
+    started_at: str = "2026-06-15T00:00:00Z"
+    project_path: str = "/tmp"
+
+
+@dataclass
+class FakeSupervisor:
+    """Fake DaemonSupervisor: deterministic spawn + a controllable session registry."""
 
     _spawn_calls: list[dict] = field(default_factory=list)
-    _write_calls: list[dict] = field(default_factory=list)
-    _close_calls: list[dict] = field(default_factory=list)
-    _send_keys_calls: list[dict] = field(default_factory=list)
+    _next_port: int = 40000
+    _seq: int = 0
+    fail_spawn: bool = False
+    sessions: list[_SessionInfo] = field(default_factory=list)
+    terminated: list[str] = field(default_factory=list)
+    models: list[str] = field(default_factory=list)
+    fail_list: bool = False
 
-    async def spawn_task(
-        self, cwd: str, pane_name: str, layout_path: str
-    ) -> str:
-        """Fake spawn_task. The new contract takes a layout file path
-        instead of env+extra_argv (env vars and claude argv now live in
-        the layout)."""
-        self._spawn_calls.append(
-            {"cwd": cwd, "pane_name": pane_name, "layout_path": layout_path}
-        )
-        return "terminal_1"
+    async def spawn(self, cwd: str, *, config_dir: str | None = None) -> _SpawnResult:
+        if self.fail_spawn:
+            from bridge.daemon_supervisor import DaemonSupervisorError
 
-    async def write_to_pane(self, pane_id: str, text: str) -> None:
-        """Fake write_to_pane."""
-        self._write_calls.append({"pane_id": pane_id, "text": text})
+            raise DaemonSupervisorError("boom")
+        self._seq += 1
+        self._next_port += 1
+        sid = f"sess-{self._seq}"
+        self._spawn_calls.append({"cwd": cwd, "session_id": sid, "port": self._next_port})
+        self.sessions.append(_SessionInfo(sid, self._next_port, project_path=cwd))
+        return _SpawnResult(sid, self._next_port)
 
-    async def send_keys(self, pane_id: str, *byte_vals: int) -> None:
-        """Fake send_keys."""
-        self._send_keys_calls.append({"pane_id": pane_id, "bytes": list(byte_vals)})
+    def _maybe_fail(self):
+        if self.fail_list:
+            from bridge.daemon_supervisor import DaemonSupervisorError
 
-    async def close_pane(self, pane_id: str) -> None:
-        """Fake close_pane."""
-        self._close_calls.append({"pane_id": pane_id})
+            raise DaemonSupervisorError("registry listing failed")
 
-    async def list_panes(self) -> list[dict]:
-        """Fake list_panes."""
-        return []
+    async def list_sessions(self) -> list[_SessionInfo]:
+        self._maybe_fail()
+        return list(self.sessions)
+
+    async def find_session(self, session_id: str):
+        self._maybe_fail()
+        for s in self.sessions:
+            if s.session_id == session_id:
+                return s
+        return None
+
+    async def list_models(self) -> list[str]:
+        return list(self.models) or ["anthropic/claude-opus-4-8", "openai/gpt-5.5"]
+
+    async def terminate(self, session_id: str) -> bool:
+        self.terminated.append(session_id)
+        return True
+
+
+@dataclass
+class FakePolytokenClient:
+    """Fake PolytokenClient injected into TaskRegistry._clients for routing tests."""
+
+    port: int = 40001
+    prompts: list[str] = field(default_factory=list)
+    cancelled: int = 0
+    terminated: int = 0
+    interrogative_responses: list[dict] = field(default_factory=list)
+    model_calls: list[dict] = field(default_factory=list)
+    facet_calls: list[str] = field(default_factory=list)
+    terminate_error_status: int | None = None
+    state_payload: dict = field(default_factory=lambda: {
+        "active_model": "anthropic/claude-opus-4-8",
+        "active_facet": "execute",
+        "active_reasoning_effort": "high",
+        "available_skills": ["brainstorming", "code-review"],
+        "session_title": "fake-title",
+        "todos": [],
+    })
+    closed: bool = False
+
+    async def prompt(self, content: str, *, max_tool_turns=None):
+        self.prompts.append(content)
+
+        class _Accepted:
+            prompt_id = "p"
+            session_id = "s"
+            resolved_references: list = []
+
+        return _Accepted()
+
+    async def state(self) -> dict:
+        return dict(self.state_payload)
+
+    async def cancel_turn(self):
+        self.cancelled += 1
+
+    async def terminate(self):
+        if self.terminate_error_status is not None:
+            from bridge.polytoken_client import PolytokenClientError
+
+            raise PolytokenClientError("rejected", status=self.terminate_error_status)
+        self.terminated += 1
+
+    async def set_model(self, model: str, *, reasoning_effort=None):
+        self.model_calls.append({"model": model, "reasoning_effort": reasoning_effort})
+
+    async def set_facet(self, facet: str):
+        self.facet_calls.append(facet)
+
+    async def respond_interrogative(self, interrogative_id: str, response: dict):
+        self.interrogative_responses.append({"id": interrogative_id, "response": response})
+
+    async def aclose(self):
+        self.closed = True

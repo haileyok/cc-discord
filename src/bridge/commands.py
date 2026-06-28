@@ -3,7 +3,6 @@
 Registered guild-scoped (instant sync). Bot must finish on_ready before sync runs.
 """
 
-import asyncio
 import logging
 import re
 from datetime import datetime, timezone
@@ -16,7 +15,6 @@ from bridge import skills, usage
 from bridge.bot import Bot, BotMissingPermission
 from bridge.projects import Project
 from bridge.tasks import (
-    SPAWN_BIND_TIMEOUT_SECS,
     Task,
     TaskNotFound,
     TaskRegistry,
@@ -26,11 +24,13 @@ from bridge.tasks import (
 
 logger = logging.getLogger(__name__)
 
+# Reasoning-effort levels accepted by `/effort`. The daemon validates the level
+# against the active model's capabilities and falls back gracefully.
+_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "none"]
+
 
 class _NotInTaskThread(Exception):
     """Raised when a thread-context command is used outside a task thread."""
-
-    pass
 
 
 def build_tree(
@@ -38,25 +38,17 @@ def build_tree(
     registry: TaskRegistry,
     projects: list[Project] | None = None,
 ) -> app_commands.CommandTree:
-    """Construct and return the CommandTree (not yet synced; caller decides when).
-
-    `projects` is the cached list of spawnable projects enumerated from
-    BRIDGE_PROJECT_ROOTS at startup. When None or empty, /spawn still
-    registers but reports that no roots are configured.
-    """
+    """Construct and return the CommandTree (not yet synced; caller decides when)."""
     tree = app_commands.CommandTree(bot.client)
     projects_list: list[Project] = list(projects or [])
-    # Key used as the slash command choice value: `{root_label}/{name}`.
-    # Bounded well under Discord's 100-char value limit and unique enough
-    # to disambiguate same-named folders across roots.
     projects_by_key: dict[str, Project] = {
         f"{p.root_label}/{p.name}": p for p in projects_list
     }
 
-    @tree.command(name="start", description="Start a new Claude task in a fresh thread")
+    @tree.command(name="start", description="Start a new Polytoken task in a fresh thread")
     @app_commands.describe(
         cwd="Working directory the task should run in (must exist)",
-        prompt="Optional first message to send after the task is bound",
+        prompt="Optional first message to send to the new session",
     )
     async def start(
         interaction: discord.Interaction,
@@ -65,24 +57,12 @@ def build_tree(
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
-            task = await registry.spawn_task(cwd=cwd, prompt=None)  # prompt handled below
+            task = await registry.spawn_task(cwd=cwd, prompt=None)
         except TaskSpawnError as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-
-        # If a prompt was provided, wait for SessionStart to bind, then write it.
         if prompt:
-            try:
-                await _wait_for_session_bind(
-                    registry, task.task_id, timeout=SPAWN_BIND_TIMEOUT_SECS
-                )
-                await registry.write_initial_prompt(task.task_id, prompt)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "task %s did not bind within %.0fs",
-                    task.task_id, SPAWN_BIND_TIMEOUT_SECS,
-                )
-
+            await registry.write_initial_prompt(task.task_id, prompt)
         thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
         await interaction.followup.send(
             f"✅ Started task `{task.task_id[:8]}` → <#{task.thread_id}> ({thread_url})",
@@ -98,20 +78,18 @@ def build_tree(
             if cur and cur not in proj.name.lower() and cur not in proj.root_label.lower():
                 continue
             label = f"{proj.name} — {proj.root_label}"
-            out.append(
-                app_commands.Choice(name=label[:100], value=key[:100])
-            )
+            out.append(app_commands.Choice(name=label[:100], value=key[:100]))
             if len(out) >= 25:
                 break
         return out
 
     @tree.command(
         name="spawn",
-        description="Spawn a Claude task in a configured project folder (see BRIDGE_PROJECT_ROOTS)",
+        description="Spawn a Polytoken task in a configured project folder (see BRIDGE_PROJECT_ROOTS)",
     )
     @app_commands.describe(
         project="Project folder (autocomplete shows immediate subfolders of BRIDGE_PROJECT_ROOTS)",
-        prompt="Optional first message to send after the task is bound",
+        prompt="Optional first message to send to the new session",
     )
     @app_commands.autocomplete(project=_project_autocomplete)
     async def spawn(
@@ -139,19 +117,8 @@ def build_tree(
         except TaskSpawnError as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-
         if prompt:
-            try:
-                await _wait_for_session_bind(
-                    registry, task.task_id, timeout=SPAWN_BIND_TIMEOUT_SECS
-                )
-                await registry.write_initial_prompt(task.task_id, prompt)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "task %s did not bind within %.0fs",
-                    task.task_id, SPAWN_BIND_TIMEOUT_SECS,
-                )
-
+            await registry.write_initial_prompt(task.task_id, prompt)
         thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
         await interaction.followup.send(
             f"✅ Started task `{task.task_id[:8]}` in `{proj.name}` "
@@ -174,7 +141,7 @@ def build_tree(
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    @tree.command(name="stop", description="Gracefully stop a task")
+    @tree.command(name="stop", description="Stop a task (cancels any turn and terminates the daemon)")
     @app_commands.describe(thread="Thread to stop (defaults to invocation thread)")
     async def stop(
         interaction: discord.Interaction,
@@ -195,11 +162,12 @@ def build_tree(
             await interaction.followup.send(f"✅ Stopped `{task.task_id[:8]}`", ephemeral=True)
         else:
             await interaction.followup.send(
-                f"⚠️ Stop timed out for `{task.task_id[:8]}`. Use `/kill` to force.",
+                f"⚠️ Couldn't terminate `{task.task_id[:8]}` — the daemon rejected it and is "
+                "still running. The task stays active; see the thread for details.",
                 ephemeral=True,
             )
 
-    @tree.command(name="kill", description="Immediately kill a task (close its pane)")
+    @tree.command(name="kill", description="Immediately terminate a task's daemon")
     @app_commands.describe(thread="Thread to kill (defaults to invocation thread)")
     async def kill(
         interaction: discord.Interaction,
@@ -212,13 +180,20 @@ def build_tree(
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         try:
-            await registry.kill_task(task.task_id)
+            killed = await registry.kill_task(task.task_id)
         except TaskNotFound:
             await interaction.followup.send("❌ Task not found", ephemeral=True)
             return
-        await interaction.followup.send(f"💥 Killed `{task.task_id[:8]}`", ephemeral=True)
+        if killed:
+            await interaction.followup.send(f"💥 Killed `{task.task_id[:8]}`", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"⚠️ Couldn't terminate `{task.task_id[:8]}` — the daemon rejected it and is "
+                "still running. Check `polytoken sessions` and terminate it manually.",
+                ephemeral=True,
+            )
 
-    @tree.command(name="restart", description="Restart a task with --resume")
+    @tree.command(name="restart", description="(Unsupported with the daemon backend)")
     @app_commands.describe(thread="Thread to restart (defaults to invocation thread)")
     async def restart(
         interaction: discord.Interaction,
@@ -241,26 +216,27 @@ def build_tree(
         interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         cur = current.lower()
+        names: list[str] = []
+        # Prefer the live session's available skills when inside a task thread.
+        task = registry.get_by_thread_id(interaction.channel_id or 0)
+        if task is not None:
+            state = await registry.get_state(task.task_id)
+            if state:
+                names = [s for s in (state.get("available_skills") or []) if isinstance(s, str)]
+        if not names:
+            names = [s.name for s in skills.list_skills()]
         out: list[app_commands.Choice[str]] = []
-        for s in skills.list_skills():
-            if cur and cur not in s.name.lower() and not (
-                s.description and cur in s.description.lower()
-            ):
+        for name in names:
+            if cur and cur not in name.lower():
                 continue
-            label = s.name
-            if s.description:
-                label = f"{s.name} — {s.description}"
-            # Discord limits both the displayed name and submitted value to 100 chars.
-            out.append(
-                app_commands.Choice(name=label[:100], value=s.name[:100])
-            )
+            out.append(app_commands.Choice(name=name[:100], value=name[:100]))
             if len(out) >= 25:
                 break
         return out
 
-    @tree.command(name="skill", description="Invoke a Claude Code skill in the task's session")
+    @tree.command(name="skill", description="Invoke a skill in the task's session")
     @app_commands.describe(
-        name="Skill name (autocomplete shows available skills + their descriptions)",
+        name="Skill name (autocomplete shows the session's available skills)",
         args="Optional arguments to pass after the skill name",
     )
     @app_commands.autocomplete(name=_skill_autocomplete)
@@ -280,16 +256,106 @@ def build_tree(
         except (TaskNotFound, TaskSpawnError) as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-        rendered = f"/{name}" + (f" {args}" if args else "")
+        rendered = f"@{name}" + (f" {args}" if args else "")
         await interaction.followup.send(
             f"✅ Sent `{rendered}` to `{task.task_id[:8]}`", ephemeral=True
         )
 
+    @tree.command(name="effort", description="Change the session's reasoning effort level")
+    @app_commands.describe(level="Reasoning effort (the daemon falls back if the model lacks the level)")
+    @app_commands.choices(
+        level=[app_commands.Choice(name=lvl, value=lvl) for lvl in _EFFORT_LEVELS]
+    )
+    async def effort_cmd(
+        interaction: discord.Interaction,
+        level: app_commands.Choice[str],
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        try:
+            await registry.set_effort(task.task_id, level.value)
+        except (TaskNotFound, TaskSpawnError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"⚙️ Set effort to `{level.value}` for `{task.task_id[:8]}`", ephemeral=True
+        )
+
+    _models_cache: list[str] = []
+
+    async def _model_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if not _models_cache:
+            _models_cache.extend(await registry.list_models())
+        cur = current.lower()
+        out: list[app_commands.Choice[str]] = []
+        for name in _models_cache:
+            if cur and cur not in name.lower():
+                continue
+            out.append(app_commands.Choice(name=name[:100], value=name[:100]))
+            if len(out) >= 25:
+                break
+        return out
+
+    @tree.command(name="model", description="Switch the session's active model")
+    @app_commands.describe(
+        name="Model registry key (autocomplete shows configured models)",
+        effort="Optional reasoning effort to apply with the switch",
+    )
+    @app_commands.autocomplete(name=_model_autocomplete)
+    @app_commands.choices(
+        effort=[app_commands.Choice(name=lvl, value=lvl) for lvl in _EFFORT_LEVELS]
+    )
+    async def model_cmd(
+        interaction: discord.Interaction,
+        name: str,
+        effort: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        eff = effort.value if effort is not None else None
+        try:
+            await registry.set_model(task.task_id, name, reasoning_effort=eff)
+        except (TaskNotFound, TaskSpawnError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        suffix = f" (effort `{eff}`)" if eff else ""
+        await interaction.followup.send(
+            f"🔧 Switched `{task.task_id[:8]}` to `{name}`{suffix}", ephemeral=True
+        )
+
+    @tree.command(name="facet", description="Switch the session's active facet")
+    @app_commands.describe(facet="Facet name (the daemon validates it and rejects unknowns)")
+    async def facet_cmd(interaction: discord.Interaction, facet: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            task = _resolve_task(registry, interaction, None)
+        except _NotInTaskThread as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        try:
+            await registry.set_facet(task.task_id, facet)
+        except (TaskNotFound, TaskSpawnError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"🎭 Switched `{task.task_id[:8]}` to facet `{facet}`", ephemeral=True
+        )
+
     @tree.command(
         name="rename",
-        description="Rename the task's thread (omit name to auto-generate via claude -p)",
+        description="Rename the task's thread (omit name to use the daemon's session title)",
     )
-    @app_commands.describe(name="New thread name; omit to auto-generate")
+    @app_commands.describe(name="New thread name; omit to use the daemon's auto-generated title")
     async def rename_cmd(
         interaction: discord.Interaction,
         name: str | None = None,
@@ -302,22 +368,15 @@ def build_tree(
             return
 
         if name is None:
-            try:
-                generated = await registry.generate_thread_name(task.task_id)
-            except Exception as e:
-                await interaction.followup.send(
-                    f"❌ Generation failed: {e}", ephemeral=True
-                )
-                return
+            generated = await registry.generate_thread_name(task.task_id)
             if not generated:
                 await interaction.followup.send(
-                    "❌ Couldn't auto-generate (no transcript yet, or claude -p errored). Pass a name explicitly.",
+                    "❌ The daemon hasn't titled this session yet. Pass a name explicitly.",
                     ephemeral=True,
                 )
                 return
             name = generated
 
-        # Discord thread names: 1–100 chars, no newlines.
         cleaned = " ".join(name.split())[:100]
         if not cleaned:
             await interaction.followup.send("❌ Empty name.", ephemeral=True)
@@ -325,13 +384,11 @@ def build_tree(
         try:
             await bot.rename_thread(task.thread_id, cleaned)
         except Exception as e:
-            await interaction.followup.send(
-                f"❌ Rename failed: {e}", ephemeral=True
-            )
+            await interaction.followup.send(f"❌ Rename failed: {e}", ephemeral=True)
             return
         await interaction.followup.send(f"✏️ Renamed to `{cleaned}`", ephemeral=True)
 
-    @tree.command(name="stats", description="Show model / token / cost stats for a task")
+    @tree.command(name="stats", description="Show model / context-usage stats for a task")
     @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
     async def stats_cmd(
         interaction: discord.Interaction,
@@ -343,24 +400,15 @@ def build_tree(
         except _NotInTaskThread as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-        if not task.current_transcript_path:
+        state = await registry.get_state(task.task_id)
+        if state is None:
             await interaction.followup.send(
-                "❌ Task has no transcript yet — wait for the first turn.",
-                ephemeral=True,
+                "❌ Couldn't reach the task's daemon for stats.", ephemeral=True
             )
             return
-        stats = usage.compute_stats(Path(task.current_transcript_path))
-        if stats is None:
-            await interaction.followup.send(
-                "❌ No usage data in transcript yet.", ephemeral=True
-            )
-            return
-        await interaction.followup.send(usage.format_summary(stats), ephemeral=True)
+        await interaction.followup.send(usage.format_state_summary(state), ephemeral=True)
 
-    @tree.command(
-        name="tasks",
-        description="Show claude's current session task list (mirrored by the bridge)",
-    )
+    @tree.command(name="tasks", description="Show the session's todo list")
     @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
     async def tasks_cmd(
         interaction: discord.Interaction,
@@ -372,19 +420,16 @@ def build_tree(
         except _NotInTaskThread as e:
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
-        if not task.task_list_state:
-            await interaction.followup.send(
-                "ℹ No tasks tracked yet — claude hasn't called TaskCreate "
-                "in this session (or the daemon was restarted since the last call).",
-                ephemeral=True,
-            )
+        state = await registry.get_state(task.task_id)
+        todos = (state or {}).get("todos") or []
+        if not todos:
+            await interaction.followup.send("ℹ No todos tracked in this session yet.", ephemeral=True)
             return
-        embed = registry._render_task_list_embed(task)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(_format_todos(todos), ephemeral=True)
 
     @tree.command(
         name="pin",
-        description="Create a Discord channel bound to a project; messages auto-spawn a Claude session",
+        description="Create a Discord channel bound to a project; messages auto-spawn a session",
     )
     @app_commands.describe(
         name="Optional channel name (default: cwd basename, normalized)",
@@ -400,9 +445,6 @@ def build_tree(
         project: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
-
-        # cwd source: inherit from task thread if invoked inside one; otherwise
-        # require an explicit project pick.
         existing_task = registry.get_by_thread_id(interaction.channel_id or 0)
         if existing_task is not None:
             cwd = existing_task.cwd
@@ -440,9 +482,7 @@ def build_tree(
             await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         except Exception as e:
-            await interaction.followup.send(
-                f"❌ Channel creation failed: {e}", ephemeral=True
-            )
+            await interaction.followup.send(f"❌ Channel creation failed: {e}", ephemeral=True)
             return
 
         try:
@@ -453,7 +493,7 @@ def build_tree(
 
         await interaction.followup.send(
             f"📌 Pinned <#{channel_id}> → `{cwd}` ({source}). "
-            "Send a message in that channel to wake a Claude session.",
+            "Send a message in that channel to wake a session.",
             ephemeral=True,
         )
 
@@ -471,9 +511,7 @@ def build_tree(
                 ephemeral=True,
             )
         else:
-            await interaction.followup.send(
-                "ℹ This channel isn't pinned.", ephemeral=True
-            )
+            await interaction.followup.send("ℹ This channel isn't pinned.", ephemeral=True)
 
     return tree
 
@@ -494,19 +532,24 @@ def _resolve_task(
     return task
 
 
+def _format_todos(todos: list) -> str:
+    lines = ["**Session todos:**"]
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        status = t.get("status") or ""
+        content = t.get("content") or t.get("activeForm") or ""
+        mark = {"completed": "✅", "in_progress": "▶️"}.get(status, "⬜")
+        lines.append(f"{mark} {content}")
+    return "\n".join(lines)[:1900]
+
+
 _CHANNEL_NAME_INVALID = re.compile(r"[^a-z0-9_-]+")
 _CHANNEL_NAME_COLLAPSE = re.compile(r"-+")
 
 
 def _sanitize_channel_name(name: str) -> str:
-    """Coerce a string into a Discord text-channel-name-safe form.
-
-    Discord text channels are 1–100 chars, lowercase letters/digits/`-`/`_`.
-    Discord auto-normalizes on create, but doing it client-side surfaces a
-    helpful error earlier and keeps the visible channel name stable.
-    Returns a non-empty string; falls back to `cc-pin` if normalization
-    collapses to empty.
-    """
+    """Coerce a string into a Discord text-channel-name-safe form."""
     cleaned = _CHANNEL_NAME_INVALID.sub("-", name.lower())
     cleaned = _CHANNEL_NAME_COLLAPSE.sub("-", cleaned).strip("-")
     return cleaned[:100] or "cc-pin"
@@ -522,19 +565,3 @@ def _humanize_age(epoch: int) -> str:
     if delta < 86400:
         return f"{int(delta // 3600)}h ago"
     return f"{int(delta // 86400)}d ago"
-
-
-async def _wait_for_session_bind(
-    registry: TaskRegistry, task_id: str, *, timeout: float
-) -> None:
-    """Poll until task.current_claude_session_id is set or timeout.
-
-    Raises asyncio.TimeoutError if the session doesn't bind within timeout seconds.
-    """
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        task = registry.get_by_task_id(task_id)
-        if task is not None and task.current_claude_session_id is not None:
-            return
-        await asyncio.sleep(0.1)
-    raise asyncio.TimeoutError()
