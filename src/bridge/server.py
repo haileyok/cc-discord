@@ -102,6 +102,15 @@ async def _handle_notify(request: web.Request) -> web.Response:
         return web.Response(status=200, text='{"status":"suppressed"}',
                             content_type="application/json")
 
+    # Suppress for non-interactive sessions (subagents, exec, background daemons).
+    # Their activity is rendered inline through the parent session's event stream,
+    # and a "waiting for input" ping is meaningless for a session that can't
+    # accept input.
+    ni = request.headers.get("X-Polytoken-Non-Interactive", "").strip().lower()
+    if ni and ni not in ("0", "false", "no", "off"):
+        return web.Response(status=200, text='{"status":"suppressed_non_interactive"}',
+                            content_type="application/json")
+
     summary = _summarize_notify(event, session_id, project, body)
     mention = registry.notify_mention_prefix()
     try:

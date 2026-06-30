@@ -2,6 +2,7 @@
 
 import json
 
+import pytest
 from aiohttp import test_utils
 
 from bridge.server import build_app, make_message_dispatcher
@@ -119,6 +120,96 @@ class TestNotify:
             assert resp.status == 200
             assert "suppressed" in await resp.text()
             assert bot._post_calls == []
+
+    async def test_non_interactive_stop_suppressed(self) -> None:
+        # A stop event for a non-interactive session → suppress (no ping).
+        bot = FakeBot()
+        reg = _NotifyRegistry(known_sessions=())
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={},
+                headers={
+                    "X-Polytoken-Event": "stop",
+                    "X-Polytoken-Session": "sess-sub",
+                    "X-Polytoken-Non-Interactive": "true",
+                },
+            )
+            assert resp.status == 200
+            assert "suppressed_non_interactive" in await resp.text()
+            assert bot._post_calls == []
+
+    async def test_non_interactive_notification_suppressed(self) -> None:
+        # A notification event for a non-interactive session → suppress.
+        bot = FakeBot()
+        reg = _NotifyRegistry(known_sessions=())
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={"summary": "job completed"},
+                headers={
+                    "X-Polytoken-Event": "notification",
+                    "X-Polytoken-Session": "sess-sub",
+                    "X-Polytoken-Non-Interactive": "true",
+                },
+            )
+            assert resp.status == 200
+            assert "suppressed_non_interactive" in await resp.text()
+            assert bot._post_calls == []
+
+    @pytest.mark.parametrize(
+        "header_value,should_suppress",
+        [
+            # Truthy → suppressed
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("True", True),
+            ("TRUE", True),
+            # Falsy → posts normally
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            ("", False),
+        ],
+    )
+    async def test_non_interactive_values(self, header_value: str, should_suppress: bool) -> None:
+        bot = FakeBot()
+        reg = _NotifyRegistry(mention="<@111> ")
+        client = await self._client(bot, reg)
+        headers = {
+            "X-Polytoken-Event": "stop",
+            "X-Polytoken-Session": "sess-x",
+        }
+        if header_value is not None:
+            headers["X-Polytoken-Non-Interactive"] = header_value
+        async with client:
+            resp = await client.post("/v1/notify", json={}, headers=headers)
+            assert resp.status == 200
+            if should_suppress:
+                assert "suppressed_non_interactive" in await resp.text()
+                assert bot._post_calls == []
+            else:
+                assert "posted" in await resp.text()
+                assert len(bot._post_calls) == 1
+
+    async def test_non_interactive_missing_header_posts(self) -> None:
+        # No X-Polytoken-Non-Interactive header at all → posts normally.
+        bot = FakeBot()
+        reg = _NotifyRegistry(mention="<@111> ")
+        client = await self._client(bot, reg)
+        async with client:
+            resp = await client.post(
+                "/v1/notify",
+                json={},
+                headers={"X-Polytoken-Event": "stop", "X-Polytoken-Session": "sess-x"},
+            )
+            assert resp.status == 200
+            assert "posted" in await resp.text()
+            assert len(bot._post_calls) == 1
 
 
 class TestDispatcher:
