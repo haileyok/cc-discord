@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -14,11 +15,16 @@ from pathlib import Path
 
 import click
 
-import bridge
 from bridge.bot import Bot
-from bridge.secrets import SECRETS_FILE, SecretsError, load_secrets, write_secrets, Secrets, secrets_file_perms
+from bridge.secrets import (
+    SECRETS_FILE,
+    Secrets,
+    SecretsError,
+    load_secrets,
+    secrets_file_perms,
+    write_secrets,
+)
 from bridge.server import serve as serve_server
-from bridge.zellij import SESSION_NAME as ZELLIJ_SESSION_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +41,12 @@ async def _validate_token_and_post_test(secrets: Secrets) -> bool:
     bot = Bot(secrets.bot_token, secrets.channel_id)
     try:
         await bot.start()
-
-        # Wait up to _TOKEN_VALIDATION_TIMEOUT seconds for bot to become ready
         start_time = asyncio.get_running_loop().time()
         while asyncio.get_running_loop().time() - start_time < _TOKEN_VALIDATION_TIMEOUT:
             if bot.is_ready:
-                # Post confirmation message to channel root (no thread)
                 await bot.post("✅ claude-discord-bridge init succeeded — you'll see future notifications here.")
                 return True
             await asyncio.sleep(0.1)
-
-        # Timeout reached
         return False
     finally:
         await bot.close()
@@ -53,7 +54,7 @@ async def _validate_token_and_post_test(secrets: Secrets) -> bool:
 
 @click.group()
 def cli() -> None:
-    """Claude Code <-> Discord bridge daemon."""
+    """Polytoken <-> Discord bridge daemon."""
     pass
 
 
@@ -61,26 +62,19 @@ def cli() -> None:
 def init() -> None:
     """Interactive bootstrap: collect bot token and channel ID, write secrets file.
 
-    Prompts for:
-    - DISCORD_BOT_TOKEN (hidden input)
-    - DISCORD_CHANNEL_ID (validated as positive integer)
-
     Writes to ~/.config/claude-discord-bridge/secrets.json (mode 0600).
     """
-    click.echo("Welcome to the Claude Code <-> Discord bridge.")
+    click.echo("Welcome to the Polytoken <-> Discord bridge.")
     click.echo()
     click.echo(
-        "This wizard will set up the bridge to post messages to Discord. "
-        "You'll need:"
+        "This wizard will set up the bridge to post messages to Discord. You'll need:"
     )
     click.echo("  - A Discord bot token (from Discord Developer Portal)")
     click.echo("  - A Discord channel ID (from a text channel you own)")
     click.echo()
 
-    # Resolve secrets path from env var for testability
     secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
 
-    # Check if file already exists
     if secrets_path.exists():
         if not click.confirm(
             f"Secrets file already exists at {secrets_path}. Overwrite?",
@@ -88,12 +82,8 @@ def init() -> None:
         ):
             return
 
-    # Prompt for bot token (hidden)
-    bot_token = click.prompt(
-        "DISCORD_BOT_TOKEN", hide_input=True, confirmation_prompt=False
-    )
+    bot_token = click.prompt("DISCORD_BOT_TOKEN", hide_input=True, confirmation_prompt=False)
 
-    # Prompt for channel ID (with validation)
     while True:
         channel_id_input = click.prompt("DISCORD_CHANNEL_ID")
         try:
@@ -105,19 +95,12 @@ def init() -> None:
         except ValueError:
             click.echo("Channel ID must be a positive integer.")
 
-    # Print reminders before writing
     click.echo()
     click.echo("Important reminders:")
-    click.echo(
-        "1. You must enable Privileged Gateway Intent: Message Content for the bot at"
-    )
+    click.echo("1. You must enable Privileged Gateway Intent: Message Content for the bot at")
     click.echo("   Discord Developer Portal > Applications > [your app] > Bot")
     click.echo()
-    click.echo(
-        "2. The bot must be a member of the guild containing channel ID {0}".format(
-            channel_id
-        )
-    )
+    click.echo(f"2. The bot must be a member of the guild containing channel ID {channel_id}")
     click.echo("   and have these permissions:")
     click.echo("   - View Channel")
     click.echo("   - Send Messages")
@@ -125,86 +108,62 @@ def init() -> None:
     click.echo("   - Manage Channels  (required for /pin; safe to omit if you won't use it)")
     click.echo()
 
-    # Write secrets
     secrets = Secrets(bot_token=bot_token, channel_id=channel_id)
     write_secrets(secrets, path=secrets_path)
 
-    # Verify mode
     perms = stat.S_IMODE(secrets_path.stat().st_mode)
     if perms != 0o600:
-        # Delete the dangling permissive file before failing
         secrets_path.unlink()
         click.echo(
             f"Error: file mode is {oct(perms)}, expected 0o600. "
             f"Secrets file deleted. Please check your filesystem settings.",
-            err=True
+            err=True,
         )
         sys.exit(1)
 
-    # Validate token and channel by connecting to Discord
     click.echo()
     click.echo("Validating token and channel...")
     try:
         success = asyncio.run(_validate_token_and_post_test(secrets))
         if not success:
-            click.echo(
-                "Error: could not connect — check token/intents/network",
-                err=True
-            )
+            click.echo("Error: could not connect — check token/intents/network", err=True)
             sys.exit(2)
     except Exception as e:
-        click.echo(
-            f"Error: could not connect — check token/intents/network ({e})",
-            err=True
-        )
+        click.echo(f"Error: could not connect — check token/intents/network ({e})", err=True)
         sys.exit(2)
 
     click.echo()
-    click.echo(
-        f"Wrote secrets to {secrets_path} (mode 0600). "
-        "Start the daemon with:"
-    )
+    click.echo(f"Wrote secrets to {secrets_path} (mode 0600). Start the daemon with:")
     click.echo("  claude-discord-bridge serve")
     click.echo()
-    click.echo(
-        "Or use the systemd unit at:"
-    )
+    click.echo("Or use the systemd unit at:")
     click.echo("  packaging/claude-discord-bridge.service")
 
 
 @cli.command()
-@click.option(
-    "--host",
-    default="127.0.0.1",
-    help="Host to bind to (default: 127.0.0.1)",
-)
-@click.option(
-    "--port",
-    default=8787,
-    type=int,
-    help="Port to bind to (default: 8787)",
-)
+@click.option("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
+@click.option("--port", default=8787, type=int, help="Port to bind to (default: 8787)")
 def serve(host: str, port: int) -> None:
     """Run the bridge daemon.
 
     Loads secrets from ~/.config/claude-discord-bridge/secrets.json and starts
-    the HTTP server + Discord bot.
+    the HTTP health server + Discord bot.
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    # Resolve secrets path from env var for testability
     secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
-
     try:
         secrets = load_secrets(path=secrets_path)
     except SecretsError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(2)
-
     asyncio.run(serve_server(secrets, host=host, port=port))
+
+
+def _polytoken_bin() -> str:
+    return os.environ.get("POLYTOKEN_BIN", "polytoken")
 
 
 @cli.command()
@@ -214,15 +173,12 @@ def doctor() -> None:
     Checks:
     - Secrets file present and mode 0600
     - Bridge daemon health and bot connectivity
-    - Settings.json hooks point to bridge scripts
-    - Skill symlink setup
-
-    Exit 0 if all checks pass (ok) or warn. Exit 1 if any check fails.
+    - The `polytoken` binary is installed and can spawn a headless session
+    - The attachments directory is writable
     """
     failed = False
     warned = False
 
-    # Resolve secrets path from env var for testability
     secrets_path = Path(os.environ.get("BRIDGE_SECRETS_PATH", str(SECRETS_FILE)))
 
     # Check 1: Secrets file present
@@ -244,8 +200,7 @@ def doctor() -> None:
     # Check 3: Daemon health
     bridge_url = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8787")
     try:
-        health_url = f"{bridge_url}/v1/health"
-        req = urllib.request.Request(health_url)
+        req = urllib.request.Request(f"{bridge_url}/v1/health")
         response = urllib.request.urlopen(req, timeout=2)
         data = json.loads(response.read().decode("utf-8"))
         if response.status == 200 and data.get("bot_connected") is True:
@@ -260,179 +215,98 @@ def doctor() -> None:
         click.echo(f"[fail] Daemon health — {bridge_url}/v1/health unreachable ({type(e).__name__})", err=True)
         failed = True
 
-    # Check 4: Settings.json hooks
-    settings_path = Path.home() / ".claude" / "settings.json"
-    if settings_path.exists():
-        try:
-            settings_data = json.loads(settings_path.read_text())
-            hooks = settings_data.get("hooks", {})
+    # Check 4: polytoken binary present + version pin
+    from bridge.version_guard import (
+        BRIDGE_POLYTOKEN_VERSION,
+        check_polytoken_version,
+        detect_polytoken_version_detail,
+    )
 
-            # Compute expected hook paths at runtime
-            expected_hooks_dir = Path(bridge.__file__).parent.parent.parent / "hooks"
-            expected_stop_path = str(expected_hooks_dir / "notify-stop.py")
-            expected_notif_path = str(expected_hooks_dir / "notify-notification.py")
-
-            hooks_ok = True
-
-            # Check Stop matcher
-            stop_found = False
-            for stop_matcher in hooks.get("Stop", []):
-                for hook_spec in stop_matcher.get("hooks", []):
-                    cmd = hook_spec.get("command", "")
-                    if expected_stop_path in cmd:
-                        stop_found = True
-                        break
-
-            if not stop_found:
-                click.echo("[fail] Settings.json hooks — Stop matcher missing or incorrect", err=True)
-                hooks_ok = False
-
-            # Check Notification matcher
-            notif_found = False
-            for notif_matcher in hooks.get("Notification", []):
-                for hook_spec in notif_matcher.get("hooks", []):
-                    cmd = hook_spec.get("command", "")
-                    if expected_notif_path in cmd:
-                        notif_found = True
-                        break
-
-            if not notif_found:
-                click.echo("[fail] Settings.json hooks — Notification matcher missing or incorrect", err=True)
-                hooks_ok = False
-
-            if hooks_ok:
-                click.echo("[ok] Settings.json hooks — Stop and Notification matchers configured")
-            else:
-                failed = True
-        except Exception as e:
-            click.echo(f"[fail] Settings.json hooks — error reading {settings_path}: {e}", err=True)
-            failed = True
+    binary = _polytoken_bin()
+    resolved = shutil.which(binary)
+    if resolved is None:
+        click.echo(f"[fail] polytoken CLI — `{binary}` not found on PATH", err=True)
+        failed = True
     else:
-        click.echo(f"[warn] Settings.json hooks — {settings_path} not found (skipping)", err=True)
-        warned = True
-
-    # Check 5: Skill symlink
-    skill_path = Path.home() / ".claude" / "skills" / "ask-discord" / "SKILL.md"
-    if skill_path.exists():
-        # Check if it's a symlink to the repo or a copy with matching content
-        repo_skill_path = Path(bridge.__file__).parent.parent.parent / "skills" / "SKILL.md"
-        if skill_path.is_symlink():
-            target = skill_path.resolve()
-            if repo_skill_path.exists() and target == repo_skill_path.resolve():
-                click.echo(f"[ok] Skill symlink — {skill_path} → {target}")
-            else:
-                click.echo(f"[warn] Skill symlink — {skill_path} symlink target mismatch", err=True)
-                warned = True
+        version, is_prerelease = detect_polytoken_version_detail(binary)
+        ok, msg = check_polytoken_version(version, is_prerelease=is_prerelease)
+        if ok:
+            click.echo(f"[ok] polytoken CLI — {resolved} ({msg})")
         else:
-            # Check if it's a copy with same content
-            if repo_skill_path.exists() and skill_path.read_text() == repo_skill_path.read_text():
-                click.echo(f"[ok] Skill symlink — {skill_path} (copy of {repo_skill_path})")
-            else:
-                click.echo(f"[warn] Skill symlink — {skill_path} exists but is not a symlink", err=True)
-                warned = True
-    else:
-        click.echo(f"[warn] Skill symlink — {skill_path} not found", err=True)
-        warned = True
-
-    # Check 6: zellij installed
-    try:
-        result = subprocess.run(["zellij", "--version"], capture_output=True, timeout=5, text=True)
-        if result.returncode == 0:
-            version_line = result.stdout.strip().split("\n")[0] if result.stdout else "zellij"
-            click.echo(f"[ok] zellij CLI — {version_line}")
-        else:
-            click.echo(f"[fail] zellij CLI — exited with status {result.returncode}", err=True)
-            failed = True
-    except FileNotFoundError:
-        path_env = os.environ.get("PATH", "(not set)")
-        click.echo(f"[fail] zellij CLI — not installed (PATH = {path_env})", err=True)
-        failed = True
-    except subprocess.TimeoutExpired:
-        click.echo("[fail] zellij CLI — timeout checking version", err=True)
-        failed = True
-    except Exception as e:
-        click.echo(f"[fail] zellij CLI — error: {e}", err=True)
-        failed = True
-
-    # Check 7: bridge zellij session exists
-    try:
-        result = subprocess.run(["zellij", "list-sessions"], capture_output=True, timeout=5, text=True)
-        if ZELLIJ_SESSION_NAME in result.stdout:
-            click.echo(f"[ok] zellij session `{ZELLIJ_SESSION_NAME}` — running")
-        else:
+            # A wrong version is a hard fail: the daemon contracts are pinned to
+            # {BRIDGE_POLYTOKEN_VERSION}; a mismatched binary can break silently.
             click.echo(
-                f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — not running yet "
-                "(will be created on first /start)",
+                f"[fail] polytoken CLI — {resolved} ({msg}). "
+                f"Bridge requires polytoken {BRIDGE_POLYTOKEN_VERSION}+.",
                 err=True,
             )
-            warned = True
-    except FileNotFoundError:
-        click.echo(f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — cannot check (zellij not installed)", err=True)
-        warned = True
-    except subprocess.TimeoutExpired:
-        click.echo(f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — timeout checking sessions", err=True)
-        warned = True
-    except Exception as e:
-        click.echo(f"[warn] zellij session `{ZELLIJ_SESSION_NAME}` — error: {e}", err=True)
-        warned = True
-
-    # Check 8: task-settings dir writable
-    task_settings_dir = Path.home() / ".local" / "state" / "claude-discord-bridge" / "task-settings"
-    try:
-        task_settings_dir.mkdir(parents=True, exist_ok=True)
-        # Try to write a temp file
-        with tempfile.NamedTemporaryFile(dir=task_settings_dir, delete=True):
-            pass
-        click.echo(f"[ok] task-settings dir — {task_settings_dir}")
-    except PermissionError:
-        click.echo(f"[fail] task-settings dir — not writable ({task_settings_dir})", err=True)
-        failed = True
-    except Exception as e:
-        click.echo(f"[fail] task-settings dir — error: {e}", err=True)
-        failed = True
-
-    # Check 9: hook scripts present and executable. Listed here:
-    #   - notify-stop / notify-notification: registered in the user's global
-    #     ~/.claude/settings.json (verified earlier in checks 5-6).
-    #   - event / pretooluse-approve: injected per-task by `_write_task_settings`.
-    hooks_dir = Path(bridge.__file__).parent.parent.parent / "hooks"
-    hook_scripts = [
-        "notify-stop.py",
-        "notify-notification.py",
-        "event.py",
-        "pretooluse-approve.py",
-    ]
-    for script_name in hook_scripts:
-        script_path = hooks_dir / script_name
-        if script_path.exists() and os.access(script_path, os.X_OK):
-            click.echo(f"[ok] hook script — {script_name}")
-        else:
-            if not script_path.exists():
-                click.echo(f"[fail] hook script — {script_name} missing", err=True)
-            else:
-                click.echo(f"[fail] hook script — {script_name} not executable", err=True)
             failed = True
 
-    # Check 10: claude on PATH
+    # Check 5: polytoken can spawn a headless session
+    if resolved is not None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="cdb-doctor-") as tmp:
+                spawn = subprocess.run(
+                    [binary, "--working-dir", tmp, "new", "--no-attach"],
+                    capture_output=True, timeout=30, text=True,
+                )
+                out = spawn.stdout or ""
+                port = None
+                sid = None
+                for tok in out.split():
+                    if tok.startswith("port="):
+                        port = tok.split("=", 1)[1]
+                    elif tok.startswith("session_id="):
+                        sid = tok.split("=", 1)[1]
+                if spawn.returncode == 0 and port and sid:
+                    click.echo(f"[ok] polytoken spawn — session {sid} on port {port}")
+                    # Clean up the throwaway daemon.
+                    with urllib.request.urlopen(
+                        urllib.request.Request(f"http://127.0.0.1:{port}/terminate", method="POST"),
+                        timeout=3,
+                    ):
+                        pass
+                else:
+                    click.echo(f"[fail] polytoken spawn — unexpected output: {out.strip()[:200]!r}", err=True)
+                    failed = True
+        except Exception as e:
+            click.echo(f"[fail] polytoken spawn — error: {e}", err=True)
+            failed = True
+
+    # Check 6: attachments dir writable
+    attachments_dir = Path.home() / ".local" / "state" / "claude-discord-bridge" / "attachments"
     try:
-        result = subprocess.run(["which", "claude"], capture_output=True, timeout=2, text=True)
-        if result.returncode == 0:
-            claude_path = result.stdout.strip()
-            click.echo(f"[ok] claude CLI — {claude_path}")
-        else:
-            click.echo("[warn] claude CLI — not on PATH (the daemon's spawned shells must have it)", err=True)
-            warned = True
-    except FileNotFoundError:
-        click.echo("[warn] claude CLI — 'which' not found; cannot check PATH", err=True)
-        warned = True
-    except subprocess.TimeoutExpired:
-        click.echo("[warn] claude CLI — timeout checking PATH", err=True)
-        warned = True
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=attachments_dir, delete=True):
+            pass
+        click.echo(f"[ok] attachments dir — {attachments_dir}")
+    except PermissionError:
+        click.echo(f"[fail] attachments dir — not writable ({attachments_dir})", err=True)
+        failed = True
     except Exception as e:
-        click.echo(f"[warn] claude CLI — error: {e}", err=True)
+        click.echo(f"[fail] attachments dir — error: {e}", err=True)
+        failed = True
+
+    # Check 7: global Polytoken notification hook (covers all sessions, not just
+    # the bridge's). A warning, not a hard fail: the bridge works without it, but
+    # you won't be pinged when non-Discord sessions need input.
+    from bridge.hooks import hook_status
+
+    status = hook_status()
+    if status["installed"]:
+        click.echo(
+            f"[ok] notification hook — {status['script_path']} "
+            f"(events: {', '.join(status['registered_events'])})"
+        )
+    else:
+        click.echo(
+            "[warn] notification hook — not installed. Run "
+            "`claude-discord-bridge setup-hooks` to get pings for ALL Polytoken "
+            "sessions (not just Discord-driven ones).",
+            err=True,
+        )
         warned = True
 
-    # Final summary
     click.echo()
     if failed:
         click.echo("Doctor: some checks failed. Please fix the issues above.", err=True)
@@ -443,6 +317,29 @@ def doctor() -> None:
     else:
         click.echo("Doctor: all checks passed. Bridge is ready.")
         sys.exit(0)
+
+
+@cli.command("setup-hooks")
+def setup_hooks() -> None:
+    """Install the global Polytoken notification hook.
+
+    Registers a hook in ~/.config/polytoken/hooks.json that fires for EVERY
+    Polytoken session (not just Discord-driven ones) on `stop` (session waiting
+    for input) and `notification` events, forwarding them to the bridge, which
+    posts to Discord with an @mention. Idempotent.
+
+    Set BRIDGE_NOTIFY_USER_ID to your Discord user ID to get a push (@mention)
+    on each notification.
+    """
+    from bridge.hooks import install_hook
+
+    path = install_hook()
+    click.echo(f"Installed global notification hook → {path}")
+    click.echo("Events: stop (waiting for input), notification.")
+    click.echo(
+        "Takes effect on the next Polytoken config reload. "
+        "Set BRIDGE_NOTIFY_USER_ID=<your Discord user ID> for push (@mention)."
+    )
 
 
 def main() -> None:

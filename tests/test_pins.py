@@ -16,7 +16,7 @@ from bridge.state import (
     upsert_pin,
 )
 from bridge.tasks import TaskRegistry
-from tests.fakes import FakeBot, FakeZellij
+from tests.fakes import FakeBot, FakeSupervisor as FakeZellij
 
 
 @pytest.mark.asyncio

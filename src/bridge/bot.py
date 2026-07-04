@@ -398,6 +398,24 @@ class Bot:
         except discord.NotFound:
             pass  # Thread already gone, which is fine
 
+    async def unarchive_thread(self, thread_id: int) -> None:
+        """Un-archive a Discord thread by ID.
+
+        Mirrors :meth:`archive_thread`: ``/stop`` and ``/kill`` archive the
+        thread; ``/restart`` un-archives it so the resumed stream can post. Like
+        Discord itself, sending a message to an archived thread also un-archives
+        it, but doing it explicitly is more robust. Silently ignores 404.
+        Raises BotNotReady if the bot isn't connected.
+        """
+        if not self.is_ready:
+            raise BotNotReady("bot not connected to Discord")
+        try:
+            thread = await self._client.fetch_channel(thread_id)
+            if isinstance(thread, discord.Thread):
+                await thread.edit(archived=False)
+        except discord.NotFound:
+            pass  # Thread already gone, which is fine
+
     async def add_reactions(self, message_id: int, thread_id: int, emoji: list[str]) -> None:
         """Add emoji reactions to a message.
 
