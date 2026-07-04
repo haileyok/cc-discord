@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 BOT_KEY: web.AppKey[Bot] = web.AppKey("bot", Bot)
 TASK_REGISTRY_KEY: web.AppKey[TaskRegistry] = web.AppKey("task_registry", TaskRegistry)
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
+SUPERVISOR_KEY: web.AppKey[DaemonSupervisor] = web.AppKey("supervisor", DaemonSupervisor)
+STOP_VERIFY_DELAY_KEY: web.AppKey[float] = web.AppKey("stop_verify_delay", float)
+NOTIFY_TASKS_KEY: web.AppKey[set] = web.AppKey("notify_tasks", set)
+
+# Grace period between a `stop` hook event and the /state verification, so a
+# session that immediately continues (queued prompt, goal continuation) has
+# started its next turn by the time we look. Override with
+# BRIDGE_STOP_VERIFY_DELAY_SECS.
+DEFAULT_STOP_VERIFY_DELAY_SECS = 2.5
 
 
 async def _handle_health(request: web.Request) -> web.Response:
@@ -75,6 +84,45 @@ def _summarize_notify(event: str, session_id: str, project: str, body: dict) -> 
     return f"🔔 Session `{sid}`{leaf}: {detail[:300]}"
 
 
+async def _stop_session_awaits_input(supervisor, session_id: str) -> tuple[bool, str]:
+    """Decide whether a `stop` hook event means the session is genuinely waiting.
+
+    `stop` fires whenever a turn would end — including turns that immediately
+    continue (queued prompts, goal continuation, harness-driven sessions that
+    end turns while awaiting forwarded tool results). Mirror the main-thread
+    gate (TurnComplete never pings; only real input needs do) by checking the
+    session's live `/state`: ping when it has ``pending_interrogatives`` (blocked
+    on an answer) or is idle; suppress when the turn is (still or again) in
+    flight, or the session is gone from the registry entirely. Fails open —
+    only positive evidence of activity suppresses the ping. ``turn_in_flight``
+    missing from older daemons reads as falsy, i.e. pre-gate behavior.
+    """
+    if supervisor is None or not session_id:
+        return True, "unverifiable"
+    try:
+        info = await supervisor.find_session(session_id)
+    except Exception:
+        logger.exception("notify: could not list sessions to verify %s", session_id)
+        return True, "registry_error"
+    if info is None:
+        return False, "session_gone"
+    client = supervisor.client_for(info.port)
+    try:
+        state = await client.state()
+    except Exception:
+        logger.warning("notify: could not read /state for %s on port %d",
+                       session_id, info.port)
+        return True, "state_error"
+    finally:
+        with contextlib.suppress(Exception):
+            await client.aclose()
+    if state.get("pending_interrogatives"):
+        return True, "pending_interrogative"
+    if state.get("turn_in_flight"):
+        return False, "turn_in_flight"
+    return True, "idle"
+
+
 async def _handle_notify(request: web.Request) -> web.Response:
     """Handle POST /v1/notify — a global Polytoken hook forwarding an event.
 
@@ -85,6 +133,12 @@ async def _handle_notify(request: web.Request) -> web.Response:
     completion (typing indicator) and notifications (AttentionPing) inline in
     their task thread, so a channel ping would double-notify. The hook's value is
     the sessions the bridge can't see (TUI, `exec`, externally-started daemons).
+
+    `stop` events are not posted directly: the hook is blocking, so we ack it
+    immediately and verify in the background (after a short grace delay) that
+    the session is actually waiting for input before pinging — see
+    :func:`_stop_session_awaits_input`. `notification` events post immediately
+    (parity with the main thread's AttentionPing).
     """
     bot: Bot = request.app[BOT_KEY]
     registry: TaskRegistry = request.app[TASK_REGISTRY_KEY]
@@ -111,6 +165,33 @@ async def _handle_notify(request: web.Request) -> web.Response:
         return web.Response(status=200, text='{"status":"suppressed_non_interactive"}',
                             content_type="application/json")
 
+    if event == "stop":
+        # Ack the (blocking) hook now; verify + post in the background.
+        supervisor = request.app.get(SUPERVISOR_KEY)
+        delay = request.app.get(STOP_VERIFY_DELAY_KEY, DEFAULT_STOP_VERIFY_DELAY_SECS)
+        notify_tasks = request.app[NOTIFY_TASKS_KEY]
+
+        async def _verify_then_post() -> None:
+            await asyncio.sleep(delay)
+            should_ping, reason = await _stop_session_awaits_input(supervisor, session_id)
+            if not should_ping:
+                logger.info("notify: suppressed stop ping for %s (%s)",
+                            (session_id or "?")[:12], reason)
+                return
+            summary = _summarize_notify(event, session_id, project, body)
+            try:
+                await bot.post(f"{registry.notify_mention_prefix()}{summary}")
+            except Exception:
+                logger.exception("failed to post notify summary to Discord")
+
+        t = asyncio.create_task(
+            _verify_then_post(), name=f"notify-stop-{(session_id or '?')[:12]}"
+        )
+        notify_tasks.add(t)
+        t.add_done_callback(notify_tasks.discard)
+        return web.Response(status=200, text='{"status":"scheduled"}',
+                            content_type="application/json")
+
     summary = _summarize_notify(event, session_id, project, body)
     mention = registry.notify_mention_prefix()
     try:
@@ -123,11 +204,25 @@ async def _handle_notify(request: web.Request) -> web.Response:
                         content_type="application/json")
 
 
-async def build_app(bot: Bot, *, started_at: float | None = None) -> web.Application:
+async def build_app(
+    bot: Bot,
+    *,
+    started_at: float | None = None,
+    supervisor: DaemonSupervisor | None = None,
+    stop_verify_delay: float | None = None,
+) -> web.Application:
     """Build and configure the aiohttp Application (health + notify)."""
     app = web.Application()
     app[BOT_KEY] = bot
     app[STARTED_AT_KEY] = started_at if started_at is not None else time.monotonic()
+    if supervisor is not None:
+        app[SUPERVISOR_KEY] = supervisor
+    if stop_verify_delay is None:
+        stop_verify_delay = float(
+            os.environ.get("BRIDGE_STOP_VERIFY_DELAY_SECS", DEFAULT_STOP_VERIFY_DELAY_SECS)
+        )
+    app[STOP_VERIFY_DELAY_KEY] = stop_verify_delay
+    app[NOTIFY_TASKS_KEY] = set()
     app.router.add_get("/v1/health", _handle_health)
     app.router.add_post("/v1/notify", _handle_notify)
     return app
@@ -161,7 +256,7 @@ async def serve(secrets: Secrets, *, host: str = "127.0.0.1", port: int = 8787) 
     bot = Bot(secrets.bot_token, secrets.channel_id, on_message=_dispatch_message)
     task_registry.bind_bot(bot)
 
-    app = await build_app(bot)
+    app = await build_app(bot, supervisor=supervisor)
     app[TASK_REGISTRY_KEY] = task_registry
     runner = web.AppRunner(app)
     await runner.setup()

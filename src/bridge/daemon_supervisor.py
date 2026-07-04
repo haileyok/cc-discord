@@ -287,6 +287,10 @@ class DaemonSupervisor:
                     names.append(name)
         return names
 
+    def client_for(self, port: int) -> PolytokenClient:
+        """Build a client for a registry-listed session (e.g. the notify gate)."""
+        return self._client_factory(port)
+
     async def find_session(self, session_id: str) -> SessionInfo | None:
         """Return the live registry entry for ``session_id``, or ``None``."""
         for info in await self.list_sessions():
