@@ -512,6 +512,12 @@ async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db
     assert any(edit["message_ts"] == "stream-1" and edit["blocks"] for edit in bot.edits)
     assert any(post.get("text") == "answer after degradation" for post in bot.posts)
 
+    await reg._render(task, events.TurnComplete("prompt-degrade"))
+    assert task.progress_stream_disabled is False
+    await reg._render(task, events.TurnStarted("prompt-retry"))
+    assert len(bot.stream_starts) == 2
+    assert task.progress_stream_ts == "stream-1"
+
 
 class TestAC5AppBudget:
     async def test_collaborative_app_exchange_budget_pauses_and_alerts_owner(self, in_memory_db):

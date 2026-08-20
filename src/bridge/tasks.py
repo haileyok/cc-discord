@@ -1759,7 +1759,12 @@ class TaskRegistry:
                 task.progress_stream_ts = str(stream_ts)
             except Exception as exc:
                 task.progress_stream_disabled = True
-                log.warning("native Slack stream start failed: %s", safe_error(exc, "stream start failed"))
+                code = slack_error_code(exc)
+                log.warning(
+                    "native Slack stream start failed%s: %s",
+                    f" ({code})" if code else "",
+                    safe_error(exc, "stream start failed"),
+                )
         if task.progress_stream_ts is None:
             await self._ensure_fallback_progress(task)
         await self._set_agent_status(task, "processing")
@@ -1791,7 +1796,12 @@ class TaskRegistry:
                         task.progress_stream_ts = None
                     except Exception as exc:
                         task.progress_stream_disabled = True
-                        log.warning("native Slack stream stop failed: %s", safe_error(exc, "stream stop failed"))
+                        code = slack_error_code(exc)
+                        log.warning(
+                            "native Slack stream stop failed%s: %s",
+                            f" ({code})" if code else "",
+                            safe_error(exc, "stream stop failed"),
+                        )
                         await self._ensure_fallback_progress(task, outcome=outcome)
                 else:
                     task.progress_stream_disabled = True
@@ -1811,6 +1821,9 @@ class TaskRegistry:
                     await self._update_fallback_progress(task, outcome=outcome)
             await self._set_agent_status(task, "active")
             task.progress_started = False
+            # Stream failures degrade only this turn. Slack capability and
+            # transient conditions can change; retry native UI next prompt.
+            task.progress_stream_disabled = False
         # App budget is a turn/exchange budget, not a process-lifetime budget.
         if task.app_exchanges:
             task.app_exchanges = 0
