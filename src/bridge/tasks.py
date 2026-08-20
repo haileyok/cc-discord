@@ -285,7 +285,12 @@ def _actor(value: Any) -> SlackActor:
     nested = _value(value, "actor", None) or _value(value, "user", None)
     if nested is not None and nested is not value:
         value = nested
-    actor_id = _value(value, "actor_id", None) or _value(value, "user_id", None) or _value(value, "id", None)
+    actor_id = (
+        _value(value, "actor_id", None)
+        or _value(value, "user_id", None)
+        or _value(value, "id", None)
+        or _value(value, "bot_id", None)
+    )
     is_app = bool(_value(value, "is_app", False) or _value(value, "bot_id", None))
     return SlackActor(str(actor_id or ""), is_app=is_app, display_name=_value(value, "display_name", None))
 
@@ -430,7 +435,13 @@ class TaskRegistry:
         self._conn = conn
         self._bot = bot
         self._supervisor = supervisor
-        self.app_actor_id = app_actor_id or getattr(bot, "app_actor_id", None) or getattr(bot, "user_id", None)
+        # ``app_actor_id`` is the bridge's own Slack user identity.  Keep the
+        # external app's stable B... identity separate: it is a participant,
+        # not the bridge itself.
+        self.app_actor_id = getattr(bot, "bot_user_id", None) or app_actor_id
+        self._bridge_bot_id = getattr(bot, "bot_id", None)
+        self._daemon_presence_known = False
+        self._known_daemon_sessions: set[str] = set()
         self.home_channel_id = home_channel_id or getattr(bot, "home_channel_id", None)
         if app_exchange_budget <= 0:
             raise ValueError("app_exchange_budget must be positive")
@@ -453,7 +464,8 @@ class TaskRegistry:
 
     def bind_bot(self, bot: "Bot") -> None:
         self._bot = bot
-        self.app_actor_id = self.app_actor_id or getattr(bot, "app_actor_id", None) or getattr(bot, "user_id", None)
+        self.app_actor_id = getattr(bot, "bot_user_id", None) or self.app_actor_id
+        self._bridge_bot_id = getattr(bot, "bot_id", None)
         self.home_channel_id = self.home_channel_id or getattr(bot, "home_channel_id", None)
 
     def _require_bot(self) -> "Bot":
@@ -526,8 +538,11 @@ class TaskRegistry:
         if reconcile_with_daemons:
             try:
                 sessions = {str(item.session_id): item for item in await self._supervisor.list_sessions()}
+                self._known_daemon_sessions = set(sessions)
+                self._daemon_presence_known = True
             except DaemonSupervisorError:
                 listing_ok = False
+                self._daemon_presence_known = False
         # Incomplete promotions are reconciled after Bot startup. Loading DB
         # must remain side-effect free because Slack is not authenticated yet.
         runtimes = await list_runtime(self._conn)
@@ -547,7 +562,7 @@ class TaskRegistry:
                 info = sessions.get(str(runtime.session_id)) if runtime.session_id else None
                 if runtime.session_id and info is None and status in {"spawning", "running", "paused", "rebinding"}:
                     status = "crashed"
-                    await update_runtime(self._conn, runtime.task_id, status=status, now=int(time.time()))
+                    await update_runtime(self._conn, runtime.task_id, status=status, promotion_state="failed", now=int(time.time()))
                     self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned), "💥 The session daemon was not found; task is crashed."))
                 elif info is not None and (runtime.port != info.port or runtime.cwd != info.project_path):
                     await update_runtime(self._conn, runtime.task_id, port=info.port, cwd=info.project_path)
@@ -579,19 +594,27 @@ class TaskRegistry:
             if runtime is not None:
                 # Restore all old-binding fields even when the key already
                 # matches: a crash can leave only status/mode/ownership stale.
-                await restore_runtime_binding(self._conn, journal.task_id, journal.old_key, status="running")
+                restored = await restore_runtime_binding(
+                    self._conn, journal.task_id, journal.old_key,
+                    binding_id=journal.old_binding_id,
+                )
                 task = self.get_by_task_id(journal.task_id)
-                if task is not None:
+                if task is not None and restored is not None:
                     self._by_key.pop(task.key, None)
                     task.channel_id = str(journal.old_key.channel_id)
                     task.root_ts = str(journal.old_key.root_id)
                     task.mode = journal.old_mode
-                    task.status = "running"
-                    task.promotion_state = "failed"
+                    task.status = restored.status
+                    task.promotion_state = restored.promotion_state
                     task.binding_id = journal.old_binding_id
                     task.channel_owned = bool(journal.old_mode == "collaborative" and str(journal.old_key.channel_id) != str(self.home_channel_id or ""))
                     await self._index(task)
                     await self._persist_task(task)
+                    if task.status not in {"running", "spawning"}:
+                        self._deferred_consumers.discard(task.task_id)
+                        consumer = self._consumers.pop(task.task_id, None)
+                        if consumer is not None and not consumer.done():
+                            consumer.cancel()
             if not journal.new_channel_id:
                 await update_promotion_journal(self._conn, journal.journal_id, state="failed", side_effect="restore_old_binding", side_effect_state="complete")
                 continue
@@ -620,8 +643,15 @@ class TaskRegistry:
 
     async def start_event_consumers(self) -> None:
         for task in list(self._by_task_id.values()):
-            if task.status in {"running", "spawning"}:
-                self._start_consumer(task)
+            if task.status not in {"running", "spawning"}:
+                continue
+            if self._daemon_presence_known and (
+                not task.polytoken_session_id
+                or task.polytoken_session_id not in self._known_daemon_sessions
+            ):
+                self._deferred_consumers.discard(task.task_id)
+                continue
+            self._start_consumer(task)
         self._deferred_consumers.clear()
 
     async def shutdown(self) -> None:
@@ -998,6 +1028,8 @@ class TaskRegistry:
             return False
         if self.app_actor_id and msg.actor_id == str(self.app_actor_id):
             return False
+        if self._bridge_bot_id and msg.actor_id == str(self._bridge_bot_id):
+            return False
         task = self.get_by_key(ConversationKey(msg.team_id, msg.channel_id, msg.root_ts))
         if task is None or task.key in self._disabled_roots:
             return False
@@ -1005,7 +1037,10 @@ class TaskRegistry:
             return False
         if task.status not in {"running", "spawning"}:
             return True
-        if msg.actor.is_app and self.app_actor_id and msg.actor_id == str(self.app_actor_id):
+        if msg.actor.is_app and (
+            (self.app_actor_id and msg.actor_id == str(self.app_actor_id))
+            or (self._bridge_bot_id and msg.actor_id == str(self._bridge_bot_id))
+        ):
             return False
         if not await self._authorized_message(task, msg.actor):
             return False
@@ -1030,7 +1065,6 @@ class TaskRegistry:
         body_parts.extend(f"@{path}" for path in other_paths)
         if not body_parts:
             return True
-        app_prompt = False
         if msg.actor.is_app:
             if task.mode != "collaborative" or not await self._is_participant(task, msg.actor_id, is_app=True):
                 return False
@@ -1057,11 +1091,7 @@ class TaskRegistry:
             msg.team_id, msg.channel_id, msg.root_ts, msg.message_ts, msg.event_id,
             msg.actor_id, "app" if msg.actor.is_app else "human",
         )
-        accepted = await self._prompt(task, " ".join(body_parts), provenance=provenance)
-        if accepted and app_prompt:
-            task.app_exchanges += 1
-            await update_runtime(self._conn, task.task_id, app_exchanges=task.app_exchanges)
-        return accepted
+        return await self._prompt(task, " ".join(body_parts), provenance=provenance)
 
     async def _authorized_message(self, task: Task, actor: SlackActor) -> bool:
         if actor.actor_id == task.owner_user_id:
@@ -1116,7 +1146,7 @@ class TaskRegistry:
             if not attachment.url or (attachment.size is not None and int(attachment.size) > MAX_ATTACHMENT_BYTES):
                 continue
             name = Path(attachment.filename).name or f"attachment-{index}"
-            destination = directory / f"{msg.message_ts or int(time.time() * 1000)}-{name}"
+            destination = directory / f"{msg.message_ts or int(time.time() * 1000)}-{index}-{name}"
             try:
                 await self._require_bot().download_file(attachment.url, destination, MAX_ATTACHMENT_BYTES)
                 size = destination.stat().st_size
@@ -1137,7 +1167,8 @@ class TaskRegistry:
             return
         await self._require_bot().invite_participants(task.channel_id, actor_ids)
         for actor_id in actor_ids:
-            await upsert_participant(self._conn, task.key, Participant(ActorId(actor_id), ParticipantKind.HUMAN))
+            kind = ParticipantKind.APP if actor_id.startswith("B") else ParticipantKind.HUMAN
+            await upsert_participant(self._conn, task.key, Participant(ActorId(actor_id), kind))
 
     async def add_participant(
         self, task_id: str, owner_user_id: str | SlackActor, actor_id: str,
@@ -1151,7 +1182,11 @@ class TaskRegistry:
             raise ValueError("participant kind must be human or app") from exc
         if not actor_id:
             raise ValueError("participant actor_id must not be empty")
+        if participant_kind is ParticipantKind.APP and not actor_id.startswith("B"):
+            raise ValueError("app participant actor_id must be Slack bot_id (B...)")
         await self._require_bot().invite_participants(task.channel_id, [actor_id])
+        # Persist the stable B... app identity; Bot resolves it to U... only
+        # for the Slack membership side effect above.
         await upsert_participant(self._conn, task.key, Participant(ActorId(actor_id), participant_kind, display_name))
 
     async def remove_participant(self, task_id: str, owner_user_id: str | SlackActor, actor_id: str) -> bool:

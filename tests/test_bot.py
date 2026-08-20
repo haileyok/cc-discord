@@ -254,3 +254,30 @@ class TestAC9SocketMode:
                                                           "user": "UBOT", "text": "self", "ts": "1"}}
         })
         assert received == []
+
+    @pytest.mark.asyncio
+    async def test_external_bot_message_uses_b_id_and_invite_kick_use_u_id(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("bots_info", {"ok": True, "bot": {"id": "BAPP", "user_id": "UAPP"}}),
+            ("conversations_info", {"ok": True, "channel": {"id": "GNEW", "team_id": "T1", "is_private": True, "is_member": True}}),
+            ("conversations_invite", {"ok": True}),
+            ("conversations_info", {"ok": True, "channel": {"id": "GNEW", "team_id": "T1", "is_private": True, "is_member": True}}),
+            ("conversations_kick", {"ok": True}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        received = []
+        bot._on_message_cb = received.append
+        await bot.handle_socket_envelope({
+            "envelope_id": "E", "payload": {"team_id": "T1", "event": {"type": "bot_message", "team": "T1", "channel": "GNEW",
+                                                          "bot_id": "BAPP", "text": "from app", "ts": "2"}}
+        })
+        assert received and received[0].actor.actor_id == "BAPP"
+        assert received[0].actor.is_app
+        bot.remember_owned_channel("GNEW")
+        await bot.invite_participants("GNEW", ["BAPP"])
+        await bot.remove_participants("GNEW", ["BAPP"])
+        membership_calls = [call for call in client.calls if call.method in {"conversations_invite", "conversations_kick"}]
+        assert [call.kwargs.get("users") or call.kwargs.get("user") for call in membership_calls] == ["UAPP", "UAPP"]
+        assert all("BAPP" not in str(call.kwargs) for call in membership_calls)
+        client.assert_complete()

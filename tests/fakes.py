@@ -304,6 +304,9 @@ class FakeSlackClient:
     async def conversations_info(self, **kwargs: Any) -> Any:
         return await self._call("conversations_info", **kwargs)
 
+    async def bots_info(self, **kwargs: Any) -> Any:
+        return await self._call("bots_info", **kwargs)
+
     async def chat_postMessage(self, **kwargs: Any) -> Any:
         return await self._call("chat_postMessage", **kwargs)
 

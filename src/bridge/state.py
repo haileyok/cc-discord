@@ -533,22 +533,32 @@ async def update_runtime(
 
 async def restore_runtime_binding(
     conn: aiosqlite.Connection, task_id: str, old_key: ConversationKey,
-    *, status: str = "running", now: int | None = None,
+    *, status: str | None = None, binding_id: str | None = None,
+    now: int | None = None,
 ) -> RuntimeRow | None:
-    """Restore the old conversation binding after an interrupted promotion."""
+    """Restore an interrupted promotion without discarding old-root state.
+
+    ``status`` is optional deliberately: daemon reconciliation may already have
+    marked the runtime ``crashed`` and promotion recovery must not resurrect it
+    merely because its conversation binding is being restored.  Participants
+    belong to the old root and must survive the atomic replacement as well.
+    """
     runtime = await get_runtime(conn, task_id)
     if runtime is None:
         return None
+    participant_rows = await list_participants(conn, old_key)
+    participants = [row.participant for row in participant_rows]
     restored = RuntimeRow(
         task_id=runtime.task_id, key=old_key, session_id=runtime.session_id,
-        port=runtime.port, status=status, cwd=runtime.cwd, owner=runtime.owner,
+        port=runtime.port, status=runtime.status if status is None else status,
+        cwd=runtime.cwd, owner=runtime.owner,
         created_at=runtime.created_at, last_activity=runtime.last_activity,
         app_exchange_budget=runtime.app_exchange_budget, app_exchanges=runtime.app_exchanges,
         owner_alerted=runtime.owner_alerted, promotion_state="failed",
-        binding_id=None, cleanup_pending=runtime.cleanup_pending,
+        binding_id=binding_id, cleanup_pending=runtime.cleanup_pending,
         channel_owned=False,
     )
-    await replace_runtime_binding(conn, old_key, restored, [], now=now)
+    await replace_runtime_binding(conn, old_key, restored, participants, now=now)
     return restored
 
 

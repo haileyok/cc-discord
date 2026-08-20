@@ -494,7 +494,7 @@ class CommandDispatcher:
 
     async def _shortcut(self, payload: Mapping[str, Any]) -> SlackResponse:
         callback = str(payload.get("callback_id") or payload.get("callback") or "agent")
-        if callback not in {"agent", "bridge.agent", "agent_shortcut", "task_agent"}:
+        if callback not in {"agent", "bridge.agent", "agent_shortcut", "task_agent", "agent_global"}:
             return await self._error(payload, "Unknown shortcut.")
         actor = _actor_id(payload)
         task_id = ""

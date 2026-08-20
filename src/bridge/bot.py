@@ -229,6 +229,19 @@ class SlackUser:
 
 
 @dataclass(frozen=True)
+class SlackAppIdentity:
+    """Canonical external Slack app identity.
+
+    Slack events identify an installed app with a stable ``bot_id`` (B...),
+    while ``conversations.invite`` and ``conversations.kick`` require the
+    app's workspace user id (U...).
+    """
+
+    bot_id: str
+    user_id: str
+
+
+@dataclass(frozen=True)
 class SlackChannel:
     id: str
     name: str = ""
@@ -408,7 +421,9 @@ class Bot:
         self._closed = False
         self._socket_connected = False
         self._last_error: str | None = None
+        self._bot_id: str | None = None
         self._bot_user_id: str | None = None
+        self._app_identity_cache: dict[str, SlackAppIdentity] = {}
         self._channel: SlackChannel | None = None
         self._used_channel_names: set[str] = set()
         self._owned_channel_ids: set[str] = set()
@@ -435,6 +450,30 @@ class Bot:
     @property
     def bot_user_id(self) -> str | None:
         return self._bot_user_id
+
+    @property
+    def bot_id(self) -> str | None:
+        return self._bot_id
+
+    async def resolve_app_identity(self, bot_id: str) -> SlackAppIdentity:
+        """Resolve an external app's stable bot id to its Slack user id."""
+        key = str(bot_id).strip()
+        if not key:
+            raise ValueError("bot_id must not be empty")
+        cached = self._app_identity_cache.get(key)
+        if cached is not None:
+            return cached
+        response = await self._api("bots_info", bot=key)
+        bot = _response_value(response, "bot", {}) or {}
+        if not isinstance(bot, Mapping):
+            raise SlackAdapterError("bots.info returned malformed bot data")
+        canonical_bot_id = str(bot.get("id") or key).strip()
+        user_id = str(bot.get("user_id") or bot.get("app_user_id") or "").strip()
+        if canonical_bot_id != key or not user_id:
+            raise SlackAdapterError("bots.info response omitted canonical bot/user identity")
+        identity = SlackAppIdentity(canonical_bot_id, user_id)
+        self._app_identity_cache[key] = identity
+        return identity
 
     @property
     def client(self) -> Any:
@@ -498,13 +537,15 @@ class Bot:
     async def _validate_startup(self) -> None:
         auth = await self._api("auth_test")
         auth_team = _response_value(auth, "team_id")
-        bot_id = _response_value(auth, "user_id") or _response_value(auth, "bot_id")
-        if not auth_team or not bot_id:
-            raise SlackAdapterError("auth.test response omitted team_id or bot user_id")
+        bot_user_id = _response_value(auth, "user_id") or _response_value(auth, "bot_user_id")
+        bot_id = _response_value(auth, "bot_id") or _response_value(auth, "app_id")
+        if not auth_team or not bot_user_id:
+            raise SlackAdapterError("auth.test response omitted team_id or bot user id")
         if self._team_id and auth_team != self._team_id:
             raise SlackAdapterError(f"Slack team mismatch: expected {self._team_id}, got {auth_team}")
         self._team_id = str(auth_team)
-        self._bot_user_id = str(bot_id)
+        self._bot_user_id = str(bot_user_id)
+        self._bot_id = str(bot_id) if bot_id else None
 
         if not self._owner_user_id:
             raise SlackAdapterError("owner_user_id is required for Slack startup")
@@ -719,8 +760,12 @@ class Bot:
                 if status < 200 or status >= 300:
                     raise SlackAdapterError(f"Slack upload failed with HTTP {status}", status=status)
         finally:
+            # ``fdopen`` owns the descriptor after construction.  Null the raw
+            # fd before cleanup so an upload error cannot close it twice.
             if fd is not None:
-                os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                fd = None
             with contextlib.suppress(Exception):
                 if 'file_obj' in locals():
                     file_obj.close()
@@ -819,6 +864,7 @@ class Bot:
         total = 0
         try:
             with os.fdopen(fd, "wb", closefd=True) as output:
+                fd = None
                 content = getattr(response, "content", None)
                 if content is not None and hasattr(content, "iter_chunked"):
                     async for chunk in content.iter_chunked(_UPLOAD_CHUNK_BYTES):
@@ -849,6 +895,7 @@ class Bot:
         fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             with os.fdopen(fd, "wb", closefd=True) as handle:
+                fd = None
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -920,8 +967,12 @@ class Bot:
         return await self._api("conversations_invite", channel=channel_id, users=user_id)
 
     async def invite_participants(self, channel_id: str, user_ids: list[str]) -> Any:
-        """Invite a de-duplicated set of Slack users to a verified private channel."""
-        users = [str(user) for user in dict.fromkeys(user_ids) if str(user)]
+        """Invite humans and resolve external app B IDs to Slack U IDs."""
+        users: list[str] = []
+        for actor_id in dict.fromkeys(str(user) for user in user_ids if str(user)):
+            if actor_id.startswith("B"):
+                actor_id = (await self.resolve_app_identity(actor_id)).user_id
+            users.append(actor_id)
         if not users:
             return None
         await self._verify_managed_private_channel(channel_id)
@@ -981,8 +1032,12 @@ class Bot:
                             timestamp=str(message_id), name=name)
 
     async def remove_participants(self, channel_id: str, user_ids: list[str]) -> Any:
-        """Remove actors only from a verified managed private channel."""
-        users = [str(user) for user in dict.fromkeys(user_ids) if str(user)]
+        """Remove humans and resolve external app B IDs to Slack U IDs."""
+        users: list[str] = []
+        for actor_id in dict.fromkeys(str(user) for user in user_ids if str(user)):
+            if actor_id.startswith("B"):
+                actor_id = (await self.resolve_app_identity(actor_id)).user_id
+            users.append(actor_id)
         if not users:
             return None
         await self._verify_managed_private_channel(channel_id)
@@ -1051,13 +1106,16 @@ class Bot:
         if isinstance(payload.get("channel"), Mapping):
             channel_id = str(payload["channel"].get("id") or channel_id)
         root_ts = str(event.get("thread_ts") or event.get("ts") or payload.get("thread_ts") or payload.get("message_ts") or "")
-        actor_id = str(event.get("user") or event.get("bot_id") or payload.get("user_id") or "")
-        display = str(event.get("text") or payload.get("text") or event.get("name") or kind)
+        # bot_message events intentionally carry no ``user`` field.  Their
+        # stable authorization identity is the external app's B... bot_id;
+        # channel membership APIs resolve that to a U... user id separately.
+        actor_id = str(event.get("bot_id") or event.get("user") or payload.get("user_id") or "")
+        display = str(event.get("text") or payload.get("text") or event.get("username") or event.get("name") or kind)
         # Self-generated bot messages are filtered only when Slack verifies
         # the bot identity; arbitrary bot/app actors are not blanket-dropped.
         if event_type in {"message", "app_mention", "bot_message"} and self._bot_user_id:
-            source_actor = str(event.get("user") or event.get("bot_id") or "")
-            if source_actor == self._bot_user_id:
+            source_actor = str(event.get("bot_id") or event.get("user") or "")
+            if source_actor in {self._bot_user_id, self._bot_id}:
                 return None
         normalized = dict(payload)
         if payload.get("event") is not None:
@@ -1098,7 +1156,7 @@ class Bot:
             return
         event = normalized.get("event") if isinstance(normalized.get("event"), Mapping) else normalized
         if kind in {"message", "app_mention", "bot_message"}:
-            if self._bot_user_id and str(event.get("user") or event.get("bot_id") or "") == self._bot_user_id:
+            if str(event.get("bot_id") or event.get("user") or "") in {self._bot_user_id, self._bot_id}:
                 return
             if self._on_message_cb is not None:
                 result = self._on_message_cb(self._normalize_message(event))
@@ -1132,7 +1190,7 @@ class Bot:
         ) for file in files if isinstance(file, Mapping)]
         message_ts = str(event.get("ts") or event.get("event_ts") or "")
         root_ts = str(event.get("thread_ts") or message_ts)
-        actor_id = str(event.get("user") or event.get("bot_id") or "")
+        actor_id = str(event.get("bot_id") or event.get("user") or "")
         return SlackMessage(
             team_id=str(event.get("team") or event.get("team_id") or self._team_id or ""),
             channel_id=channel_id,

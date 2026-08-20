@@ -93,6 +93,9 @@ class FakeSupervisor:
     async def find_session(self, session_id: str):
         return object()
 
+    async def list_sessions(self):
+        return []
+
     async def list_models(self):
         return ["anthropic/claude-opus-4-8"]
 
@@ -103,6 +106,8 @@ class FakeBot:
     owner_user_id: str = "UOWNER"
     home_channel_id: str = "CHOME"
     app_actor_id: str = "AAPP"
+    bot_user_id: str = "UBRIDGE"
+    bot_id: str = "B-BRIDGE"
     posts: list[dict[str, Any]] = field(default_factory=list)
     edits: list[dict[str, Any]] = field(default_factory=list)
     roots: list[dict[str, Any]] = field(default_factory=list)
@@ -178,8 +183,39 @@ async def _task(reg: TaskRegistry, *, mode="personal", channel="CHOME", root="10
 
 def _registry(db, *, budget=20):
     bot = FakeBot()
-    reg = TaskRegistry(db, bot, FakeSupervisor(), app_actor_id="AAPP", app_exchange_budget=budget)
+    reg = TaskRegistry(db, bot, FakeSupervisor(), app_exchange_budget=budget)
     return reg, bot
+
+
+@pytest.mark.asyncio
+async def test_bind_bot_uses_production_bot_user_identity(in_memory_db):
+    bot = FakeBot()
+    registry = TaskRegistry(in_memory_db, None, FakeSupervisor(), app_actor_id="WRONG")
+    registry.bind_bot(bot)
+    assert registry.app_actor_id == "UBRIDGE"
+    assert registry.app_actor_id != bot.app_actor_id
+
+
+@pytest.mark.asyncio
+async def test_pending_promotion_absent_daemon_stays_crashed_without_consumer(in_memory_db, monkeypatch):
+    bot = FakeBot()
+    supervisor = FakeSupervisor()
+    registry = TaskRegistry(in_memory_db, None, supervisor)
+    task = Task("journal-task", "T1", "COLD", "R1", "UOWNER", "personal", "/tmp", "running", "missing-session", 41001, 1, 1)
+    await registry.attach_task(task)
+    await state.upsert_participant(in_memory_db, task.key, Participant("U1", ParticipantKind.HUMAN, "human"))
+    await state.create_promotion_journal(in_memory_db, "j1", task.task_id, task.key, "personal")
+    monkeypatch.setattr(registry, "_start_consumer", lambda task: (_ for _ in ()).throw(AssertionError("consumer started")))
+    await registry.load_from_db(reconcile_with_daemons=True)
+    loaded = registry.get_by_task_id(task.task_id)
+    assert loaded is not None and loaded.status == "crashed"
+    assert (await state.get_runtime(in_memory_db, task.task_id)).status == "crashed"
+    registry.bind_bot(bot)
+    await registry.reconcile_promotion_journals()
+    loaded = registry.get_by_task_id(task.task_id)
+    assert loaded is not None and loaded.status == "crashed"
+    assert (await state.get_runtime(in_memory_db, task.task_id)).status == "crashed"
+    assert task.task_id not in registry._consumers
 
 
 class TestAC2IdentityRouting:

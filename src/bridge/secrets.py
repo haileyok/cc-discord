@@ -150,12 +150,14 @@ def write_secrets(secrets: Secrets, path: Path = SECRETS_FILE) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
             handle.write(payload)
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise
     path.chmod(0o600)
 

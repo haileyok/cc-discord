@@ -14,7 +14,7 @@ features:
   shortcuts:
     - name: Agent
       type: global
-      callback_id: agent_global
+      callback_id: agent
       description: Open claude-slack-bridge agent controls
 settings:
   socket_mode_enabled: true
@@ -41,6 +41,7 @@ oauth_config:
       - reactions:read
       - reactions:write
       - users:read
+      - bots:read
       - groups:read
       - groups:write
       - groups:history
