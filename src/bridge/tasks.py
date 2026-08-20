@@ -245,6 +245,9 @@ class Task:
     channel_owned: bool = False
     subagent_blocks: dict[str, SubagentBlock] = field(default_factory=dict)
     last_envelope: PromptEnvelope | None = None
+    # Runtime-only path from ``polytoken sessions --format json``.  It is not
+    # persisted in SQLite; startup reconciliation re-discovers it by session id.
+    credential_file_path: str | None = None
 
     @property
     def key(self) -> ConversationKey:
@@ -578,16 +581,19 @@ class TaskRegistry:
                 # binding and mark crashed rather than guessing a new channel.
                 status = "crashed"
                 await update_runtime(self._conn, runtime.task_id, status=status, promotion_state="failed", channel_owned=False)
+            credential_file_path: str | None = None
             if listing_ok and reconcile_with_daemons:
                 info = sessions.get(str(runtime.session_id)) if runtime.session_id else None
                 if runtime.session_id and info is None and status in {"spawning", "running", "paused", "rebinding"}:
                     status = "crashed"
                     await update_runtime(self._conn, runtime.task_id, status=status, promotion_state="failed", now=int(time.time()))
-                    self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned), "💥 The session daemon was not found; task is crashed."))
-                elif info is not None and (runtime.port != info.port or runtime.cwd != info.project_path):
-                    await update_runtime(self._conn, runtime.task_id, port=info.port, cwd=info.project_path)
-                    runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned)
-            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned)
+                    self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=None), "💥 The session daemon was not found; task is crashed."))
+                elif info is not None:
+                    credential_file_path = getattr(info, "credential_file_path", None)
+                    if runtime.port != info.port or runtime.cwd != info.project_path:
+                        await update_runtime(self._conn, runtime.task_id, port=info.port, cwd=info.project_path)
+                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned)
+            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path)
             if task.channel_owned and self._bot is not None:
                 remember = getattr(self._bot, "remember_owned_channel", None)
                 if callable(remember):
@@ -711,10 +717,14 @@ class TaskRegistry:
         if task.port is None:
             raise TaskSpawnError(f"task {task.task_id[:8]} is not connected to a daemon")
         client = self._clients.get(task.task_id)
-        if client is None or client.port != task.port:
+        if (
+            client is None
+            or client.port != task.port
+            or getattr(client, "credential_file_path", None) != task.credential_file_path
+        ):
             if client is not None:
                 asyncio.create_task(client.aclose())
-            client = PolytokenClient(task.port)
+            client = PolytokenClient(task.port, credential_file_path=task.credential_file_path)
             self._clients[task.task_id] = client
         return client
 
@@ -1031,6 +1041,7 @@ class TaskRegistry:
         task.status = "running"
         task.polytoken_session_id = result.session_id
         task.port = result.port
+        task.credential_file_path = getattr(result, "credential_file_path", None)
         await self._index(task)
         self._by_session_id[result.session_id] = task
         self._start_consumer(task)

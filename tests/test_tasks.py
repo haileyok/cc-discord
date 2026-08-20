@@ -31,6 +31,7 @@ from bridge.tasks import (
 class SpawnResult:
     session_id: str
     port: int
+    credential_file_path: str | None = None
 
 
 @dataclass
@@ -83,13 +84,14 @@ class FakeSupervisor:
     _seq: int = 0
     next_channel: str = "GNEW"
     next_root: str = "9000.000"
+    credential_file_path: str | None = None
 
     async def spawn(self, cwd: str, *, config_dir=None):
         if self.fail_spawn:
             from bridge.daemon_supervisor import DaemonSupervisorError
             raise DaemonSupervisorError("spawn failed")
         self._seq += 1
-        return SpawnResult(f"sess-{self._seq}", 41000 + self._seq)
+        return SpawnResult(f"sess-{self._seq}", 41000 + self._seq, self.credential_file_path)
 
     async def find_session(self, session_id: str):
         return object()
@@ -189,6 +191,17 @@ def _registry(db, *, budget=20):
 
 
 @pytest.mark.asyncio
+async def test_fresh_spawn_carries_runtime_credential_path(in_memory_db, tmp_path):
+    bot = FakeBot()
+    supervisor = FakeSupervisor(credential_file_path=str(tmp_path / "daemon.json"))
+    registry = TaskRegistry(in_memory_db, bot, supervisor)
+    task = await registry.spawn_task(
+        "/tmp", team_id="T1", channel_id="CHOME", owner_user_id="UOWNER"
+    )
+    assert task.credential_file_path == str(tmp_path / "daemon.json")
+
+
+@pytest.mark.asyncio
 async def test_bind_bot_uses_production_bot_user_identity(in_memory_db):
     bot = FakeBot()
     registry = TaskRegistry(in_memory_db, None, FakeSupervisor(), app_actor_id="WRONG")
@@ -250,13 +263,17 @@ async def test_pending_promotion_list_failure_preserves_binding_and_retries_cons
 async def test_pending_promotion_live_daemon_restores_running_consumer_and_routing(in_memory_db, monkeypatch):
     class LiveSupervisor(FakeSupervisor):
         async def list_sessions(self):
-            return [SimpleNamespace(session_id="live-session", port=41001, project_path="/tmp")]
+            return [SimpleNamespace(
+                session_id="live-session", port=41001, project_path="/tmp",
+                credential_file_path="/run/pt/live-session.json",
+            )]
 
     bot = FakeBot()
     registry = TaskRegistry(in_memory_db, None, LiveSupervisor())
     task = Task("live-journal-task", "T1", "COLD", "R1", "UOWNER", "personal", "/tmp", "running", "live-session", 41001, 1, 1)
     await registry.attach_task(task)
     client = FakeClient(port=41001)
+    client.credential_file_path = "/run/pt/live-session.json"
     registry._clients[task.task_id] = client
     await state.upsert_participant(in_memory_db, task.key, Participant("UHELP", ParticipantKind.HUMAN, "helper"))
     await state.create_promotion_journal(in_memory_db, "live-j1", task.task_id, task.key, "personal")
@@ -269,6 +286,7 @@ async def test_pending_promotion_live_daemon_restores_running_consumer_and_routi
 
     loaded = registry.get_by_task_id(task.task_id)
     assert loaded is not None and loaded.status == "running"
+    assert loaded.credential_file_path == "/run/pt/live-session.json"
     assert (await state.get_runtime(in_memory_db, task.task_id)).status == "running"
     assert started == [task.task_id]
     assert await registry.maybe_route_message(SlackMessage("T1", "COLD", "R1", SlackActor("UOWNER"), "after restart", "E-live", "M-live"))

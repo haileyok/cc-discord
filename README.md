@@ -109,7 +109,7 @@ Slack limitations are intentional:
 
 ## Security and threat model
 
-The bridge trusts the configured Slack workspace and local host. In a personal task, only the configured owner ID can route prompts or use privileged controls; other public-channel observers are ignored. Collaborative tasks accept only the owner and explicitly enrolled participants, while privileged controls remain owner-only. A public home channel exposes task text, tool output, filenames, files, and questions to everyone who can view it, so use a private channel for confidential work. The Polytoken daemon has bypass permissions and host tools. The loopback daemon is unauthenticated by design, so keep the bridge host trusted and do not bind the health server publicly. Bot-token downloads are restricted to HTTPS Slack URLs and bounded sizes; file paths emitted by the agent must be absolute and existing before upload. Secrets are never logged and are protected with 0600/0700 modes.
+The bridge trusts the configured Slack workspace and local host. In a personal task, only the configured owner ID can route prompts or use privileged controls; other public-channel observers are ignored. Collaborative tasks accept only the owner and explicitly enrolled participants, while privileged controls remain owner-only. A public home channel exposes task text, tool output, filenames, files, and questions to everyone who can view it, so use a private channel for confidential work. The Polytoken daemon has bypass permissions and host tools; every daemon request uses its per-session bearer credential from the 0600 file reported by `polytoken sessions --format json`. Bot-token downloads are restricted to HTTPS Slack URLs and bounded sizes; file paths emitted by the agent must be absolute and existing before upload. Secrets and daemon credentials are never logged and are protected with 0600/0700 modes.
 
 This is not a security boundary against a malicious workspace member, compromised host account, malicious project checkout, or prompt injection in files. The bridge's `@` attachment references are not an extra sandbox: the agent already has shell access. Slack app scopes should be reviewed and reduced if a deployment does not need collaborative channel creation/invites.
 
@@ -127,7 +127,7 @@ This is not a security boundary against a malicious workspace member, compromise
 | `src/bridge/daemon_supervisor.py` | Spawn/list/terminate Polytoken daemons |
 | `src/bridge/state.py` | SQLite state and normalized Slack conversation records |
 
-Each daemon survives a bridge restart when discoverable through `polytoken sessions`; the bridge reattaches live sessions and marks missing sessions crashed. SSE reconnects resume after the last sequence. A live in-stream gap is made visible and reconciles cheap state; full history replay is not guaranteed.
+Each daemon survives a bridge restart when discoverable through `polytoken sessions --format json`; the bridge reattaches live sessions, reloads each daemon's 0600 bearer credential path, and marks missing sessions crashed. SSE reconnects resume after the last sequence. A live in-stream gap is made visible and reconciles cheap state; full history replay is not guaranteed.
 
 ## Development and collaboration
 

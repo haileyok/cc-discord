@@ -1,10 +1,10 @@
 """Async HTTP client for a single Polytoken daemon session.
 
 Each Polytoken session is a daemon process bound to a loopback port
-(``http://127.0.0.1:<port>``). The daemon is unauthenticated and reachable
-only over loopback. This client wraps the per-session endpoints the bridge
-needs: prompting, the ``/events`` SSE stream, history/state reads,
-interrogative responses, and the lifecycle verbs.
+(``http://127.0.0.1:<port>``) and protected by a per-session bearer token.
+The credential file is validated locally before the first request. This client
+wraps the per-session endpoints the bridge needs: prompting, the ``/events``
+SSE stream, history/state reads, interrogative responses, and lifecycle verbs.
 
 Built on ``aiohttp`` so it shares the bridge's single asyncio event loop and
 existing HTTP stack (no extra dependency).
@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+import stat
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -43,6 +45,48 @@ class PolytokenClientError(Exception):
         super().__init__(message)
         self.status = status
         self.body = None
+
+
+class PolytokenCredentialError(PolytokenClientError):
+    """Raised when a daemon bearer credential file is missing or unsafe."""
+
+
+def load_bearer_token(path: str | Path) -> str:
+    """Load and validate a Polytoken 0.6 daemon credential file.
+
+    Credential files must be non-symlink regular files with exactly ``0600``
+    permission bits and a JSON object containing ``version: 1``,
+    ``kind: "bearer"``, and a non-empty string ``token``.  Error messages never
+    include the token or file contents.
+    """
+    credential_path = Path(path).expanduser()
+    try:
+        if credential_path.is_symlink():
+            raise PolytokenCredentialError("Polytoken credential file must not be a symlink")
+        file_stat = credential_path.stat()
+    except PolytokenCredentialError:
+        raise
+    except OSError as exc:
+        raise PolytokenCredentialError("cannot access Polytoken credential file") from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise PolytokenCredentialError("Polytoken credential path is not a regular file")
+    if stat.S_IMODE(file_stat.st_mode) != 0o600:
+        raise PolytokenCredentialError("Polytoken credential file must have mode 0600")
+    try:
+        with credential_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeError) as exc:
+        raise PolytokenCredentialError("cannot read Polytoken credential file") from exc
+    except json.JSONDecodeError as exc:
+        raise PolytokenCredentialError("Polytoken credential file contains invalid JSON") from exc
+    if not isinstance(data, Mapping):
+        raise PolytokenCredentialError("Polytoken credential file must contain a JSON object")
+    if data.get("version") != 1 or data.get("kind") != "bearer":
+        raise PolytokenCredentialError("Polytoken credential file has an unsupported schema")
+    token = data.get("token")
+    if not isinstance(token, str) or not token or not token.strip() or token != token.strip():
+        raise PolytokenCredentialError("Polytoken credential token is missing or invalid")
+    return token
 
 
 class TurnInFlight(PolytokenClientError):
@@ -87,11 +131,14 @@ class PromptAccepted:
 
 
 class PolytokenClient:
-    """HTTP client bound to one daemon session at ``http://<host>:<port>``.
+    """Authenticated HTTP client for one daemon at ``http://<host>:<port>``.
 
+    ``credential_file_path`` is the path from the Polytoken session registry.
     Pass a shared ``aiohttp.ClientSession`` to pool connections across many
     per-task clients; otherwise the client lazily owns its own session and
-    closes it in :meth:`aclose`.
+    closes it in :meth:`aclose`.  The optional missing path is retained only for
+    compatibility with pre-auth test doubles; supervised 0.6 sessions always
+    provide one.
     """
 
     def __init__(
@@ -99,11 +146,17 @@ class PolytokenClient:
         port: int,
         *,
         host: str = "127.0.0.1",
+        credential_file_path: str | Path | None = None,
         session: aiohttp.ClientSession | None = None,
         timeout_secs: float = _DEFAULT_TIMEOUT_SECS,
     ) -> None:
         self.port = port
         self.host = host
+        self.credential_file_path = (
+            str(Path(credential_file_path).expanduser())
+            if credential_file_path is not None else None
+        )
+        self._token = load_bearer_token(credential_file_path) if credential_file_path is not None else None
         self._base = f"http://{host}:{port}"
         self._session = session
         self._owns_session = session is None
@@ -131,6 +184,11 @@ class PolytokenClient:
     def _url(self, path: str) -> str:
         return f"{self._base}{path}"
 
+    def _auth_headers(self) -> dict[str, str]:
+        if self._token is None:
+            return {}
+        return {"Authorization": f"Bearer {self._token}"}
+
     async def _request(
         self,
         method: str,
@@ -151,6 +209,7 @@ class PolytokenClient:
                 self._url(path),
                 json=json_body,
                 params=params,
+                headers=self._auth_headers(),
                 timeout=self._timeout,
             ) as resp:
                 text = await resp.text()
@@ -272,7 +331,7 @@ class PolytokenClient:
         connection drops, then reconnect (reconciling via :meth:`history` if
         a ``stream_discontinuity`` is observed).
         """
-        headers = {"Accept": "text/event-stream"}
+        headers = {"Accept": "text/event-stream", **self._auth_headers()}
         if last_seq is not None:
             headers["Last-Event-ID"] = str(last_seq)
         # No total/read deadline: the stream stays open between events. A
@@ -284,7 +343,8 @@ class PolytokenClient:
                 self._url("/events"), headers=headers, timeout=stream_timeout
             ) as resp:
                 if resp.status != 200:
-                    body = await resp.text()
+                    # Do not read or retain a rejection body; it may contain
+                    # prompts, credentials, paths, or upstream diagnostics.
                     raise PolytokenClientError(
                         "Polytoken event stream rejected the request", status=resp.status
                     )

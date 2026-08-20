@@ -371,7 +371,11 @@ class CommandDispatcher:
         channel = _channel_id(payload) or str(getattr(self.bot, "home_channel_id", ""))
         task = await self.registry.spawn_task(cwd, team_id=team, channel_id=channel, owner_user_id=actor, prompt=prompt)
         await self._decorate_root(task)
-        return await self._reply(payload, f"✅ Started task `{task.task_id[:8]}` in `{Path(task.cwd).name}` → <#{task.channel_id}>", blocks=build_task_root_blocks(task.task_id, mode=task.mode))
+        return await self._reply(
+            payload,
+            f"✅ Started task `{task.task_id[:8]}` in `{Path(task.cwd).name}`. "
+            "Open the task message in the channel and choose *Reply in thread* to work with the agent.",
+        )
 
     async def _session_command(self, payload: Mapping[str, Any], name: str, args: dict[str, str], tokens: list[str], actor: str) -> SlackResponse:
         task = await self._task_from_payload(payload, actor, require_owner=True)
@@ -632,8 +636,13 @@ class CommandDispatcher:
         if not callable(editor):
             return
         blocks = build_task_root_blocks(task.task_id, mode=task.mode)
-        result = editor(task.channel_id, task.root_ts,
-                        text=f"Task `{task.task_id[:8]}` · `{Path(task.cwd).name}`", blocks=blocks)
+        result = editor(
+            task.channel_id,
+            task.root_ts,
+            text=(f"🤖 *Agent task* `{task.task_id[:8]}` · `{Path(task.cwd).name}`\n"
+                  "Reply in this message's thread to work with the agent. Agent output will stay in the thread."),
+            blocks=blocks,
+        )
         if inspect.isawaitable(result):
             await result
 

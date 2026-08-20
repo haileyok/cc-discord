@@ -154,6 +154,23 @@ async def test_socket_normalization_and_ack_before_slow_work(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_start_is_thread_first_and_does_not_duplicate_control_blocks(tmp_path: Path) -> None:
+    registry = LocalRegistry()
+    bot = LocalBot()
+    dispatcher = CommandDispatcher(bot, registry)
+    response = await dispatcher.dispatch({
+        "type": "slash_commands", "command": "/agent",
+        "team_id": "T1", "channel_id": "GHOME", "user_id": "UOWNER",
+        "text": f"start cwd={tmp_path}",
+    })
+    assert response.blocks is None
+    assert "Reply in thread" in response.text
+    assert len(bot.edits) == 1
+    assert "Reply in this message's thread" in bot.edits[0]["text"]
+    assert bot.edits[0]["blocks"]
+
+
+@pytest.mark.asyncio
 async def test_owner_only_privileged_control_has_no_side_effect(tmp_path: Path) -> None:
     registry = LocalRegistry()
     dispatcher = CommandDispatcher(LocalBot(), registry)

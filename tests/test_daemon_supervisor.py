@@ -30,6 +30,15 @@ _SESSIONS_OUT = """SESSION_ID                  PORT    PID      STARTED_AT      
 03hqrb-life                 34017   4074715  2026-06-15T03:18:35Z     /tmp/pt probe with spaces
 """
 
+_SESSIONS_JSON = """[
+  {"session_id": "03hess-salt", "port": 41515, "pid": 3701047,
+   "started_at": "2026-06-15T00:45:45Z", "project_path": "/home/slack",
+   "credential_file_path": "/run/user/1000/polytoken/03hess-salt.json"},
+  {"session_id": "03hqrb-life", "port": 34017, "pid": 4074715,
+   "started_at": "2026-06-15T03:18:35Z", "project_path": "/tmp/pt probe with spaces",
+   "credential_file_path": "/run/user/1000/polytoken/03hqrb-life.json"}
+]"""
+
 
 _NO_FAIL = object()
 
@@ -52,12 +61,16 @@ class FakeClient:
 class TestSpawn:
     async def test_spawn_parses_id_and_port(self) -> None:
         runner = make_runner(
-            {("new", "--no-attach"): (0, "session_id=03abc-foo port=34521\n", "")}
+            {
+                ("new", "--no-attach"): (0, "session_id=03abc-foo port=34521\n", ""),
+                ("sessions", "--format", "json"): (0, '[{"session_id":"03abc-foo","port":34521,"pid":1,"started_at":"t","project_path":"/work/dir","credential_file_path":"/run/pt/03abc-foo.json"}]', ""),
+            }
         )
         sup = DaemonSupervisor(runner=runner)
         res = await sup.spawn("/work/dir")
         assert res.session_id == "03abc-foo"
         assert res.port == 34521
+        assert res.credential_file_path == "/run/pt/03abc-foo.json"
         # working-dir and the subcommand are present.
         argv = runner.calls[0]  # type: ignore[attr-defined]
         assert "--working-dir" in argv and "/work/dir" in argv
@@ -65,7 +78,10 @@ class TestSpawn:
 
     async def test_spawn_includes_config_dir(self) -> None:
         runner = make_runner(
-            {("new", "--no-attach"): (0, "session_id=s port=1\n", "")}
+            {
+                ("new", "--no-attach"): (0, "session_id=s port=1\n", ""),
+                ("sessions", "--format", "json"): (0, '[{"session_id":"s","port":1,"pid":1,"started_at":"t","project_path":"/w","credential_file_path":"/run/pt/s.json"}]', ""),
+            }
         )
         sup = DaemonSupervisor(runner=runner)
         await sup.spawn("/w", config_dir="/cfg")
@@ -94,6 +110,13 @@ class TestListSessions:
         assert rows[0] == SessionInfo(
             "03hess-salt", 41515, 3701047, "2026-06-15T00:45:45Z", "/home/slack"
         )
+        assert rows[1].project_path == "/tmp/pt probe with spaces"
+
+    async def test_parses_json_registry_and_credential_paths(self) -> None:
+        runner = make_runner({("sessions", "--format", "json"): (0, _SESSIONS_JSON, "")})
+        sup = DaemonSupervisor(runner=runner)
+        rows = await sup.list_sessions()
+        assert rows[0].credential_file_path == "/run/user/1000/polytoken/03hess-salt.json"
         assert rows[1].project_path == "/tmp/pt probe with spaces"
 
     async def test_nonzero_raises(self) -> None:
@@ -150,6 +173,19 @@ class TestTerminate:
         ok = await sup.terminate("03hess-salt")
         assert ok is True
         assert fake.terminated and fake.closed
+
+    async def test_terminate_passes_registry_credential_path(self) -> None:
+        runner = make_runner({("sessions", "--format", "json"): (0, _SESSIONS_JSON, "")})
+        fake = FakeClient()
+        seen: list[tuple[int, str | None]] = []
+
+        def factory(port: int, credential_file_path: str | None = None):
+            seen.append((port, credential_file_path))
+            return fake
+
+        sup = DaemonSupervisor(runner=runner, client_factory=factory)
+        assert await sup.terminate("03hess-salt") is True
+        assert seen == [(41515, "/run/user/1000/polytoken/03hess-salt.json")]
 
     async def test_terminate_unknown_session(self) -> None:
         runner = make_runner({("sessions",): (0, _SESSIONS_OUT, "")})
