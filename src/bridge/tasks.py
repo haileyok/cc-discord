@@ -77,6 +77,7 @@ from bridge.state import (
     get_pending_interrogative,
     get_root,
     get_runtime,
+    get_runtime_by_key,
     list_runtime,
     replace_runtime_binding,
     restore_runtime_binding,
@@ -588,6 +589,50 @@ class TaskRegistry:
     def get_by_conversation(self, team_id: str, channel_id: str, root_ts: str) -> Task | None:
         return self._by_key.get(ConversationKey(team_id, channel_id, root_ts))
 
+    async def restore_by_conversation(self, team_id: str, channel_id: str, root_ts: str) -> Task | None:
+        """Restore a durable active binding that is unexpectedly absent from memory."""
+        key = ConversationKey(team_id, channel_id, root_ts)
+        existing = self._by_key.get(key)
+        if existing is not None:
+            return existing
+        runtime = await get_runtime_by_key(self._conn, key)
+        if runtime is None or runtime.status not in {"running", "spawning", "paused", "rebinding"}:
+            return None
+        credential_file_path: str | None = None
+        if runtime.session_id:
+            try:
+                info = await self._supervisor.find_session(str(runtime.session_id))
+            except DaemonSupervisorError:
+                info = None
+            if info is not None:
+                credential_file_path = getattr(info, "credential_file_path", None)
+                runtime = RuntimeRow(
+                    runtime.task_id, runtime.key, runtime.session_id,
+                    int(getattr(info, "port", runtime.port) or runtime.port or 0),
+                    runtime.status, str(getattr(info, "project_path", runtime.cwd) or runtime.cwd), runtime.owner,
+                    runtime.created_at, runtime.last_activity,
+                    runtime.app_exchange_budget, runtime.app_exchanges,
+                    runtime.owner_alerted, runtime.promotion_state,
+                    runtime.binding_id, runtime.cleanup_pending,
+                    runtime.channel_owned, runtime.mention_required,
+                )
+        task = Task(
+            runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id),
+            str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode),
+            runtime.cwd, runtime.status, runtime.session_id, runtime.port,
+            runtime.created_at, runtime.last_activity, runtime.app_exchange_budget,
+            runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state,
+            runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned,
+            credential_file_path=credential_file_path,
+            mention_required=runtime.mention_required,
+        )
+        self._disabled_roots.discard(task.key)
+        await self._index(task)
+        if task.status in {"running", "spawning"}:
+            self._start_consumer(task)
+        log.warning("restored missing in-memory Slack task binding for %s", task.task_id[:8])
+        return task
+
     def get_by_session_id(self, session_id: str) -> Task | None:
         return self._by_session_id.get(session_id)
 
@@ -750,8 +795,10 @@ class TaskRegistry:
         self._startup_notices.clear()
 
     async def attach_task(self, task: Task, *, start_consumer: bool = False) -> Task:
-        await self._index(task)
+        # SQLite owns conversation uniqueness. Never evict a healthy in-memory
+        # binding before the durable write succeeds.
         await self._persist_root(task)
+        await self._index(task)
         if start_consumer and task.status in {"running", "spawning"}:
             self._start_consumer(task)
         return task
@@ -1327,6 +1374,10 @@ class TaskRegistry:
             existing = self.get_by_conversation(team_id, channel_id, root_ts)
             if existing is not None and existing.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
                 raise TaskRoutingError("that Slack thread already has an active task")
+            if existing is None:
+                restored = await self.restore_by_conversation(team_id, channel_id, root_ts)
+                if restored is not None and restored.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
+                    return restored
         task_id = str(uuid.uuid4())
         created = int(time.time())
         if root_ts is None:

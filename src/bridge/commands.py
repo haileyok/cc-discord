@@ -637,6 +637,10 @@ class CommandDispatcher:
             if not team or not channel or not root or _team_id(payload, self.bot) != team:
                 raise TaskRoutingError("selected Slack thread binding is invalid")
             existing = self.registry.get_by_conversation(team, channel, root)
+            if existing is None:
+                restore = getattr(self.registry, "restore_by_conversation", None)
+                if callable(restore):
+                    existing = await restore(team, channel, root)
             if existing is not None and existing.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
                 return await self._reply(
                     payload,

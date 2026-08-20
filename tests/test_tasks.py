@@ -788,6 +788,24 @@ class TestAC10DedupAndDaemonErrors:
 
 
 @pytest.mark.asyncio
+async def test_existing_root_restores_durable_binding_before_duplicate_spawn(in_memory_db, tmp_path):
+    reg, _ = _registry(in_memory_db)
+    original, _ = await _task(reg, root="1000.restore")
+    reg._by_key.clear()
+    reg._by_task_id.clear()
+    reg._by_session_id.clear()
+
+    restored = await reg.spawn_task(
+        str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER",
+        root_ts=original.root_ts, bind_existing_root=True,
+    )
+    assert restored.task_id == original.task_id
+    assert reg._supervisor._seq == 0
+    assert reg.get_by_conversation("T1", "CHOME", original.root_ts) is restored
+    await reg.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_existing_root_fetches_paginated_history_once_with_order_files_and_duplicate_guard(in_memory_db, tmp_path):
     reg, bot = _registry(in_memory_db)
     bot.thread_pages = {

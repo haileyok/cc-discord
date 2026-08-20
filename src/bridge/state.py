@@ -508,6 +508,16 @@ async def get_runtime(conn: aiosqlite.Connection, task_id: str) -> RuntimeRow | 
     return _runtime_from_row(row) if row is not None else None
 
 
+async def get_runtime_by_key(conn: aiosqlite.Connection, key: ConversationKey) -> RuntimeRow | None:
+    key = _key(key)
+    cursor = await conn.execute(
+        _RUNTIME_SELECT + " WHERE team_id = ? AND channel_id = ? AND root_id = ?",
+        (key.team_id, key.channel_id, key.root_id),
+    )
+    row = await cursor.fetchone()
+    return _runtime_from_row(row) if row is not None else None
+
+
 async def list_runtime(conn: aiosqlite.Connection) -> list[RuntimeRow]:
     cursor = await conn.execute(_RUNTIME_SELECT + " ORDER BY last_activity DESC, task_id")
     return [_runtime_from_row(row) for row in await cursor.fetchall()]
@@ -1266,6 +1276,7 @@ __all__ = [
     "consume_pending_interrogative",
     "ensure_state_dir",
     "get_runtime",
+    "get_runtime_by_key",
     "list_runtime",
     "replace_runtime_binding",
     "restore_runtime_binding",
