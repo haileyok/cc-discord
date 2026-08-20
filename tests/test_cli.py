@@ -169,7 +169,7 @@ class TestDoctorCommand:
     def test_doctor_bad_slack_startup_fails(self, tmp_path, monkeypatch) -> None:
         class BadBot(ReadyBot):
             async def start(self):
-                raise RuntimeError("private home channel membership failed")
+                raise RuntimeError("home channel membership failed")
         which, run = _mock_subprocess()
         result = self._run(
             tmp_path, monkeypatch, which=which, run_fn=run,

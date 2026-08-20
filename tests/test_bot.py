@@ -92,16 +92,27 @@ class TestAC1StartupAndHealth:
         assert socket.connected
 
     @pytest.mark.asyncio
-    async def test_startup_rejects_public_or_nonmember_home(self) -> None:
-        for private, member, message in [
-            (False, True, "must be private"),
-            (True, False, "not a member"),
-        ]:
-            client = FakeSlackClient(script=_startup_script(private=private, member=member))
-            bot = _ready_bot(client=client)
-            with pytest.raises(SlackAdapterError, match=message):
-                await bot.start()
-            assert not bot.is_ready
+    async def test_startup_accepts_public_home_channel(self) -> None:
+        client = FakeSlackClient(script=_startup_script(private=False, member=True))
+        bot = _ready_bot(client=client)
+        await bot.start()
+        assert bot.is_ready
+        assert bot.channel is not None and not bot.channel.is_private
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_nonmember_home(self) -> None:
+        client = FakeSlackClient(script=_startup_script(private=False, member=False))
+        bot = _ready_bot(client=client)
+        with pytest.raises(SlackAdapterError, match="not a member"):
+            await bot.start()
+        assert not bot.is_ready
+
+    def test_manifest_supports_public_and_private_home_channels(self) -> None:
+        manifest = (Path(__file__).parents[1] / "slack-app-manifest.yaml").read_text()
+        assert "- message.channels" in manifest
+        assert "- message.groups" in manifest
+        assert "- channels:history" in manifest
+        assert "- groups:history" in manifest
 
     @pytest.mark.asyncio
     async def test_not_ready_guard(self) -> None:

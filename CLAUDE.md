@@ -31,13 +31,13 @@ Slack Web API + Socket Mode
                      daemon_supervisor.py
 ```
 
-`Bot.start()` validates `auth.test`, configured team, owner lookup, and the configured private home channel's identity/private/member flags. If an app token is configured it connects Socket Mode and dispatches `message`, `app_mention`, and reaction events. The `Bot` surface intentionally has provider-neutral method names consumed by `TaskRegistry`; Slack-specific behavior belongs in `bot.py`, not in task logic.
+`Bot.start()` validates `auth.test`, configured team, owner lookup, and the configured public or private home channel's identity/member flags. If an app token is configured it connects Socket Mode and dispatches `message`, `app_mention`, and reaction events. The `Bot` surface intentionally has provider-neutral method names consumed by `TaskRegistry`; Slack-specific behavior belongs in `bot.py`, not in task logic.
 
 A task is keyed by `(team_id, channel_id, root_ts)` and owned by one Slack user. Personal tasks accept the owner; collaborative tasks maintain explicit participants and can create a private channel. A task runs one Polytoken daemon rooted at its project directory. Runtime ports are stored/discovered for reattachment but are not stable identities.
 
 ## Security / threat model (non-negotiable)
 
-The configured Slack channel is a local-operator trust boundary, not a sandbox. A person who can post a routed message can cause the bypass-mode Polytoken agent to run arbitrary host commands, read/write project files, use network tools, and resolve `@<path>` references. Prompt text is proxied verbatim. Never invite untrusted users; never put secrets or sensitive production work in a shared task channel.
+Authorization is based on stable actor IDs, not channel visibility. Personal tasks route only the configured owner; collaborative tasks route the owner plus explicit participants, and privileged controls remain owner-only. A public home channel may therefore have read-only observers, but it exposes all task output and attachments to them. Any actor authorized to post a routed message can cause the bypass-mode Polytoken agent to run arbitrary host commands, read/write project files, use network tools, and resolve `@<path>` references. Prompt text is proxied verbatim. Never authorize untrusted participants; never put secrets or sensitive production work in a publicly visible task.
 
 The loopback Polytoken HTTP daemon is unauthenticated by design. Keep the health server on `127.0.0.1`; do not expose it to a network. A compromised local account, project checkout, Slack workspace member, or prompt-injected file is outside the bridge's defense boundary. Agent attachment markers are not a sandbox expansion: shell access already exists.
 
@@ -51,7 +51,7 @@ Secrets are Slack-only JSON fields:
 
 `src/bridge/secrets.py` never reads Discord keys or probes a Discord path. Writes use 0600 for the file and 0700 for its directory. Do not log token values, include them in errors, or add user-token impersonation. Keep Slack file downloads authenticated, HTTPS-only, and bounded; keep uploads bounded and limited to the adapter's supported APIs.
 
-Manifest scopes are intentionally bot scopes for private channels, files, reactions, users, and channel management. There must be no `oauth_config.scopes.user` block. If a new feature needs a scope, update the manifest, README, and threat-model review together.
+Manifest scopes are intentionally bot scopes for public/private channel history, files, reactions, users, and channel management. There must be no `oauth_config.scopes.user` block. If a new feature needs a scope, update the manifest, README, and threat-model review together.
 
 ## Event and routing invariants
 
@@ -78,7 +78,7 @@ Collaborative task routing permits explicitly authorized app actors but bounds a
 
 1. Secrets file exists and is 0600; parent config directory is 0700.
 2. All Slack fields and token prefixes validate.
-3. Real Slack startup validates bot identity, workspace/team, owner, private home-channel membership, and observable Socket Mode state.
+3. Real Slack startup validates bot identity, workspace/team, owner, public/private home-channel membership, and observable Socket Mode state.
 4. Local `/v1/health` is reachable and reports connected state.
 5. `polytoken --version` and a throwaway `polytoken new --no-attach` smoke succeed; the smoke daemon is terminated.
 6. `~/.local/state/claude-slack-bridge` (or `BRIDGE_STATE_DIR`) is private and writable.

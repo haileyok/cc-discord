@@ -566,14 +566,12 @@ class Bot:
         actual_channel = str(channel.get("id", self._channel_id))
         if actual_channel != self._channel_id:
             raise SlackAdapterError("configured home channel does not match conversations.info")
-        if not bool(channel.get("is_private", False)):
-            raise SlackAdapterError("configured Slack home channel must be private")
         if not bool(channel.get("is_member", False)):
             raise SlackAdapterError("Slack bot is not a member of the configured home channel")
         self._channel = SlackChannel(
             id=self._channel_id,
             name=str(channel.get("name", "")),
-            is_private=True,
+            is_private=bool(channel.get("is_private", False)),
             is_member=True,
         )
 

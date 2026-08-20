@@ -17,7 +17,7 @@
 
 - Python 3.12 managed by [uv](https://docs.astral.sh/uv/) (`.python-version`).
 - A Slack app installed in the target workspace with Socket Mode enabled. Use [`slack-app-manifest.yaml`](slack-app-manifest.yaml) as the starting manifest.
-- A private Slack home channel containing the bot. The bot needs the manifest's bot scopes; no user token is needed or accepted.
+- A public or private Slack home channel containing the bot. Public channels make task output visible but do not grant prompt/control authority; no user token is needed or accepted.
 - The `polytoken` executable on `PATH` (the service unit sets a conservative explicit PATH; add your install location if needed).
 
 ## Slack app setup
@@ -25,10 +25,10 @@
 1. Create a Slack app from `slack-app-manifest.yaml` (or add the equivalent settings in the Slack app dashboard).
 2. Enable **Socket Mode** and create an app-level token with the `connections:write` scope. Keep the resulting `xapp-...` token private.
 3. Install/reinstall the app in the workspace. Copy the bot token (`xoxb-...`) and app token (`xapp-...`). Do not create or use a user token for this bridge.
-4. Enable the manifest's `/agent`, global shortcut, interactivity, `message.groups`, `app_mention`, and reaction subscriptions.
-5. Invite the bot to a private home channel. Record the workspace team ID, home channel ID, and the trusted owner's user ID.
+4. Enable the manifest's `/agent`, global shortcut, interactivity, `message.channels`, `message.groups`, `app_mention`, and reaction subscriptions.
+5. Invite the bot to a public or private home channel. Record the workspace team ID, home channel ID, and the trusted owner's user ID.
 
-The manifest intentionally enables private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) and channel create/invite/archive support through the relevant channel-management scopes. Review scopes against your workspace policy before installing.
+The manifest enables public-channel history for an observable home channel and private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) for private homes and promoted collaboration channels. Review scopes against your workspace policy before installing.
 
 ## Install and configure
 
@@ -39,14 +39,14 @@ uv sync
 uv run claude-slack-bridge init
 ```
 
-`init` explains the manifest/install requirements, prompts for exactly these fields, writes them to `~/.config/claude-slack-bridge/secrets.json`, and validates by starting the real Slack `Bot`: `auth.test`, configured team, owner lookup, private home-channel membership, and Socket Mode. It posts a confirmation message only after startup succeeds.
+`init` explains the manifest/install requirements, prompts for exactly these fields, writes them to `~/.config/claude-slack-bridge/secrets.json`, and validates by starting the real Slack `Bot`: `auth.test`, configured team, owner lookup, home-channel membership, and Socket Mode. It posts a confirmation message only after startup succeeds.
 
 | JSON key | Value |
 |---|---|
 | `SLACK_BOT_TOKEN` | `xoxb-...` bot token |
 | `SLACK_APP_TOKEN` | `xapp-...` app-level Socket Mode token |
 | `SLACK_TEAM_ID` | Workspace ID, usually `T...` |
-| `SLACK_HOME_CHANNEL_ID` | Private home channel ID, usually `C...` or `G...` |
+| `SLACK_HOME_CHANNEL_ID` | Public or private home channel ID, usually `C...` or `G...` |
 | `SLACK_OWNER_USER_ID` | Trusted operator's user ID, usually `U...` |
 
 The secrets directory is mode `0700`; the JSON file is mode `0600`. `BRIDGE_SECRETS_PATH` may point to an intentionally chosen alternate file for tests/deployment. There is no automatic Discord-config fallback or migration.
@@ -77,7 +77,7 @@ Check setup and live connectivity:
 uv run claude-slack-bridge doctor
 ```
 
-`doctor` checks secrets and directory modes, Slack identity/team/private-channel membership and observable Socket Mode state, local bridge health, Polytoken version plus a throwaway headless spawn/termination smoke, private state storage, and warns if a legacy Discord unit/process is still visible. Live checks require network access and a running daemon; warnings distinguish non-observable runtime state from hard failures.
+`doctor` checks secrets and directory modes, Slack identity/team/home-channel membership and observable Socket Mode state, local bridge health, Polytoken version plus a throwaway headless spawn/termination smoke, private state storage, and warns if a legacy Discord unit/process is still visible. Live checks require network access and a running daemon; warnings distinguish non-observable runtime state from hard failures.
 
 ## Commands and routing
 
@@ -109,7 +109,7 @@ Slack limitations are intentional:
 
 ## Security and threat model
 
-The bridge trusts the configured Slack workspace/channel and the local host. Slack participants can control prompts, and the Polytoken daemon has bypass permissions and host tools. Do not place secrets, production credentials, or untrusted users in a routed channel; use a separate private workspace/channel when possible. The loopback daemon is unauthenticated by design, so keep the bridge host trusted and do not bind the health server publicly. Bot-token downloads are restricted to HTTPS Slack URLs and bounded sizes; file paths emitted by the agent must be absolute and existing before upload. Secrets are never logged and are protected with 0600/0700 modes.
+The bridge trusts the configured Slack workspace and local host. In a personal task, only the configured owner ID can route prompts or use privileged controls; other public-channel observers are ignored. Collaborative tasks accept only the owner and explicitly enrolled participants, while privileged controls remain owner-only. A public home channel exposes task text, tool output, filenames, files, and questions to everyone who can view it, so use a private channel for confidential work. The Polytoken daemon has bypass permissions and host tools. The loopback daemon is unauthenticated by design, so keep the bridge host trusted and do not bind the health server publicly. Bot-token downloads are restricted to HTTPS Slack URLs and bounded sizes; file paths emitted by the agent must be absolute and existing before upload. Secrets are never logged and are protected with 0600/0700 modes.
 
 This is not a security boundary against a malicious workspace member, compromised host account, malicious project checkout, or prompt injection in files. The bridge's `@` attachment references are not an extra sandbox: the agent already has shell access. Slack app scopes should be reviewed and reduced if a deployment does not need collaborative channel creation/invites.
 

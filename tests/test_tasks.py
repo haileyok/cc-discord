@@ -318,7 +318,7 @@ async def test_restart_cleanup_remembers_journal_channel_before_verified_archive
 
 
 class TestAC2IdentityRouting:
-    async def test_owner_only_personal_and_conversation_key_index(self, in_memory_db):
+    async def test_public_home_observer_cannot_prompt_personal_task(self, in_memory_db):
         reg, _ = _registry(in_memory_db)
         task, client = await _task(reg)
         assert reg.get_by_key(_key(task)) is task

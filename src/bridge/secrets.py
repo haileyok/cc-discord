@@ -50,7 +50,7 @@ class Secrets:
 
     @property
     def channel_id(self) -> str:
-        """Compatibility alias for the configured private home channel."""
+        """Compatibility alias for the configured public or private home channel."""
         return self.home_channel_id
 
 

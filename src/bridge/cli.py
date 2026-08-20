@@ -69,7 +69,7 @@ async def _validate_slack_and_post_test(secrets: Secrets) -> bool:
 
 
 async def _check_slack_startup(secrets: Secrets) -> dict[str, Any]:
-    """Validate Slack identity, team, private home membership, and Socket Mode."""
+    """Validate Slack identity, team, home-channel membership, and Socket Mode."""
     bot = Bot(
         secrets.bot_token,
         team_id=secrets.team_id,
@@ -103,8 +103,8 @@ def init() -> None:
     click.echo("Before continuing, create/install the Slack app from:")
     click.echo("  slack-app-manifest.yaml (Socket Mode; /agent; shortcuts/interactivity)")
     click.echo("Install it in your workspace and copy the xoxb bot token and xapp app token.")
-    click.echo("The bot must be invited to a private home channel and have the manifest scopes.")
-    click.echo("The wizard validates auth.test, team identity, owner identity, private-channel membership, and Socket Mode by starting Bot.")
+    click.echo("The bot must be invited to the configured public or private home channel and have the manifest scopes.")
+    click.echo("The wizard validates auth.test, team identity, owner identity, channel membership, and Socket Mode by starting Bot.")
     click.echo()
 
     secrets_path = _secrets_path()
@@ -116,14 +116,14 @@ def init() -> None:
     bot_token = click.prompt("SLACK_BOT_TOKEN (xoxb-...)", hide_input=True)
     app_token = click.prompt("SLACK_APP_TOKEN (xapp-...)", hide_input=True)
     team_id = click.prompt("SLACK_TEAM_ID (T...)")
-    home_channel_id = click.prompt("SLACK_HOME_CHANNEL_ID (private C.../G...)")
+    home_channel_id = click.prompt("SLACK_HOME_CHANNEL_ID (public/private C.../G...)")
     owner_user_id = click.prompt("SLACK_OWNER_USER_ID (U...)")
 
     click.echo()
     click.echo("Required Slack app setup:")
     click.echo("  • Enable Socket Mode and use an app-level xapp token.")
     click.echo("  • Enable /agent, shortcuts, and interactivity in the app manifest.")
-    click.echo("  • Invite the bot to the configured private home channel.")
+    click.echo("  • Invite the bot to the configured public or private home channel.")
     click.echo("  • Do not configure a user token or user-token impersonation.")
 
     secrets = Secrets(
@@ -153,7 +153,10 @@ def init() -> None:
     try:
         success = asyncio.run(_validate_slack_and_post_test(secrets))
     except Exception as exc:
-        click.echo("Error: Slack startup validation failed.", err=True)
+        click.echo(
+            f"Error: {safe_error(exc, 'Slack startup validation failed')}",
+            err=True,
+        )
         raise click.exceptions.Exit(2) from exc
     if not success:
         click.echo("Error: Slack startup did not become ready before timeout.", err=True)
@@ -343,7 +346,7 @@ def doctor() -> None:
         try:
             health = asyncio.run(_check_slack_startup(secrets))
             click.echo(
-                f"[ok] Slack startup — identity {health.get('bot_user_id') or '?'}; team {health.get('team_id') or '?'}; private home channel membership verified"
+                f"[ok] Slack startup — identity {health.get('bot_user_id') or '?'}; team {health.get('team_id') or '?'}; home channel membership verified"
             )
             if health.get("socket_mode_connected") is True:
                 click.echo("[ok] Socket Mode — connected")
@@ -351,7 +354,7 @@ def doctor() -> None:
                 click.echo("[warn] Socket Mode — app token is configured but connection was not observable", err=True)
                 warned = True
         except Exception as exc:
-            click.echo("[fail] Slack startup — identity/team/private-channel/Socket Mode check failed", err=True)
+            click.echo("[fail] Slack startup — identity/team/home-channel/Socket Mode check failed", err=True)
             failed = True
 
     health_failed, health_warned = _doctor_health()
