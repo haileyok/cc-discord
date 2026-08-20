@@ -5,6 +5,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from bridge.commands import (
     SlackResponse,
     build_task_root_blocks,
     normalize_socket_payload,
+    _resolve_working_directory,
 )
 from bridge.domain import ConversationKey
 from bridge.tasks import Task, TaskPrivilegeError
@@ -207,6 +209,14 @@ async def test_agent_commands_cover_model_facet_effort_title_stats_todos_and_pin
     names = [name for name, _, _ in registry.calls]
     assert "set_model" in names and "set_facet" in names and "set_effort" in names
     assert any(edit["channel_id"] == "GHOME" and edit["message_ts"] == "100.1" and edit["text"] == "New title" for edit in bot.edits)
+
+
+def test_working_directory_resolution_accepts_quotes_case_and_aliases(tmp_path: Path) -> None:
+    project = SimpleNamespace(name="attie", root_label="bluesky", path=tmp_path)
+    assert _resolve_working_directory("Attie", [project])[0] == str(tmp_path.resolve())
+    assert _resolve_working_directory("BLUESKY/ATTIE", [project])[0] == str(tmp_path.resolve())
+    assert _resolve_working_directory(f"`{tmp_path}`", [])[0] == str(tmp_path.resolve())
+    assert _resolve_working_directory("does-not-exist", [project])[0] is None
 
 
 def test_task_root_blocks_have_controls_and_task_value() -> None:

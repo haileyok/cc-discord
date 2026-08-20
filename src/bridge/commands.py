@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import shlex
 import time
 from dataclasses import dataclass
@@ -169,6 +170,28 @@ def _text_field(values: Mapping[str, Any], *names: str) -> str:
                     value = selected.get("value") if isinstance(selected, Mapping) else ""
                 return str(value or "").strip()
     return ""
+
+
+def _resolve_working_directory(value: str, projects: list[Any]) -> tuple[str | None, str]:
+    """Resolve user-entered paths and configured project aliases tolerantly."""
+    requested = str(value or "").strip().strip("`\"'").strip()
+    if not requested:
+        return None, ""
+    key = requested.casefold()
+    for project in projects:
+        path = Path(str(getattr(project, "path", ""))).expanduser()
+        aliases = {
+            str(getattr(project, "name", "")),
+            path.name,
+            str(path),
+            f"{getattr(project, 'root_label', '')}/{getattr(project, 'name', '')}",
+        }
+        if key in {alias.strip().casefold() for alias in aliases if alias.strip()} and path.is_dir():
+            return str(path.resolve()), requested
+    expanded = Path(os.path.expandvars(requested)).expanduser()
+    if expanded.is_dir():
+        return str(expanded.resolve()), requested
+    return None, requested
 
 
 def _plain_text(value: Any, limit: int = 75) -> str:
@@ -605,17 +628,15 @@ class CommandDispatcher:
                 raise TaskRoutingError("selected Slack thread binding is invalid")
             requested = _text_field(values, "cwd", "project")
             prompt = _text_field(values, "initial_prompt", "prompt")
-            selected = next((project for project in self.projects if requested in {
-                str(getattr(project, "name", "")),
-                f"{getattr(project, 'root_label', '')}/{getattr(project, 'name', '')}",
-            }), None)
-            cwd = str(getattr(selected, "path", "")) if selected is not None else str(Path(requested).expanduser())
-            if not requested or not Path(cwd).is_dir():
-                project_hint = (
-                    "No projects were loaded; enter an absolute path or set BRIDGE_PROJECT_ROOTS and restart."
-                    if not self.projects else "Choose an existing working directory or one of the configured projects."
+            cwd, normalized = _resolve_working_directory(requested, self.projects)
+            if cwd is None:
+                choices = sorted({str(getattr(project, "name", "")) for project in self.projects if getattr(project, "name", "")})
+                choice_hint = f" Available projects: {', '.join(choices[:8])}." if choices else ""
+                shown = _plain_text(normalized or "(empty)", 160)
+                return await self._error(
+                    payload,
+                    f"Working directory or project `{shown}` was not found.{choice_hint}",
                 )
-                return await self._error(payload, project_hint)
             task = await self.registry.spawn_task(
                 cwd, team_id=team, channel_id=channel, owner_user_id=actor,
                 root_ts=root, prompt=prompt or None, bind_existing_root=True,
