@@ -148,9 +148,13 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _short_path(p: str | None) -> str:
+def _short_path(p: Any) -> str:
     if not p:
         return "?"
+    if isinstance(p, (list, tuple, set)):
+        paths = [_short_path(item) for item in p if item]
+        return _truncate(", ".join(paths), 80) if paths else "?"
+    p = str(p)
     if len(p) <= 50:
         return p
     parts = p.split("/")

@@ -86,6 +86,14 @@ class TestToolSummary:
         assert "todo" in result
         assert "src/" in result
 
+    async def test_grep_with_multiple_paths(self) -> None:
+        """Polytoken grep accepts a list of search roots."""
+        result = summarize(
+            "Grep", {"pattern": "todo", "path": ["src/", "tests/"]}, None,
+        )
+        assert "🔍" in result
+        assert "src/" in result and "tests/" in result
+
     async def test_grep_without_path(self) -> None:
         """Grep tool without path."""
         result = summarize("Grep", {"pattern": "error"}, None)
