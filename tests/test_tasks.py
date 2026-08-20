@@ -536,6 +536,7 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     task, _ = await _task(reg, root="1000.rich")
     await reg._render(task, events.TurnStarted("prompt-rich"))
     await reg._render(task, events.ToolLine("✓ Bash: pwd"))
+    await reg._render(task, events.ToolLine("✓ Read: pyproject.toml"))
     await reg._render(task, events.AssistantText("final answer"))
     await reg._render(task, events.SubagentStarted("h1", "research", "model"))
     await reg._render(task, events.SubagentActivity("h1", "reading"))
@@ -554,7 +555,9 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
         for call in rich_bot.stream_appends
     )
     task_chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call["chunks"]]
-    assert any(chunk["type"] == "task_update" and "Bash: pwd" in chunk["title"] for chunk in task_chunks)
+    activity_chunks = [chunk for chunk in task_chunks if chunk["type"] == "task_update" and chunk["id"] == "activity"]
+    assert [chunk["title"] for chunk in activity_chunks] == ["✓ Bash: pwd", "✓ Read: pyproject.toml"]
+    assert all(chunk["status"] == "in_progress" for chunk in activity_chunks)
     assert any(chunk["type"] == "task_update" and chunk["id"] == "subagent-h1" for chunk in task_chunks)
     assert rich_bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
     assert rich_bot.statuses == [

@@ -861,7 +861,12 @@ class TaskRegistry:
             elif isinstance(action, ToolLine):
                 if not task.progress_started:
                     self._agg_for(task).append(action.line)
-                await self._progress_task_update(task, action.line, status="complete")
+                # Reuse one timeline item for ordinary tool activity. A fresh
+                # ID per call makes Slack append a visible row for every tool;
+                # the stable ID updates the current Agent working row in place.
+                await self._progress_task_update(
+                    task, action.line, task_id="activity", status="in_progress",
+                )
             elif isinstance(action, (ToolDiff, ToolFailure)):
                 line = action.block if isinstance(action, ToolDiff) else action.line
                 await self._progress_line(task, line)
