@@ -120,6 +120,7 @@ class FakeBot:
     kicks: list[dict[str, Any]] = field(default_factory=list)
     downloads: list[dict[str, Any]] = field(default_factory=list)
     reactions: list[dict[str, Any]] = field(default_factory=list)
+    deletions: list[dict[str, Any]] = field(default_factory=list)
     fail_invite: bool = False
     fail_root: bool = False
     _message_seq: int = 0
@@ -132,6 +133,9 @@ class FakeBot:
 
     async def edit_message(self, channel_id: str, message_ts: str, *, text=None, blocks=None, content=None):
         self.edits.append({"channel_id": channel_id, "message_ts": message_ts, "text": text, "blocks": blocks, "content": content})
+
+    async def delete_message(self, channel_id: str, message_ts: str):
+        self.deletions.append({"channel_id": channel_id, "message_ts": message_ts})
 
     async def post_with_attachments(self, paths, *, channel_id, root_ts, text):
         self.posts.append({"attachments": list(paths), "channel_id": channel_id, "root_ts": root_ts, "text": text})
@@ -451,9 +455,10 @@ async def test_turn_status_fallback_is_one_editable_block_and_no_legacy_working_
     await reg._render(task, events.ToolLine("✓ Bash: ls"))
     await reg._render(task, events.TurnComplete("prompt-1"))
     assert task.progress_stream_ts is None
-    assert task.progress_fallback_ts == fallback_ts
+    assert task.progress_fallback_ts is None
     assert any(edit["message_ts"] == fallback_ts and edit["blocks"] for edit in bot.edits)
-    assert "✅ Ready" in bot.edits[-1]["text"]
+    assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": fallback_ts}]
+    assert not any("Agent complete" in str(edit.get("text")) for edit in bot.edits)
     assert task.status_message_ts is None
 
 
@@ -487,6 +492,25 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     ]
     assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
     assert task.progress_stream_ts is None and task.progress_started is False
+
+
+@pytest.mark.asyncio
+async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db):
+    class FailingAppendBot(RichFakeBot):
+        async def append_stream(self, channel_id, stream_ts, *, markdown_text=None, chunks=None):
+            raise RuntimeError("invalid_arguments")
+
+    bot = FailingAppendBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.degrade")
+    await reg._render(task, events.TurnStarted("prompt-degrade"))
+    await reg._render(task, events.AssistantText("answer after degradation"))
+
+    assert bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
+    assert task.progress_stream_ts is None
+    assert task.progress_fallback_ts == "stream-1"
+    assert any(edit["message_ts"] == "stream-1" and edit["blocks"] for edit in bot.edits)
+    assert any(post.get("text") == "answer after degradation" for post in bot.posts)
 
 
 class TestAC5AppBudget:

@@ -110,6 +110,15 @@ def _exception_response(exc: BaseException) -> Any:
     return getattr(exc, "response", None)
 
 
+def slack_error_code(exc: BaseException) -> str | None:
+    """Return only Slack's non-secret machine error code for diagnostics."""
+    error = getattr(exc, "error", None)
+    if isinstance(exc, SlackApiError):
+        error = _response_value(_exception_response(exc), "error", error)
+    value = str(error or "").strip()
+    return value or None
+
+
 def _is_retryable_exception(exc: BaseException) -> bool:
     if isinstance(exc, SlackAdapterError):
         return exc.status == 429 or (exc.status is not None and 500 <= exc.status < 600) or exc.error in {
@@ -1176,6 +1185,11 @@ class Bot:
         if blocks is not None:
             kwargs["blocks"] = blocks
         await self._api("chat_update", **kwargs)
+
+    async def delete_message(self, channel_id: str, message_ts: str) -> None:
+        """Delete a bot-authored transient progress message."""
+        self._require_ready()
+        await self._api("chat_delete", channel=self._channel_for(channel_id), ts=str(message_ts))
 
     async def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
         self._require_ready()

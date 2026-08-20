@@ -25,6 +25,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 import aiosqlite
 
 from bridge import voice
+from bridge.bot import slack_error_code
 from bridge.daemon_supervisor import DaemonSupervisor, DaemonSupervisorError
 from bridge.domain import (
     ActorId,
@@ -954,7 +955,20 @@ class TaskRegistry:
                     return True
                 except Exception as exc:
                     task.progress_stream_disabled = True
-                    log.warning("native Slack stream append failed: %s", safe_error(exc, "stream append failed"))
+                    code = slack_error_code(exc)
+                    log.warning(
+                        "native Slack stream append failed%s: %s",
+                        f" ({code})" if code else "",
+                        safe_error(exc, "stream append failed"),
+                    )
+                    # Slack will not allow chat.update on an active stream. Stop
+                    # it first, then convert that same message into the fallback.
+                    stopper = getattr(self._require_bot(), "stop_stream", None)
+                    if callable(stopper):
+                        with contextlib.suppress(Exception):
+                            result = stopper(task.channel_id, task.progress_stream_ts)
+                            if inspect.isawaitable(result):
+                                await result
             else:
                 task.progress_stream_disabled = True
             await self._ensure_fallback_progress(task)
@@ -1753,12 +1767,20 @@ class TaskRegistry:
     async def _end_turn(self, task: Task, *, outcome: str = "complete") -> None:
         if task.progress_started:
             final_title = {
-                "complete": "Agent complete",
+                "complete": "Agent working",
                 "cancelled": "Agent cancelled",
                 "error": "Agent failed",
-            }.get(outcome, "Agent complete")
+            }.get(outcome, "Agent working")
             final_status = "complete" if outcome == "complete" else "error"
-            await self._progress_task_update(task, final_title, task_id="turn", status=final_status)
+            if task.progress_stream_ts is not None:
+                # Complete the existing turn card without adding an extra
+                # "Agent complete" timeline entry beside the real response.
+                await self._append_progress(task, chunks=[{
+                    "type": "task_update", "id": "turn",
+                    "title": final_title, "status": final_status,
+                }])
+            elif outcome != "complete":
+                await self._progress_task_update(task, final_title, task_id="turn", status=final_status)
             if task.progress_stream_ts is not None:
                 stopper = getattr(self._require_bot(), "stop_stream", None)
                 if callable(stopper):
@@ -1775,7 +1797,18 @@ class TaskRegistry:
                     task.progress_stream_disabled = True
                     await self._ensure_fallback_progress(task, outcome=outcome)
             if task.progress_fallback_ts is not None:
-                await self._update_fallback_progress(task, outcome=outcome)
+                if outcome == "complete":
+                    # The fallback is a transient working indicator. Successful
+                    # completion leaves only the actual assistant response.
+                    deleter = getattr(self._require_bot(), "delete_message", None)
+                    if callable(deleter):
+                        with contextlib.suppress(Exception):
+                            result = deleter(task.channel_id, task.progress_fallback_ts)
+                            if inspect.isawaitable(result):
+                                await result
+                    task.progress_fallback_ts = None
+                else:
+                    await self._update_fallback_progress(task, outcome=outcome)
             await self._set_agent_status(task, "active")
             task.progress_started = False
         # App budget is a turn/exchange budget, not a process-lifetime budget.
