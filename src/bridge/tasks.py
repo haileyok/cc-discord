@@ -202,6 +202,7 @@ class SlackMessage:
     event_id: str | None = None
     message_ts: str | None = None
     files: tuple[SlackFile, ...] = ()
+    verified_mention: bool = False
 
     @property
     def actor_id(self) -> str:
@@ -407,6 +408,7 @@ def normalize_message(value: Any) -> SlackMessage:
         event_id=event_id,
         message_ts=str(message_ts) if message_ts is not None else None,
         files=tuple(_file(item) for item in files),
+        verified_mention=str(_value(source, "kind", None) or _value(source, "type", "")) == "app_mention",
     )
 
 
@@ -1405,11 +1407,13 @@ class TaskRegistry:
             return True
         if task.mention_required:
             cleaned = _strip_verified_mention(msg.text, self._bridge_user_id)
-            if cleaned is None:
-                # Existing human threads are opt-in: attachments alone and
-                # display-name lookalikes must never reach the daemon.
+            if cleaned is not None:
+                msg = replace(msg, text=cleaned)
+            elif not msg.verified_mention:
+                # Existing human threads are opt-in: only Slack's authenticated
+                # app_mention event or an exact <@bot> token qualifies. Display
+                # names and ordinary thread messages never reach the daemon.
                 return False
-            msg = replace(msg, text=cleaned)
         if msg.actor.is_app and (
             (self.app_actor_id and msg.actor_id == str(self.app_actor_id))
             or (self._bridge_bot_id and msg.actor_id == str(self._bridge_bot_id))

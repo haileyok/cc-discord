@@ -434,6 +434,19 @@ class TestAC2IdentityRouting:
         assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE> verified", "E4", "M4", (attachment,)))
         assert json.loads(client.prompts[0])["body"] == "verified @" + str(bot.downloads[0]["path"])
 
+    async def test_existing_thread_trusts_authenticated_app_mention_without_literal_token(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.004mention")
+        task.mention_required = True
+        event = {
+            "kind": "app_mention", "team_id": "T1", "channel_id": "CHOME",
+            "root_ts": task.root_ts, "actor_id": "UOWNER",
+            "message_ts": "M-app-mention", "id": "E-app-mention",
+            "text": "summarize this thread",
+        }
+        assert await reg.maybe_route_message(event)
+        assert json.loads(client.prompts[0])["body"] == "summarize this thread"
+
     async def test_existing_thread_routes_block_only_rich_text_mention(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.004c")
