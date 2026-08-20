@@ -568,6 +568,13 @@ class CommandDispatcher:
             root = _root_ts(payload)
             if not team or not channel or not root:
                 return await self._error(payload, "Start agent here needs the selected message's exact thread.")
+            membership = getattr(self.bot, "is_channel_member", None)
+            if callable(membership):
+                is_member = membership(channel)
+                if inspect.isawaitable(is_member):
+                    is_member = await is_member
+                if not is_member:
+                    return await self._open_modal(payload, _invite_bot_modal())
             return await self._open_modal(payload, _start_here_modal(team=team, channel=channel, root=root))
         if callback not in {"agent", "bridge.agent", "agent_shortcut", "task_agent", "agent_global"}:
             return await self._error(payload, "Unknown shortcut.")
@@ -782,6 +789,22 @@ class CommandDispatcher:
         return ("*Polytoken commands:* `/agent start cwd=<path> [prompt=<text>]`, `/agent spawn project=<name>`, "
                 "`list`, `stop`, `kill`, `restart`, `compact`, `skill`, `model`, `facet`, `effort`, `title`, "
                 "`stats`, `todos`, `pin`, `unpin`. Task controls are also available on each root message.")
+
+
+def _invite_bot_modal() -> dict[str, Any]:
+    return {
+        "type": "modal", "callback_id": "bridge.invite_required",
+        "title": {"type": "plain_text", "text": "Add agent to channel"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [{
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": (
+                "*Hailey's Robot is not a member of this channel.*\n"
+                "Invite the app to the channel, then run *Start agent here* again. "
+                "The bot must be a member to read thread history, download files, and reply."
+            )},
+        }],
+    }
 
 
 def _start_here_modal(*, team: str, channel: str, root: str) -> dict[str, Any]:

@@ -685,6 +685,13 @@ class Bot:
             ids.append(self._message_id(response))
         return ids
 
+    async def is_channel_member(self, channel_id: str) -> bool:
+        """Return whether the bot can read and post in a conversation."""
+        self._require_ready()
+        response = await self._api("conversations_info", channel=self._channel_for(channel_id))
+        channel = _response_value(response, "channel", {}) or {}
+        return bool(isinstance(channel, Mapping) and channel.get("is_member"))
+
     async def open_modal(self, trigger_id: str, view: Mapping[str, Any]) -> Any:
         """Open a Slack modal from a short-lived interactive trigger."""
         self._require_ready()
@@ -715,7 +722,13 @@ class Bot:
         }
         if blocks:
             kwargs["blocks"] = blocks
-        return await self._api("chat_postEphemeral", **kwargs)
+        try:
+            return await self._api("chat_postEphemeral", **kwargs)
+        except SlackApiError as exc:
+            if slack_error_code(exc) == "not_in_channel":
+                logger.warning("cannot deliver ephemeral response: bot is not in channel")
+                return None
+            raise
 
     async def post_blocks(self, blocks: list[dict[str, Any]], fallback_text: str | None = None,
                           *, channel_id: str | None = None, root_ts: str | None = None) -> list[str]:

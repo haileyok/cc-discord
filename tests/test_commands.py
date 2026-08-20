@@ -322,6 +322,24 @@ async def test_activity_button_is_owner_only_and_retains_completion_summary() ->
 
 
 @pytest.mark.asyncio
+async def test_start_agent_here_requires_bot_channel_membership() -> None:
+    class NonMemberBot(LocalBot):
+        async def is_channel_member(self, channel_id: str) -> bool:
+            return False
+
+    bot = NonMemberBot()
+    dispatcher = CommandDispatcher(bot, LocalRegistry())
+    response = await dispatcher.dispatch({
+        "type": "message_action", "callback_id": "start_agent_here", "trigger_id": "TR-NO-MEMBER",
+        "team": {"id": "T1"}, "user": {"id": "UOWNER"}, "channel": {"id": "COTHER"},
+        "message": {"ts": "200.2", "text": "human root"},
+    })
+    assert response.modal and response.modal["callback_id"] == "bridge.invite_required"
+    assert "not a member" in str(response.modal["blocks"])
+    assert bot.modal_calls == [{"trigger_id": "TR-NO-MEMBER", "view": response.modal}]
+
+
+@pytest.mark.asyncio
 async def test_start_agent_here_shortcut_binds_selected_thread_without_editing_root(tmp_path: Path) -> None:
     registry = LocalRegistry()
     bot = LocalBot()
