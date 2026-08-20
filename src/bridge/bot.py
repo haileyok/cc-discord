@@ -884,8 +884,9 @@ class Bot:
                 os.fsync(output.fileno())
             return None
         except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
             raise
 
     @staticmethod
@@ -901,8 +902,9 @@ class Bot:
                 os.fsync(handle.fileno())
             os.replace(partial, output)
         except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
             with contextlib.suppress(OSError):
                 partial.unlink()
             raise

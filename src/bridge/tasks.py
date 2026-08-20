@@ -336,13 +336,17 @@ def normalize_message(value: Any) -> SlackMessage:
     message_ts = _value(source, "message_ts", None) or _value(source, "ts", None)
     root = _value(source, "root_ts", None) or _value(source, "thread_ts", None) or message_ts
     files = _value(source, "files", None) or _value(source, "attachments", ()) or ()
+    raw_event_id = _value(value, "event_id", None) or _value(value, "id", None)
+    event_id = (raw_event_id if isinstance(raw_event_id, str)
+                else str(raw_event_id) if raw_event_id is not None and not isinstance(raw_event_id, Mapping)
+                else None)
     return SlackMessage(
         team_id=str(team or ""),
         channel_id=str(channel or ""),
         root_ts=str(root or ""),
         actor=actor,
         text=str(_value(source, "text", None) or _value(source, "content", "")),
-        event_id=_value(source, "event_id", None) or _value(source, "event", None),
+        event_id=event_id,
         message_ts=str(message_ts) if message_ts is not None else None,
         files=tuple(_file(item) for item in files),
     )
@@ -610,17 +614,18 @@ class TaskRegistry:
             if runtime is not None:
                 # Restore all old-binding fields even when the key already
                 # matches: a crash can leave only status/mode/ownership stale.
-                # A journal records a transient rebinding.  Its recovery
-                # status must come from daemon reconciliation, never from the
-                # transient row status persisted during the side effect.
-                live_daemon = (
-                    self._daemon_presence_known
-                    and bool(runtime.session_id)
-                    and str(runtime.session_id) in self._known_daemon_sessions
-                )
+                # Daemon reconciliation is tri-state: a successful listing
+                # proves present/absent, while a failed listing is unknown and
+                # must preserve the retryable preexisting status.
+                if not self._daemon_presence_known:
+                    recovered_status = runtime.status
+                elif runtime.session_id and str(runtime.session_id) in self._known_daemon_sessions:
+                    recovered_status = "running"
+                else:
+                    recovered_status = "crashed"
                 restored = await restore_runtime_binding(
                     self._conn, journal.task_id, journal.old_key,
-                    status="running" if live_daemon else "crashed",
+                    status=recovered_status,
                     binding_id=journal.old_binding_id,
                 )
                 task = self.get_by_task_id(journal.task_id)
@@ -648,6 +653,12 @@ class TaskRegistry:
                 continue
             try:
                 await update_promotion_journal(self._conn, journal.journal_id, state="cleanup_pending", side_effect="archive_channel", side_effect_state="started")
+                # Ownership is an in-memory capability and is lost on restart;
+                # restore it from the durable journal before archive_channel's
+                # independent private/team/member verification.
+                remember = getattr(self._require_bot(), "remember_owned_channel", None)
+                if callable(remember):
+                    remember(journal.new_channel_id)
                 await self._require_bot().archive_channel(journal.new_channel_id)
             except Exception:
                 await update_promotion_journal(self._conn, journal.journal_id, state="cleanup_pending", side_effect="archive_channel", side_effect_state="failed", error_code="archive_unverified")

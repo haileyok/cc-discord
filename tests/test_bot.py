@@ -208,6 +208,53 @@ class TestAC4WebApiAndRetry:
             await bot.archive_channel("GHOME")
 
 
+class TestAC4DownloadAtomicity:
+    @pytest.mark.asyncio
+    async def test_streaming_download_over_limit_preserves_value_error(self, tmp_path: Path) -> None:
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"123"
+                yield b"456"
+
+        class Response:
+            status = 200
+            content_length = None
+            content = Content()
+
+        class Session:
+            def get(self, *args, **kwargs):
+                return Response()
+
+        bot = Bot("token", client=FakeSlackClient(), http_session=Session())
+        destination = tmp_path / "download.bin"
+        with pytest.raises(ValueError, match="exceeds configured size limit") as raised:
+            await bot.download_private_file("https://files.slack.com/private", max_bytes=5, destination=destination)
+        assert isinstance(raised.value, ValueError)
+        assert not destination.exists()
+        assert not destination.with_name(destination.name + ".partial").exists()
+
+    def test_atomic_write_preserves_write_error_and_cleans_partial(self, tmp_path: Path, monkeypatch) -> None:
+        import bridge.bot as bot_module
+        output = tmp_path / "atomic.bin"
+        sentinel = OSError("forced write failure")
+        original_open = bot_module.os.open
+
+        class FailingHandle:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def write(self, _data): raise sentinel
+            def flush(self): pass
+            def fileno(self): return 1
+
+        monkeypatch.setattr(bot_module.os, "open", lambda *args, **kwargs: original_open(*args, **kwargs))
+        monkeypatch.setattr(bot_module.os, "fdopen", lambda *args, **kwargs: FailingHandle())
+        with pytest.raises(OSError) as raised:
+            Bot._atomic_write_bytes(output, b"payload")
+        assert raised.value is sentinel
+        assert not output.exists()
+        assert not output.with_name(output.name + ".partial").exists()
+
+
 class TestAC9SocketMode:
     @pytest.mark.asyncio
     async def test_quick_ack_and_normalized_message_dispatch(self) -> None:

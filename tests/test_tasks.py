@@ -220,6 +220,33 @@ async def test_pending_promotion_absent_daemon_stays_crashed_without_consumer(in
 
 
 @pytest.mark.asyncio
+async def test_pending_promotion_list_failure_preserves_binding_and_retries_consumer(in_memory_db, monkeypatch):
+    class FailingSupervisor(FakeSupervisor):
+        async def list_sessions(self):
+            from bridge.daemon_supervisor import DaemonSupervisorError
+            raise DaemonSupervisorError("registry listing failed")
+
+    registry = TaskRegistry(in_memory_db, None, FailingSupervisor())
+    task = Task("retry-journal-task", "T1", "COLD", "R1", "UOWNER", "personal", "/tmp", "running", "live-session", 41001, 1, 1, binding_id="old-binding")
+    await registry.attach_task(task)
+    await state.create_promotion_journal(in_memory_db, "retry-j1", task.task_id, task.key, "personal", old_binding_id="old-binding")
+    started: list[str] = []
+    monkeypatch.setattr(registry, "_start_consumer", lambda loaded: started.append(loaded.task_id))
+
+    await registry.load_from_db(reconcile_with_daemons=True)
+    registry.bind_bot(FakeBot())
+    await registry.reconcile_promotion_journals()
+    await registry.start_event_consumers()
+
+    loaded = registry.get_by_task_id(task.task_id)
+    runtime = await state.get_runtime(in_memory_db, task.task_id)
+    assert loaded is not None
+    assert (loaded.status, loaded.channel_id, loaded.root_ts, loaded.binding_id) == ("running", "COLD", "R1", "old-binding")
+    assert (runtime.status, runtime.binding_id) == ("running", "old-binding")
+    assert started == [task.task_id, task.task_id]
+
+
+@pytest.mark.asyncio
 async def test_pending_promotion_live_daemon_restores_running_consumer_and_routing(in_memory_db, monkeypatch):
     class LiveSupervisor(FakeSupervisor):
         async def list_sessions(self):
@@ -246,6 +273,48 @@ async def test_pending_promotion_live_daemon_restores_running_consumer_and_routi
     assert started == [task.task_id]
     assert await registry.maybe_route_message(SlackMessage("T1", "COLD", "R1", SlackActor("UOWNER"), "after restart", "E-live", "M-live"))
     assert json.loads(client.prompts[0])["body"] == "after restart"
+
+
+@pytest.mark.asyncio
+async def test_normalized_nested_ingress_uses_scalar_stable_id_and_dedups(in_memory_db):
+    reg, _ = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.normalized")
+    normalized = {"event": {"team": "T1", "channel": "CHOME", "ts": "1000.normalized", "user": "UOWNER", "text": "hello"}, "id": "ENVELOPE-1", "team_id": "T1", "channel_id": "CHOME", "root_ts": "1000.normalized", "actor_id": "UOWNER", "text": "hello"}
+    msg = __import__("bridge.tasks", fromlist=["normalize_message"]).normalize_message(normalized)
+    assert msg.event_id == "ENVELOPE-1" and not isinstance(msg.event_id, dict)
+    assert (msg.team_id, msg.channel_id, msg.root_ts, msg.actor_id) == ("T1", "CHOME", "1000.normalized", "UOWNER")
+    assert await reg.maybe_route_message(msg)
+    assert await reg.maybe_route_message(msg)
+    assert len(client.prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_cleanup_remembers_journal_channel_before_verified_archive(in_memory_db):
+    old = ConversationKey("T1", "COLD", "R-clean")
+    registry = TaskRegistry(in_memory_db, None, FakeSupervisor())
+    task = Task("cleanup-journal-task", "T1", "COLD", "R-clean", "UOWNER", "personal", "/tmp", "running", "sess-clean", 41001, 1, 1)
+    await registry.attach_task(task)
+    await state.create_promotion_journal(in_memory_db, "cleanup-j1", task.task_id, old, "personal")
+    await state.update_promotion_journal(in_memory_db, "cleanup-j1", new_channel_id="GNEW", state="cleanup_pending")
+
+    class OwnershipBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.remembered: set[str] = set()
+        def remember_owned_channel(self, channel_id):
+            self.remembered.add(channel_id)
+        async def archive_channel(self, channel_id):
+            assert channel_id in self.remembered
+            await super().archive_channel(channel_id)
+
+    bot = OwnershipBot()
+    fresh = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    await fresh.load_from_db()
+    await fresh.reconcile_promotion_journals()
+    await fresh.reconcile_promotion_journals()
+    assert bot.remembered == {"GNEW"}
+    assert bot.archives == ["GNEW"]
+    assert (await state.get_promotion_journal(in_memory_db, "cleanup-j1")).state == "failed"
 
 
 class TestAC2IdentityRouting:
