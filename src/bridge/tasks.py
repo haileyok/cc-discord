@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -248,7 +249,16 @@ class Task:
     # Runtime-only path from ``polytoken sessions --format json``.  It is not
     # persisted in SQLite; startup reconciliation re-discovers it by session id.
     credential_file_path: str | None = None
+    # Runtime-only native progress state.  The old ``status_message_ts`` field
+    # remains for data/fixture compatibility, but is no longer used to post a
+    # separate "Agent is working" message.
     status_message_ts: str | None = None
+    progress_stream_ts: str | None = None
+    progress_fallback_ts: str | None = None
+    progress_stream_disabled: bool = False
+    progress_started: bool = False
+    progress_lines: list[str] = field(default_factory=list)
+    progress_sequence: int = 0
 
     @property
     def key(self) -> ConversationKey:
@@ -769,6 +779,7 @@ class TaskRegistry:
             return False
 
     async def _handle_daemon_death(self, task: Task) -> None:
+        await self._end_turn(task, outcome="error")
         await self._post(task, "💥 The session daemon exited; this task is crashed.")
         await self._teardown_task(task, status="crashed", cancel_consumer=False)
 
@@ -776,33 +787,56 @@ class TaskRegistry:
         try:
             if isinstance(action, AssistantText):
                 if action.subagent_handle:
-                    await self._subagent_activity(task, action.subagent_handle, f"• 💬 {action.text[:140]}")
+                    line = f"• 💬 {action.text[:140]}"
+                    await self._subagent_activity(task, action.subagent_handle, line)
+                    await self._progress_task_update(
+                        task, f"Subagent {action.subagent_handle}: {action.text[:140]}",
+                        task_id=f"subagent-{action.subagent_handle}", status="in_progress",
+                    )
                 else:
-                    await self._post_assistant_text(task, action.text)
+                    await self._stream_assistant_text(task, action.text)
             elif isinstance(action, AssistantThinking):
                 if not action.subagent_handle:
-                    await self._post(task, f"💭 {action.text}")
+                    await self._progress_line(task, f"💭 {action.text[:180]}")
+                    if task.progress_stream_ts is None and task.progress_fallback_ts is None:
+                        await self._post(task, f"💭 {action.text}")
             elif isinstance(action, ToolLine):
                 self._agg_for(task).append(action.line)
+                await self._progress_task_update(task, action.line, status="complete")
             elif isinstance(action, (ToolDiff, ToolFailure)):
-                await self._post(task, action.block if isinstance(action, ToolDiff) else action.line)
+                line = action.block if isinstance(action, ToolDiff) else action.line
+                await self._progress_line(task, line)
+                await self._post(task, line)
             elif isinstance(action, SubagentStarted):
                 await self._subagent_started(task, action)
+                await self._progress_task_update(
+                    task, f"{action.subagent_type or action.handle} started",
+                    task_id=f"subagent-{action.handle}", status="in_progress",
+                )
             elif isinstance(action, SubagentActivity):
                 await self._subagent_activity(task, action.handle, action.line)
+                await self._progress_task_update(
+                    task, f"{action.handle}: {action.line}",
+                    task_id=f"subagent-{action.handle}", status="in_progress",
+                )
             elif isinstance(action, SubagentCompleted):
                 await self._subagent_completed(task, action)
+                await self._progress_task_update(
+                    task, f"{action.handle}: {action.result_summary or 'completed'}",
+                    task_id=f"subagent-{action.handle}", status="complete",
+                    output=action.result_summary,
+                )
             elif isinstance(action, (AskQuestion, Clarification, Confirmation)):
                 await self._post_interrogative(task, action)
             elif isinstance(action, TurnStarted):
                 await self._begin_turn(task)
             elif isinstance(action, TurnComplete):
-                await self._end_turn(task)
+                await self._end_turn(task, outcome="complete")
             elif isinstance(action, TurnCancelled):
-                await self._end_turn(task)
+                await self._end_turn(task, outcome="cancelled")
                 await self._post(task, f"🛑 Turn cancelled ({action.reason})")
             elif isinstance(action, ModelError):
-                await self._end_turn(task)
+                await self._end_turn(task, outcome="error")
                 await self._post(task, "⚠ Model error: the daemon could not complete this request.")
             elif isinstance(action, TitleChange):
                 await self._post(task, f"*{action.title.strip()[:200]}*")
@@ -830,6 +864,164 @@ class TaskRegistry:
             )
         elif cleaned:
             await self._post(task, cleaned)
+
+    @staticmethod
+    def _progress_chunk_text(text: str, limit: int = 1800) -> list[str]:
+        value = str(text)
+        if not value:
+            return []
+        return [value[index:index + limit] for index in range(0, len(value), limit)]
+
+    @staticmethod
+    def _progress_identifier(value: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value)).strip("-")
+        return (safe or "step")[:80]
+
+    @staticmethod
+    def _progress_blocks(task: Task, *, outcome: str = "running") -> tuple[str, list[dict[str, Any]]]:
+        labels = {
+            "running": ("⏳ Agent working", "processing"),
+            "complete": ("✅ Ready", "active"),
+            "cancelled": ("🛑 Turn cancelled", "active"),
+            "error": ("⚠️ Agent error", "active"),
+        }
+        heading, state = labels.get(outcome, labels["running"])
+        lines = task.progress_lines[-8:] or ["Starting agent turn…"]
+        body = "\n".join(f"• {line[:240]}" for line in lines)
+        fallback = f"{heading}\n{body}"
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body[:2900]}"}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{state} · {len(task.progress_lines)} updates"}]},
+        ]
+        return fallback[:2900], blocks
+
+    async def _set_agent_status(self, task: Task, status: str) -> None:
+        setter = getattr(self._require_bot(), "set_agent_status", None)
+        if not callable(setter):
+            return
+        try:
+            result = setter(task.channel_id, task.root_ts, status)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            # Native status is an optional enhancement.  Never let it affect a
+            # daemon turn, and keep credentials/URLs out of logs.
+            log.warning("native Slack status update suppressed: %s", safe_error(exc, "status update failed"))
+
+    async def _ensure_fallback_progress(self, task: Task, *, outcome: str = "running") -> None:
+        fallback, blocks = self._progress_blocks(task, outcome=outcome)
+        bot = self._require_bot()
+        if task.progress_fallback_ts is None and task.progress_stream_ts is not None:
+            # A stream message already exists.  Convert that same message into
+            # the editable Block Kit fallback instead of posting a duplicate.
+            stream_ts = task.progress_stream_ts
+            try:
+                await bot.edit_message(task.channel_id, stream_ts, text=fallback, blocks=blocks)
+                task.progress_fallback_ts = stream_ts
+                task.progress_stream_ts = None
+                return
+            except Exception as exc:
+                log.warning("native Slack stream fallback conversion failed: %s", safe_error(exc, "progress fallback failed"))
+        if task.progress_fallback_ts is None:
+            sent = await self._post(task, fallback, blocks=blocks)
+            task.progress_fallback_ts = sent[0] if sent else None
+        elif task.progress_fallback_ts:
+            with contextlib.suppress(Exception):
+                await bot.edit_message(task.channel_id, task.progress_fallback_ts, text=fallback, blocks=blocks)
+
+    async def _update_fallback_progress(self, task: Task, *, outcome: str = "running") -> None:
+        if task.progress_fallback_ts is None:
+            await self._ensure_fallback_progress(task, outcome=outcome)
+            return
+        fallback, blocks = self._progress_blocks(task, outcome=outcome)
+        with contextlib.suppress(Exception):
+            await self._require_bot().edit_message(
+                task.channel_id, task.progress_fallback_ts, text=fallback, blocks=blocks,
+            )
+
+    async def _append_progress(self, task: Task, *, markdown_text: str | None = None,
+                               chunks: list[dict[str, Any]] | None = None) -> bool:
+        if not task.progress_started:
+            return False
+        if task.progress_stream_ts is not None and not task.progress_stream_disabled:
+            append = getattr(self._require_bot(), "append_stream", None)
+            if callable(append):
+                try:
+                    result = append(task.channel_id, task.progress_stream_ts,
+                                    markdown_text=markdown_text, chunks=chunks)
+                    if inspect.isawaitable(result):
+                        await result
+                    return True
+                except Exception as exc:
+                    task.progress_stream_disabled = True
+                    log.warning("native Slack stream append failed: %s", safe_error(exc, "stream append failed"))
+            else:
+                task.progress_stream_disabled = True
+            await self._ensure_fallback_progress(task)
+        elif task.progress_fallback_ts is None:
+            await self._ensure_fallback_progress(task)
+        else:
+            await self._update_fallback_progress(task)
+        return False
+
+    async def _progress_line(self, task: Task, line: str) -> None:
+        if not task.progress_started:
+            return
+        cleaned = str(line).strip().replace("\x00", "")
+        if cleaned:
+            task.progress_lines.append(cleaned[:300])
+            del task.progress_lines[:-100]
+        if task.progress_stream_ts is None:
+            await self._update_fallback_progress(task)
+
+    async def _progress_task_update(self, task: Task, title: str, *, task_id: str | None = None,
+                                    status: str = "complete", details: str | None = None,
+                                    output: str | None = None) -> None:
+        if not task.progress_started:
+            return
+        task.progress_sequence += 1
+        safe_title = str(title).strip()[:240] or "Agent update"
+        await self._progress_line(task, safe_title)
+        chunk: dict[str, Any] = {
+            "type": "task_update",
+            "id": self._progress_identifier(task_id or f"step-{task.progress_sequence}"),
+            "title": safe_title,
+            "status": status,
+        }
+        if details:
+            chunk["details"] = str(details)[:500]
+        if output:
+            chunk["output"] = str(output)[:500]
+        await self._append_progress(task, chunks=[chunk])
+
+    async def _stream_assistant_text(self, task: Task, text: str) -> None:
+        cleaned, paths = _parse_attach_markers(text)
+        if not task.progress_started:
+            await self._post_assistant_text(task, text)
+            return
+        stream_was_active = task.progress_stream_ts is not None
+        chunks = self._progress_chunk_text(cleaned)
+        appended = 0
+        for chunk in chunks:
+            if not await self._append_progress(task, markdown_text=chunk):
+                break
+            appended += len(chunk)
+        # Converting a live stream to Block Kit replaces its rendered content;
+        # replay the complete assistant block in ordinary output, not only the
+        # failed suffix, when that handoff occurred.
+        if stream_was_active and task.progress_stream_ts is None and task.progress_fallback_ts is not None:
+            appended = 0
+        remaining = cleaned[appended:]
+        if remaining:
+            # A stream can fail after partially receiving a block.  Only post
+            # the unacknowledged suffix so assistant output appears once.
+            await self._post(task, remaining)
+        if paths:
+            await self._require_bot().post_with_attachments(
+                [str(path) for path in paths[:MAX_ATTACHMENTS_PER_POST]],
+                channel_id=task.channel_id, root_ts=task.root_ts,
+                text=remaining or None,
+            )
 
     async def _handle_reconcile(self, task: Task, reason: str) -> None:
         await self._post(task, f"⚠️ Event stream gap detected ({reason}); state was re-synced.")
@@ -1495,6 +1687,7 @@ class TaskRegistry:
             if exc.status is not None:
                 await self._post(task, "⚠ The daemon rejected termination; task remains active.")
                 return False
+        await self._end_turn(task, outcome="cancelled")
         await self._teardown_task(task, status="stopped")
         return True
 
@@ -1507,6 +1700,7 @@ class TaskRegistry:
         except PolytokenClientError as exc:
             if exc.status is not None:
                 return False
+        await self._end_turn(task, outcome="cancelled")
         await self._teardown_task(task, status="crashed")
         return True
 
@@ -1523,19 +1717,67 @@ class TaskRegistry:
         return task
 
     async def _begin_turn(self, task: Task) -> None:
-        """Show a lightweight thread status because Slack has no bot typing API."""
-        if task.status_message_ts is not None:
+        """Start one native rich stream, with one editable Block Kit fallback."""
+        if task.progress_started:
             return
-        sent = await self._post(task, "⏳ Agent is working…")
-        task.status_message_ts = sent[0] if sent else None
-
-    async def _end_turn(self, task: Task) -> None:
-        if task.status_message_ts is not None:
-            with contextlib.suppress(Exception):
-                await self._require_bot().edit_message(
-                    task.channel_id, task.status_message_ts, text="✅ Ready"
+        task.progress_started = True
+        task.progress_lines.clear()
+        task.progress_sequence = 0
+        bot = self._require_bot()
+        starter = getattr(bot, "start_stream", None)
+        if callable(starter) and not task.progress_stream_disabled:
+            try:
+                stream_ts = starter(
+                    task.channel_id,
+                    task.root_ts,
+                    recipient_user_id=task.owner_user_id,
+                    recipient_team_id=task.team_id,
+                    chunks=[
+                        {"type": "plan_update", "title": "Agent working"},
+                        {"type": "task_update", "id": "turn", "title": "Agent working", "status": "in_progress"},
+                    ],
+                    task_display_mode="timeline",
                 )
-            task.status_message_ts = None
+                if inspect.isawaitable(stream_ts):
+                    stream_ts = await stream_ts
+                if not stream_ts:
+                    raise RuntimeError("Slack stream start omitted message timestamp")
+                task.progress_stream_ts = str(stream_ts)
+            except Exception as exc:
+                task.progress_stream_disabled = True
+                log.warning("native Slack stream start failed: %s", safe_error(exc, "stream start failed"))
+        if task.progress_stream_ts is None:
+            await self._ensure_fallback_progress(task)
+        await self._set_agent_status(task, "processing")
+
+    async def _end_turn(self, task: Task, *, outcome: str = "complete") -> None:
+        if task.progress_started:
+            final_title = {
+                "complete": "Agent complete",
+                "cancelled": "Agent cancelled",
+                "error": "Agent failed",
+            }.get(outcome, "Agent complete")
+            final_status = "complete" if outcome == "complete" else "error"
+            await self._progress_task_update(task, final_title, task_id="turn", status=final_status)
+            if task.progress_stream_ts is not None:
+                stopper = getattr(self._require_bot(), "stop_stream", None)
+                if callable(stopper):
+                    try:
+                        result = stopper(task.channel_id, task.progress_stream_ts)
+                        if inspect.isawaitable(result):
+                            await result
+                        task.progress_stream_ts = None
+                    except Exception as exc:
+                        task.progress_stream_disabled = True
+                        log.warning("native Slack stream stop failed: %s", safe_error(exc, "stream stop failed"))
+                        await self._ensure_fallback_progress(task, outcome=outcome)
+                else:
+                    task.progress_stream_disabled = True
+                    await self._ensure_fallback_progress(task, outcome=outcome)
+            if task.progress_fallback_ts is not None:
+                await self._update_fallback_progress(task, outcome=outcome)
+            await self._set_agent_status(task, "active")
+            task.progress_started = False
         # App budget is a turn/exchange budget, not a process-lifetime budget.
         if task.app_exchanges:
             task.app_exchanges = 0

@@ -166,6 +166,41 @@ class FakeBot:
         self.reactions.append({"channel_id": channel_id, "message_ts": message_ts, "name": name})
 
 
+class RichFakeBot(FakeBot):
+    """Fake native stream surface used by deterministic progress tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.stream_starts: list[dict[str, Any]] = []
+        self.stream_appends: list[dict[str, Any]] = []
+        self.stream_stops: list[dict[str, Any]] = []
+        self.statuses: list[dict[str, str]] = []
+
+    async def start_stream(self, channel_id, thread_ts, *, recipient_user_id, recipient_team_id,
+                           chunks=None, task_display_mode=None, markdown_text=None):
+        call = {
+            "channel_id": channel_id, "thread_ts": thread_ts,
+            "recipient_user_id": recipient_user_id, "recipient_team_id": recipient_team_id,
+            "chunks": chunks, "task_display_mode": task_display_mode,
+            "markdown_text": markdown_text,
+        }
+        self.stream_starts.append(call)
+        return "stream-1"
+
+    async def append_stream(self, channel_id, stream_ts, *, markdown_text=None, chunks=None):
+        self.stream_appends.append({
+            "channel_id": channel_id, "stream_ts": stream_ts,
+            "markdown_text": markdown_text, "chunks": chunks,
+        })
+
+    async def stop_stream(self, channel_id, stream_ts, **kwargs):
+        self.stream_stops.append({"channel_id": channel_id, "stream_ts": stream_ts, **kwargs})
+
+    async def set_agent_status(self, channel_id, thread_ts, status):
+        self.statuses.append({"channel_id": channel_id, "thread_ts": thread_ts, "status": status})
+        return True
+
+
 @pytest.fixture(autouse=True)
 def _disable_sse_consumers(monkeypatch):
     monkeypatch.setattr(TaskRegistry, "_start_consumer", lambda self, task: None)
@@ -403,18 +438,55 @@ class TestAC4AttachmentsAndInterrogatives:
 
 
 @pytest.mark.asyncio
-async def test_turn_status_is_posted_and_completed_in_task_thread(in_memory_db):
+async def test_turn_status_fallback_is_one_editable_block_and_no_legacy_working_message(in_memory_db):
     reg, bot = _registry(in_memory_db)
     task, _ = await _task(reg, root="1000.status")
     await reg._render(task, events.TurnStarted("prompt-1"))
-    assert bot.posts[-1]["text"] == "⏳ Agent is working…"
+    assert len(bot.posts) == 1
     assert bot.posts[-1]["root_ts"] == task.root_ts
-    status_ts = task.status_message_ts
-    assert status_ts is not None
+    assert bot.posts[-1]["blocks"]
+    assert "Agent is working" not in bot.posts[-1]["text"]
+    fallback_ts = task.progress_fallback_ts
+    assert fallback_ts is not None
+    await reg._render(task, events.ToolLine("✓ Bash: ls"))
     await reg._render(task, events.TurnComplete("prompt-1"))
-    assert bot.edits[-1]["message_ts"] == status_ts
-    assert bot.edits[-1]["text"] == "✅ Ready"
+    assert task.progress_stream_ts is None
+    assert task.progress_fallback_ts == fallback_ts
+    assert any(edit["message_ts"] == fallback_ts and edit["blocks"] for edit in bot.edits)
+    assert "✅ Ready" in bot.edits[-1]["text"]
     assert task.status_message_ts is None
+
+
+@pytest.mark.asyncio
+async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memory_db):
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.rich")
+    await reg._render(task, events.TurnStarted("prompt-rich"))
+    await reg._render(task, events.ToolLine("✓ Bash: pwd"))
+    await reg._render(task, events.AssistantText("final answer"))
+    await reg._render(task, events.SubagentStarted("h1", "research", "model"))
+    await reg._render(task, events.SubagentActivity("h1", "reading"))
+    await reg._render(task, events.SubagentCompleted("h1", "success", None, "done"))
+    await reg._render(task, events.TurnComplete("prompt-rich"))
+
+    assert len(rich_bot.stream_starts) == 1
+    start = rich_bot.stream_starts[0]
+    assert start["recipient_user_id"] == task.owner_user_id
+    assert start["recipient_team_id"] == task.team_id
+    assert start["task_display_mode"] == "timeline"
+    assert [chunk["type"] for chunk in start["chunks"]] == ["plan_update", "task_update"]
+    assert any(call["markdown_text"] == "final answer" for call in rich_bot.stream_appends)
+    task_chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call["chunks"]]
+    assert any(chunk["type"] == "task_update" and "Bash: pwd" in chunk["title"] for chunk in task_chunks)
+    assert any(chunk["type"] == "task_update" and chunk["id"] == "subagent-h1" for chunk in task_chunks)
+    assert rich_bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
+    assert rich_bot.statuses == [
+        {"channel_id": task.channel_id, "thread_ts": task.root_ts, "status": "processing"},
+        {"channel_id": task.channel_id, "thread_ts": task.root_ts, "status": "active"},
+    ]
+    assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
+    assert task.progress_stream_ts is None and task.progress_started is False
 
 
 class TestAC5AppBudget:

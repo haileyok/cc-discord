@@ -29,6 +29,7 @@ settings:
       - app_mention
       - reaction_added
       - reaction_removed
+      - agent_session_stopped
   incoming_webhooks:
     incoming_webhooks_enabled: false
 oauth_config:

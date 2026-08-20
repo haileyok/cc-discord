@@ -183,6 +183,48 @@ class TestAC4WebApiAndRetry:
         assert calls[-1].kwargs["name"] == "x"
 
     @pytest.mark.asyncio
+    async def test_native_chat_stream_uses_current_sdk_kwargs_and_parses_ts(self) -> None:
+        chunks = [{"type": "task_update", "id": "work", "title": "Work", "status": "in_progress"}]
+        client = FakeSlackClient(script=_startup_script() + [
+            ("chat_startStream", {"ok": True, "ts": "3.1"}),
+            ("chat_appendStream", {"ok": True}),
+            ("chat_stopStream", {"ok": True}),
+            ("api_call", {"ok": True}),
+        ], expected_kwargs={
+            "chat_startStream": {
+                "channel": "GHOME", "thread_ts": "1.0", "recipient_user_id": "UOWNER",
+                "recipient_team_id": "T1", "task_display_mode": "timeline",
+            },
+            "chat_appendStream": {"channel": "GHOME", "ts": "3.1", "chunks": chunks},
+            "chat_stopStream": {"channel": "GHOME", "ts": "3.1"},
+            "api_call": {
+                "api_method": "agents.sessions.setStatus",
+                "json": {"channel_id": "GHOME", "thread_ts": "1.0", "status": "processing"},
+            },
+        })
+        bot = _ready_bot(client=client)
+        await bot.start()
+        assert await bot.start_stream(
+            "GHOME", "1.0", recipient_user_id="UOWNER", recipient_team_id="T1",
+        ) == "3.1"
+        await bot.append_stream("GHOME", "3.1", chunks=chunks)
+        await bot.stop_stream("GHOME", "3.1")
+        assert await bot.set_agent_status("GHOME", "1.0", "processing")
+        client.assert_complete()
+
+    @pytest.mark.asyncio
+    async def test_native_status_permanent_failure_is_suppressed_and_not_retried(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("api_call", {"ok": False, "error": "feature_disabled"}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        assert not await bot.set_agent_status("GHOME", "1.0", "processing")
+        assert not await bot.set_agent_status("GHOME", "1.0", "active")
+        assert [call.method for call in client.calls].count("api_call") == 1
+        client.assert_complete()
+
+    @pytest.mark.asyncio
     async def test_external_upload_flow_is_preflight_upload_complete(self, tmp_path: Path) -> None:
         # The HTTP leg is intentionally not faked by a permissive MagicMock;
         # this verifies the two Slack API legs and file existence/size guards.

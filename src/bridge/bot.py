@@ -429,6 +429,10 @@ class Bot:
         self._owned_channel_ids: set[str] = set()
         self._outbound_locks: dict[str, asyncio.Lock] = {}
         self._outbound_last: dict[str, float] = {}
+        # Native agent status is optional: older workspaces/SDK fakes may not
+        # expose the generic API surface.  Once Slack gives a permanent
+        # capability error, skip future attempts for this process.
+        self._agent_status_unsupported = False
         self._socket_handler = self.handle_socket_envelope
 
     @property
@@ -520,7 +524,10 @@ class Bot:
             self._outbound_last[str(channel_id)] = asyncio.get_running_loop().time()
 
     async def _api(self, method: str, **kwargs: Any) -> Any:
-        if method in {"chat_postMessage", "chat_update", "reactions_add", "files_completeUploadExternal"}:
+        if method in {
+            "chat_postMessage", "chat_update", "chat_startStream", "chat_appendStream",
+            "chat_stopStream", "reactions_add", "files_completeUploadExternal",
+        }:
             await self._throttle_outbound(kwargs.get("channel") or kwargs.get("channel_id"))
         operation = getattr(self._client, method, None)
         if operation is None or not callable(operation):
@@ -698,6 +705,128 @@ class Bot:
         fallback = fallback_text or self._blocks_fallback(blocks)
         return await self.post(fallback, channel_id=channel_id, root_ts=root_ts,
                                blocks=blocks, fallback_text=fallback)
+
+    async def start_stream(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        *,
+        recipient_user_id: str,
+        recipient_team_id: str,
+        markdown_text: str | None = None,
+        chunks: Any | None = None,
+        task_display_mode: str | None = "timeline",
+    ) -> str:
+        """Start a native Slack stream in an ordinary channel thread.
+
+        The recipient fields are deliberately required: Slack uses them to
+        associate the stream with the human who initiated the thread.  Return
+        the stream message timestamp, which is the ``ts`` used by append/stop.
+        """
+        self._require_ready()
+        kwargs: dict[str, Any] = {
+            "channel": self._channel_for(channel_id),
+            "thread_ts": str(thread_ts),
+            "recipient_user_id": str(recipient_user_id),
+            "recipient_team_id": str(recipient_team_id),
+        }
+        if markdown_text is not None:
+            kwargs["markdown_text"] = markdown_text
+        if chunks is not None:
+            kwargs["chunks"] = chunks
+        if task_display_mode is not None:
+            kwargs["task_display_mode"] = task_display_mode
+        response = await self._api("chat_startStream", **kwargs)
+        return self._message_id(response)
+
+    async def append_stream(
+        self,
+        channel_id: str,
+        stream_ts: str,
+        *,
+        markdown_text: str | None = None,
+        chunks: Any | None = None,
+    ) -> Any:
+        """Append markdown or structured task/plan chunks to a stream."""
+        self._require_ready()
+        kwargs: dict[str, Any] = {
+            "channel": self._channel_for(channel_id),
+            "ts": str(stream_ts),
+        }
+        if markdown_text is not None:
+            kwargs["markdown_text"] = markdown_text
+        if chunks is not None:
+            kwargs["chunks"] = chunks
+        return await self._api("chat_appendStream", **kwargs)
+
+    async def stop_stream(
+        self,
+        channel_id: str,
+        stream_ts: str,
+        *,
+        markdown_text: str | None = None,
+        chunks: Any | None = None,
+        blocks: Any | None = None,
+        metadata: Any | None = None,
+    ) -> Any:
+        """Finalize a native stream, optionally with final text/blocks."""
+        self._require_ready()
+        kwargs: dict[str, Any] = {
+            "channel": self._channel_for(channel_id),
+            "ts": str(stream_ts),
+        }
+        if markdown_text is not None:
+            kwargs["markdown_text"] = markdown_text
+        if chunks is not None:
+            kwargs["chunks"] = chunks
+        if blocks is not None:
+            kwargs["blocks"] = blocks
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        return await self._api("chat_stopStream", **kwargs)
+
+    # Explicit aliases keep the adapter discoverable to callers that mirror the
+    # Web API naming while the task layer uses the shorter stream names.
+    start_chat_stream = start_stream
+    append_chat_stream = append_stream
+    stop_chat_stream = stop_stream
+
+    async def set_agent_status(self, channel_id: str, thread_ts: str, status: str) -> bool:
+        """Best-effort agents.sessions.setStatus for native Slack UX.
+
+        This endpoint is intentionally optional.  A missing generic ``api_call``
+        method or a permanent feature/scope error disables it for this Bot;
+        transient failures are logged and remain non-fatal to agent turns.
+        """
+        if self._agent_status_unsupported:
+            return False
+        payload = {
+            "channel_id": self._channel_for(channel_id),
+            "thread_ts": str(thread_ts),
+            "status": str(status),
+        }
+        try:
+            await self._api("api_call", api_method="agents.sessions.setStatus", json=payload)
+            return True
+        except Exception as exc:
+            error = str(getattr(exc, "error", "") or "").lower()
+            if isinstance(exc, SlackApiError):
+                error = str(_response_value(_exception_response(exc), "error", error) or error).lower()
+            permanent = {
+                "access_denied", "accesslimited", "channel_not_found", "deprecated_endpoint",
+                "enterprise_is_restricted", "feature_disabled", "invalid_arguments", "invalid_auth",
+                "method_deprecated", "missing_scope", "no_permission", "not_allowed_token_type",
+                "not_authorized", "not_authed", "team_access_not_granted", "thread_ts_not_allowed",
+                "thread_ts_required", "token_expired", "token_revoked", "unknown_method",
+            }
+            if (
+                error in permanent
+                or "lacks api_call" in str(exc).lower()
+                or isinstance(exc, (AttributeError, TypeError, NotImplementedError))
+            ):
+                self._agent_status_unsupported = True
+            logger.warning("native Slack agent status unavailable: %s", safe_error(exc, "status update failed"))
+            return False
 
     async def post_with_attachments(self, file_paths: list[str | Path],
                                     *, channel_id: str | None = None,
