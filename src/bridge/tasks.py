@@ -265,6 +265,7 @@ class Task:
     progress_started: bool = False
     progress_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
+    progress_answer: str = ""
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
 
@@ -821,12 +822,14 @@ class TaskRegistry:
                     if task.progress_stream_ts is None and task.progress_fallback_ts is None:
                         await self._post(task, f"💭 {action.text}")
             elif isinstance(action, ToolLine):
-                self._agg_for(task).append(action.line)
+                if not task.progress_started:
+                    self._agg_for(task).append(action.line)
                 await self._progress_task_update(task, action.line, status="complete")
             elif isinstance(action, (ToolDiff, ToolFailure)):
                 line = action.block if isinstance(action, ToolDiff) else action.line
                 await self._progress_line(task, line)
-                await self._post(task, line)
+                if not task.progress_started:
+                    await self._post(task, line)
             elif isinstance(action, SubagentStarted):
                 await self._subagent_started(task, action)
                 await self._progress_task_update(
@@ -913,6 +916,12 @@ class TaskRegistry:
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body[:2900]}"}},
             {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{state} · {len(task.progress_lines)} updates"}]},
         ]
+        if task.progress_answer:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": task.progress_answer[-2900:]},
+            })
+            fallback = f"{fallback}\n\n{task.progress_answer}"[:2900]
         return fallback[:2900], blocks
 
     async def _set_agent_status(self, task: Task, status: str) -> None:
@@ -1032,28 +1041,21 @@ class TaskRegistry:
         if not task.progress_started:
             await self._post_assistant_text(task, text)
             return
-        stream_was_active = task.progress_stream_ts is not None
+        if cleaned:
+            task.progress_answer = (task.progress_answer + cleaned)[-12000:]
         chunks = self._progress_chunk_text(cleaned)
-        appended = 0
         for chunk in chunks:
             if not await self._append_progress(task, markdown_text=chunk):
                 break
-            appended += len(chunk)
-        # Converting a live stream to Block Kit replaces its rendered content;
-        # replay the complete assistant block in ordinary output, not only the
-        # failed suffix, when that handoff occurred.
-        if stream_was_active and task.progress_stream_ts is None and task.progress_fallback_ts is not None:
-            appended = 0
-        remaining = cleaned[appended:]
-        if remaining:
-            # A stream can fail after partially receiving a block.  Only post
-            # the unacknowledged suffix so assistant output appears once.
-            await self._post(task, remaining)
+        if task.progress_fallback_ts is not None:
+            # The fallback card is the turn surface: keep answer text inside it
+            # instead of posting a second assistant message.
+            await self._update_fallback_progress(task)
         if paths:
             await self._require_bot().post_with_attachments(
                 [str(path) for path in paths[:MAX_ATTACHMENTS_PER_POST]],
                 channel_id=task.channel_id, root_ts=task.root_ts,
-                text=remaining or None,
+                text=None,
             )
 
     async def _handle_reconcile(self, task: Task, reason: str) -> None:
@@ -1083,6 +1085,8 @@ class TaskRegistry:
     async def _subagent_started(self, task: Task, action: SubagentStarted) -> None:
         block = SubagentBlock(action.handle, action.subagent_type or action.handle, time.time())
         task.subagent_blocks[action.handle] = block
+        if task.progress_started:
+            return
         try:
             sent = await self._post(task, "", blocks=self._subagent_blocks(block, [], 0, False))
             block.message_ts = sent[0] if sent else None
@@ -1095,8 +1099,9 @@ class TaskRegistry:
         if block is None:
             block = SubagentBlock(handle, handle, time.time())
             task.subagent_blocks[handle] = block
-            sent = await self._post(task, "", blocks=self._subagent_blocks(block, [], 0, False))
-            block.message_ts = sent[0] if sent else None
+            if not task.progress_started:
+                sent = await self._post(task, "", blocks=self._subagent_blocks(block, [], 0, False))
+                block.message_ts = sent[0] if sent else None
         block.actions.append(line)
         await self._maybe_edit_subagent(task, block, False)
 
@@ -1930,6 +1935,7 @@ class TaskRegistry:
         task.progress_started = True
         task.progress_lines.clear()
         task.progress_sequence = 0
+        task.progress_answer = ""
         bot = self._require_bot()
         starter = getattr(bot, "start_stream", None)
         if callable(starter) and not task.progress_stream_disabled:
@@ -2001,14 +2007,23 @@ class TaskRegistry:
                     await self._ensure_fallback_progress(task, outcome=outcome)
             if task.progress_fallback_ts is not None:
                 if outcome == "complete":
-                    # The fallback is a transient working indicator. Successful
-                    # completion leaves only the actual assistant response.
-                    deleter = getattr(self._require_bot(), "delete_message", None)
-                    if callable(deleter):
-                        with contextlib.suppress(Exception):
-                            result = deleter(task.channel_id, task.progress_fallback_ts)
-                            if inspect.isawaitable(result):
-                                await result
+                    if task.progress_answer:
+                        # Transform the one working card into the final answer.
+                        answer_blocks = [
+                            {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+                            for chunk in self._progress_chunk_text(task.progress_answer, 2900)
+                        ][:50]
+                        await self._require_bot().edit_message(
+                            task.channel_id, task.progress_fallback_ts,
+                            text=task.progress_answer[:4000], blocks=answer_blocks,
+                        )
+                    else:
+                        deleter = getattr(self._require_bot(), "delete_message", None)
+                        if callable(deleter):
+                            with contextlib.suppress(Exception):
+                                result = deleter(task.channel_id, task.progress_fallback_ts)
+                                if inspect.isawaitable(result):
+                                    await result
                     task.progress_fallback_ts = None
                 else:
                     await self._update_fallback_progress(task, outcome=outcome)

@@ -471,6 +471,7 @@ async def test_turn_status_fallback_is_one_editable_block_and_no_legacy_working_
     fallback_ts = task.progress_fallback_ts
     assert fallback_ts is not None
     await reg._render(task, events.ToolLine("✓ Bash: ls"))
+    assert len(bot.posts) == 1  # tool progress stays in the existing card
     await reg._render(task, events.TurnComplete("prompt-1"))
     assert task.progress_stream_ts is None
     assert task.progress_fallback_ts is None
@@ -528,9 +529,12 @@ async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db
     assert task.progress_stream_ts is None
     assert task.progress_fallback_ts == "stream-1"
     assert any(edit["message_ts"] == "stream-1" and edit["blocks"] for edit in bot.edits)
-    assert any(post.get("text") == "answer after degradation" for post in bot.posts)
+    assert not any(post.get("text") == "answer after degradation" for post in bot.posts)
+    assert any("answer after degradation" in str(edit.get("text")) for edit in bot.edits)
 
     await reg._render(task, events.TurnComplete("prompt-degrade"))
+    assert "answer after degradation" in bot.edits[-1]["text"]
+    assert all("Agent working" not in str(block) for block in bot.edits[-1]["blocks"])
     assert task.progress_stream_disabled is False
     await reg._render(task, events.TurnStarted("prompt-retry"))
     assert len(bot.stream_starts) == 2
