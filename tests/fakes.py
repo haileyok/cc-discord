@@ -310,6 +310,9 @@ class FakeSlackClient:
     async def chat_postMessage(self, **kwargs: Any) -> Any:
         return await self._call("chat_postMessage", **kwargs)
 
+    async def chat_postEphemeral(self, **kwargs: Any) -> Any:
+        return await self._call("chat_postEphemeral", **kwargs)
+
     async def chat_update(self, **kwargs: Any) -> Any:
         return await self._call("chat_update", **kwargs)
 

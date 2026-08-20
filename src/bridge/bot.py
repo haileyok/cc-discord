@@ -669,6 +669,30 @@ class Bot:
             ids.append(self._message_id(response))
         return ids
 
+    async def respond(self, payload: Mapping[str, Any], response: Any) -> Any:
+        """Send a dispatcher response after a Socket Mode envelope was acked.
+
+        Slash-command acknowledgements must happen immediately, before task work.
+        The eventual result is therefore delivered as an ephemeral message to the
+        verified command actor in the originating channel.
+        """
+        text = str(getattr(response, "text", "") or "")
+        blocks = getattr(response, "blocks", None)
+        if not text and not blocks:
+            return None
+        channel_id = str(payload.get("channel_id") or "")
+        actor_id = str(payload.get("actor_id") or payload.get("user_id") or "")
+        if not channel_id or not actor_id:
+            raise SlackAdapterError("Slack response omitted channel or actor identity")
+        kwargs: dict[str, Any] = {
+            "channel": channel_id,
+            "user": actor_id,
+            "text": text or self._blocks_fallback(blocks),
+        }
+        if blocks:
+            kwargs["blocks"] = blocks
+        return await self._api("chat_postEphemeral", **kwargs)
+
     async def post_blocks(self, blocks: list[dict[str, Any]], fallback_text: str | None = None,
                           *, channel_id: str | None = None, root_ts: str | None = None) -> list[str]:
         fallback = fallback_text or self._blocks_fallback(blocks)

@@ -7,6 +7,7 @@ AC.9 = Socket Mode quick ack and normalized dispatch hooks.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -144,6 +145,19 @@ class TestAC4WebApiAndRetry:
         with pytest.raises(SlackAdapterError):
             await _with_retry("test", non_retryable, sleeper=waits.append)
         assert waits == [7]
+
+    @pytest.mark.asyncio
+    async def test_socket_command_response_posts_ephemeral_to_verified_actor(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("chat_postEphemeral", {"ok": True, "message_ts": "1.0"}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        response = SimpleNamespace(text="missing cwd", blocks=None, ephemeral=True)
+        await bot.respond({"channel_id": "GHOME", "actor_id": "UOWNER"}, response)
+        call = client.calls[-1]
+        assert call.method == "chat_postEphemeral"
+        assert call.kwargs == {"channel": "GHOME", "user": "UOWNER", "text": "missing cwd"}
 
     @pytest.mark.asyncio
     async def test_root_thread_blocks_edit_and_reactions(self) -> None:
