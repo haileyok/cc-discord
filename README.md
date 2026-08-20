@@ -7,6 +7,7 @@
 ## What it does
 
 - `/agent` and shortcuts provide the Slack control surface for starting and managing tasks.
+- Mentioning the bot as the configured owner automatically starts an ad-hoc task when that thread has no task yet. It imports the thread for context and runs from `BRIDGE_AD_HOC_CWD` (default `/home/hailey/bluesky`), so requests such as thread analysis or an Attie deployment do not need a separate start step.
 - Each task runs `polytoken new --no-attach` in a project directory. Prompts go to the daemon's loopback `POST /prompt`; assistant/tool activity comes from its resumable `GET /events` SSE stream.
 - Replies in a task's root message thread become prompts. Structured questions are rendered to Slack; the next plain-text reply answers the pending question.
 - Text, thinking, tool summaries, subagent activity, todo state, reactions, and attachments are translated to Slack messages/blocks/files.
@@ -101,6 +102,7 @@ Slack limitations are intentional:
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Local health URL used by `doctor` |
 | `POLYTOKEN_BIN` | `polytoken` | Polytoken executable for smoke checks |
 | `BRIDGE_PROJECT_ROOTS` | unset | Colon-separated parent paths for project selection |
+| `BRIDGE_AD_HOC_CWD` | `/home/hailey/bluesky` | Working directory for owner mentions that automatically start a task |
 | `BRIDGE_ATTACHMENT_TTL_SECS` | `604800` | Attachment cleanup TTL (7 days) |
 | `BRIDGE_MAX_ATTACHMENT_BYTES` | `10485760` | Incoming attachment byte cap |
 | `BRIDGE_APP_EXCHANGE_BUDGET` | `20` | Collaborative app-to-app loop cap |

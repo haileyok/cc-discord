@@ -422,6 +422,51 @@ class TestAC2IdentityRouting:
         assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", "other-root", SlackActor("UOWNER"), "unknown", "E2", "M2"))
         assert client.prompts == []
 
+    async def test_owner_mention_without_task_starts_ad_hoc_bluesky_session(self, in_memory_db, tmp_path):
+        bot = FakeBot()
+        supervisor = FakeSupervisor()
+        reg = TaskRegistry(in_memory_db, bot, supervisor, ad_hoc_cwd=str(tmp_path))
+        bot.thread_pages = {"": {"messages": [
+            {"ts": "1.000", "user": "UOTHER", "text": "earlier thread context"},
+        ], "has_more": False}}
+        prompts: list[str] = []
+
+        async def capture(_task, content, **_kwargs):
+            prompts.append(content)
+            return True
+
+        reg._prompt = capture  # type: ignore[method-assign]
+        event = {
+            "kind": "app_mention", "team_id": "T1", "channel_id": "COTHER",
+            "root_ts": "1.000", "message_ts": "2.000", "actor_id": "UOWNER",
+            "id": "E-ad-hoc", "text": "<@UBRIDGE> deploy Attie with sha abc123",
+        }
+        assert await reg.maybe_route_message(event)
+        task = reg.get_by_conversation("T1", "COTHER", "1.000")
+        assert task is not None
+        assert task.cwd == str(tmp_path)
+        assert task.mention_required is True
+        assert supervisor._seq == 1
+        assert len(prompts) == 1
+        assert "earlier thread context" in prompts[0]
+        assert "deploy Attie with sha abc123" in prompts[0]
+        assert '"actor_id":"UOWNER"' in prompts[0]
+        assert await reg.maybe_route_message(event)
+        assert supervisor._seq == 1
+        await reg.shutdown()
+
+    async def test_non_owner_mention_without_task_is_ignored(self, in_memory_db, tmp_path):
+        bot = FakeBot()
+        supervisor = FakeSupervisor()
+        reg = TaskRegistry(in_memory_db, bot, supervisor, ad_hoc_cwd=str(tmp_path))
+        assert not await reg.maybe_route_message({
+            "kind": "app_mention", "team_id": "T1", "channel_id": "COTHER",
+            "root_ts": "1.000", "message_ts": "2.000", "actor_id": "UOTHER",
+            "id": "E-unauthorized", "text": "<@UBRIDGE> do something",
+        })
+        assert supervisor._seq == 0
+        await reg.shutdown()
+
     async def test_existing_thread_requires_exact_mention_before_auth_or_files(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.004b")

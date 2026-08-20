@@ -126,6 +126,7 @@ SUBAGENT_BLOCK_MAX_ACTIONS = 5
 SUBAGENT_EDIT_THROTTLE_SECS = 1.5
 MAX_ATTACHMENTS_PER_POST = 10
 DEFAULT_APP_EXCHANGE_BUDGET = int(os.environ.get("BRIDGE_APP_EXCHANGE_BUDGET", "20"))
+DEFAULT_AD_HOC_CWD = os.environ.get("BRIDGE_AD_HOC_CWD", "/home/hailey/bluesky")
 ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
 
 
@@ -529,6 +530,7 @@ class TaskRegistry:
         app_actor_id: str | None = None,
         home_channel_id: str | None = None,
         app_exchange_budget: int = DEFAULT_APP_EXCHANGE_BUDGET,
+        ad_hoc_cwd: str = DEFAULT_AD_HOC_CWD,
     ) -> None:
         self._conn = conn
         self._bot = bot
@@ -542,6 +544,7 @@ class TaskRegistry:
         self._daemon_presence_known = False
         self._known_daemon_sessions: set[str] = set()
         self.home_channel_id = home_channel_id or getattr(bot, "home_channel_id", None)
+        self.ad_hoc_cwd = str(Path(ad_hoc_cwd).expanduser())
         if app_exchange_budget <= 0:
             raise ValueError("app_exchange_budget must be positive")
         self.app_exchange_budget = app_exchange_budget
@@ -1661,6 +1664,60 @@ class TaskRegistry:
             self._message_seen.add(marker)
         return True
 
+    async def _spawn_from_owner_mention(self, msg: SlackMessage) -> bool:
+        """Create an attached ad-hoc task for a verified owner mention."""
+        bot = self._require_bot()
+        owner_id = str(getattr(bot, "owner_user_id", "") or "")
+        cleaned = _strip_verified_mention(msg.text, self._bridge_user_id)
+        if not msg.verified_mention and cleaned is None:
+            return False
+        if msg.actor.is_app or not owner_id or msg.actor_id != owner_id:
+            return False
+        if not await self._dedup_message(msg):
+            return True
+        request = cleaned if cleaned is not None else msg.text.strip()
+        if not request and not msg.files:
+            await bot.post(
+                "👋 I saw the mention, but Slack supplied no request text. Mention me with what you want the agent to do.",
+                channel_id=msg.channel_id,
+                root_ts=msg.root_ts,
+            )
+            return True
+        if msg.files:
+            # The normal routed-message path applies authenticated attachment
+            # downloading after a task exists. Ask for a follow-up rather than
+            # silently dropping files from the task-creating mention.
+            request = (request + "\n\n[Slack attachments were included with the task-starting mention; inspect the thread for them.]").strip()
+        provenance = MessageProvenance(
+            msg.team_id, msg.channel_id, msg.root_ts, msg.message_ts, msg.event_id,
+            msg.actor_id, "human",
+        )
+        try:
+            await self.spawn_task(
+                self.ad_hoc_cwd,
+                team_id=msg.team_id,
+                channel_id=msg.channel_id,
+                owner_user_id=owner_id,
+                root_ts=msg.root_ts,
+                prompt=provenance.wire(request),
+                bind_existing_root=True,
+            )
+        except TaskRoutingError:
+            # A concurrent redelivery may have won the root reservation. The
+            # durable task now owns this conversation, so treat this event as
+            # handled rather than creating a second daemon.
+            if self.get_by_conversation(msg.team_id, msg.channel_id, msg.root_ts) is not None:
+                return True
+            raise
+        except Exception as exc:
+            await bot.post(
+                f"💥 Could not start an ad-hoc agent in `{Path(self.ad_hoc_cwd).name}`: {safe_error(exc, 'start failed')}",
+                channel_id=msg.channel_id,
+                root_ts=msg.root_ts,
+            )
+            return True
+        return True
+
     async def maybe_route_message(self, value: Any) -> bool:
         msg = normalize_message(value)
         if not msg.team_id or not msg.channel_id or not msg.root_ts or not msg.actor_id:
@@ -1670,7 +1727,9 @@ class TaskRegistry:
         if self._bridge_bot_id and msg.actor_id == str(self._bridge_bot_id):
             return False
         task = self.get_by_key(ConversationKey(msg.team_id, msg.channel_id, msg.root_ts))
-        if task is None or task.key in self._disabled_roots:
+        if task is None:
+            return await self._spawn_from_owner_mention(msg)
+        if task.key in self._disabled_roots:
             return False
         if task.status in {"rebinding", "promoting"} or task.promotion_state in {"preparing"}:
             return False
