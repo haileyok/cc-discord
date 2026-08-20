@@ -1063,6 +1063,33 @@ async def put_pending_interrogative(
     return pending
 
 
+async def restore_pending_interrogative_if_absent(
+    conn: aiosqlite.Connection,
+    key: ConversationKey,
+    pending: PendingInterrogative,
+    *,
+    binding_id: str = "",
+    target_kind: ParticipantKind = ParticipantKind.HUMAN,
+) -> bool:
+    """Restore a claimed question only when no newer question replaced it."""
+    key = _key(key)
+    cursor = await conn.execute(
+        """
+        INSERT OR IGNORE INTO pending_interrogatives
+          (team_id, channel_id, root_id, actor_id, interrogative_id,
+           payload_json, binding_id, target_kind, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            key.team_id, key.channel_id, key.root_id, pending.actor_id,
+            pending.interrogative_id, _json(pending.payload), str(binding_id),
+            ParticipantKind(target_kind).value, pending.created_at, pending.expires_at,
+        ),
+    )
+    await conn.commit()
+    return cursor.rowcount > 0
+
+
 async def get_pending_interrogative(
     conn: aiosqlite.Connection,
     key: ConversationKey,
@@ -1279,6 +1306,7 @@ __all__ = [
     "get_runtime_by_key",
     "list_runtime",
     "replace_runtime_binding",
+    "restore_pending_interrogative_if_absent",
     "restore_runtime_binding",
     "update_runtime",
     "upsert_runtime",

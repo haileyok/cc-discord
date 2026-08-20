@@ -81,6 +81,7 @@ from bridge.state import (
     get_runtime_by_key,
     list_runtime,
     replace_runtime_binding,
+    restore_pending_interrogative_if_absent,
     restore_runtime_binding,
     RuntimeRow,
     update_runtime,
@@ -1403,11 +1404,16 @@ class TaskRegistry:
         except PolytokenClientError:
             # Delivery failed after the atomic claim. Restore the durable row so
             # the targeted actor can retry instead of losing the question.
-            await put_pending_interrogative(
+            restored = await restore_pending_interrogative_if_absent(
                 self._conn, task.key, pending, binding_id=binding_id,
                 target_kind=ParticipantKind.APP if pending.actor_id.startswith("B") else ParticipantKind.HUMAN,
             )
-            self._pending[(task.key, str(pending.actor_id))] = pending
+            if restored:
+                self._pending[(task.key, str(pending.actor_id))] = pending
+            else:
+                newer = await get_pending_interrogative(self._conn, task.key, pending.actor_id)
+                if newer is not None:
+                    self._pending[(task.key, str(pending.actor_id))] = newer
             await self._post(task, "⚠ Failed to deliver your answer to the daemon; please retry.")
 
     @staticmethod

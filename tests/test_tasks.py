@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from bridge import events, state
-from bridge.domain import ConversationKey, Participant, ParticipantKind
+from bridge.domain import ConversationKey, Participant, ParticipantKind, PendingInterrogative
 from bridge.polytoken_client import PolytokenClientError
 from bridge.tasks import (
     SlackActor,
@@ -542,6 +542,25 @@ async def test_failed_interrogative_delivery_restores_pending_for_retry(in_memor
     assert await state.get_pending_interrogative(in_memory_db, task.key, "UOWNER") is not None
     assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "yes"))
     assert client.interrogative_responses[-1]["id"] == "I-retry"
+
+
+@pytest.mark.asyncio
+async def test_failed_old_answer_does_not_overwrite_newer_interrogative(in_memory_db):
+    reg, _ = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.interrogative-race")
+    await reg._render(task, events.Confirmation("I-old", None, "Old question?"))
+
+    async def accepted_then_failed(interrogative_id, response):
+        newer = PendingInterrogative("I-new", "UOWNER", {"kind": "confirmation", "question": "New?"}, 9999999999, 1)
+        await state.put_pending_interrogative(in_memory_db, task.key, newer)
+        reg._pending[(task.key, "UOWNER")] = newer
+        raise PolytokenClientError("ambiguous transport failure")
+
+    client.respond_interrogative = accepted_then_failed
+    assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "yes"))
+    stored = await state.get_pending_interrogative(in_memory_db, task.key, "UOWNER")
+    assert stored is not None and stored.interrogative_id == "I-new"
+    assert reg._pending[(task.key, "UOWNER")].interrogative_id == "I-new"
 
 
 @pytest.mark.asyncio
