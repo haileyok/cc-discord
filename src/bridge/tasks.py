@@ -1042,6 +1042,14 @@ class TaskRegistry:
         task.polytoken_session_id = result.session_id
         task.port = result.port
         task.credential_file_path = getattr(result, "credential_file_path", None)
+        await update_runtime(
+            self._conn,
+            task.task_id,
+            session_id=result.session_id,
+            port=result.port,
+            status="running",
+            last_activity=task.last_activity,
+        )
         await self._index(task)
         self._by_session_id[result.session_id] = task
         self._start_consumer(task)

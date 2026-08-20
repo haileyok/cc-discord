@@ -199,6 +199,11 @@ async def test_fresh_spawn_carries_runtime_credential_path(in_memory_db, tmp_pat
         "/tmp", team_id="T1", channel_id="CHOME", owner_user_id="UOWNER"
     )
     assert task.credential_file_path == str(tmp_path / "daemon.json")
+    runtime = await state.get_runtime(in_memory_db, task.task_id)
+    assert runtime is not None
+    assert runtime.session_id == task.polytoken_session_id
+    assert runtime.port == task.port
+    assert runtime.status == "running"
 
 
 @pytest.mark.asyncio

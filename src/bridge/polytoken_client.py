@@ -56,7 +56,8 @@ def load_bearer_token(path: str | Path) -> str:
 
     Credential files must be non-symlink regular files with exactly ``0600``
     permission bits and a JSON object containing ``version: 1``,
-    ``kind: "bearer"``, and a non-empty string ``token``.  Error messages never
+    ``kind: "polytoken-daemon-credential"``, and a non-empty string ``token``.
+    Error messages never
     include the token or file contents.
     """
     credential_path = Path(path).expanduser()
@@ -81,7 +82,7 @@ def load_bearer_token(path: str | Path) -> str:
         raise PolytokenCredentialError("Polytoken credential file contains invalid JSON") from exc
     if not isinstance(data, Mapping):
         raise PolytokenCredentialError("Polytoken credential file must contain a JSON object")
-    if data.get("version") != 1 or data.get("kind") != "bearer":
+    if data.get("version") != 1 or data.get("kind") != "polytoken-daemon-credential":
         raise PolytokenCredentialError("Polytoken credential file has an unsupported schema")
     token = data.get("token")
     if not isinstance(token, str) or not token or not token.strip() or token != token.strip():

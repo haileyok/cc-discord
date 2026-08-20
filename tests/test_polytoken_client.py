@@ -99,7 +99,7 @@ def _build_stub_app() -> web.Application:
 
 def _credential_file(tmp_path, token: str = "daemon-secret"):
     path = tmp_path / "credential.json"
-    path.write_text(json.dumps({"version": 1, "kind": "bearer", "token": token}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 1, "kind": "polytoken-daemon-credential", "token": token}), encoding="utf-8")
     path.chmod(0o600)
     return path
 
