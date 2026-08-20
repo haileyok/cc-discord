@@ -1,17 +1,17 @@
-"""Translate a Polytoken ``DaemonEvent`` stream into Discord render actions.
+"""Translate a Polytoken ``DaemonEvent`` stream into Slack render actions.
 
 This is a *pure* translation layer: it consumes :class:`SseEnvelope`s and
 produces a list of :class:`Action` intents. It holds only the per-session
 state needed to translate (content-block buffers, pending tool calls, the
-last seen ``seq``); it never touches Discord. ``TaskRegistry`` interprets the
-actions by driving the surviving renderers (the tool-summary aggregator,
-subagent embeds, and ``Bot`` posting).
+last seen ``seq``); it never touches Slack. ``TaskRegistry`` interprets the
+actions by driving the tool-summary aggregator, subagent Block Kit messages,
+and ``Bot`` posting.
 
 Routing rule: every event optionally carries ``subagent_handle``. When set,
 the activity belongs to a spawned subagent and is routed to that subagent's
-live embed; when unset, it belongs to the main session and is routed to the
-main thread aggregator. This replaces the old JSONL ``_is_sidechain_tool``
-heuristic.
+live Block Kit message; when unset, it belongs to the main session and is
+routed to the main root-message aggregator. This replaces the old JSONL
+``_is_sidechain_tool`` heuristic.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bridge import tool_summary
+from bridge.redaction import safe_error
 from bridge.polytoken_client import SseEnvelope
 
 log = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ class SubagentStarted(Action):
 
 @dataclass(frozen=True)
 class SubagentActivity(Action):
-    """A tool one-liner attributed to a running subagent (drives its embed)."""
+    """A tool one-liner attributed to a running subagent message."""
 
     handle: str
     line: str
@@ -95,12 +96,13 @@ class SubagentCompleted(Action):
 
 @dataclass(frozen=True)
 class AskQuestion(Action):
-    """Structured ``ask_user_question`` to render + collect a reply for."""
+    """Structured ``ask_user_question`` with an untrusted payload isolated."""
 
     interrogative_id: str
     prompt_id: str | None
     payload: dict[str, Any]
     subagent_handle: str | None = None
+    target_actor_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -337,7 +339,9 @@ class Translator:
         return [TurnCancelled(reason=e.get("reason", ""))]
 
     def _on_model_error(self, e: dict[str, Any]) -> list[Action]:
-        return [ModelError(error=str(e.get("error", "")))]
+        # Provider/model payloads may contain URLs, prompts, credentials, or
+        # filesystem paths. Never forward the raw daemon error to Slack.
+        return [ModelError(error=safe_error(None, "The daemon reported a model error"))]
 
     # -- tools ------------------------------------------------------------
 
@@ -362,7 +366,7 @@ class Translator:
         failed = tool_summary.is_failure(response, claude_name)
 
         if pending.subagent_handle:
-            # Subagent activity routes to its embed (one compact line).
+            # Subagent activity routes to its Block Kit message (one compact line).
             return [SubagentActivity(handle=pending.subagent_handle, line=line)]
 
         actions: list[Action] = []
@@ -403,8 +407,9 @@ class Translator:
             AskQuestion(
                 interrogative_id=e.get("interrogative_id", ""),
                 prompt_id=e.get("prompt_id"),
-                payload=e.get("payload") or {},
+                payload=e.get("payload") if isinstance(e.get("payload"), dict) else {},
                 subagent_handle=e.get("subagent_handle"),
+                target_actor_id=str((e.get("payload") or {}).get("actor_id") or (e.get("payload") or {}).get("target_actor_id") or "") or None,
             )
         ]
 
@@ -412,7 +417,7 @@ class Translator:
         itype = e.get("interrogative_type")
         iid = e.get("interrogative_id", "")
         pid = e.get("prompt_id")
-        question = e.get("question", "")
+        question = str(e.get("question", ""))[:4000]
         if itype == "permission":
             # Bypass mode: permission interrogatives never need a user answer.
             return []

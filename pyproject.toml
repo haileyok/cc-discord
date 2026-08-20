@@ -1,17 +1,17 @@
 [project]
-name = "claude-discord-bridge"
+name = "claude-slack-bridge"
 version = "0.1.0"
-description = "Localhost HTTP bridge between Claude Code sessions and Discord."
+description = "Localhost HTTP bridge between Polytoken sessions and Slack."
 requires-python = ">=3.12,<4"
 dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.21",
     "click>=8.1",
-    "discord.py>=2.4",
+    "slack-sdk>=3.35",
 ]
 
 [project.scripts]
-claude-discord-bridge = "bridge.cli:main"
+claude-slack-bridge = "bridge.cli:main"
 
 [dependency-groups]
 dev = [

@@ -26,7 +26,7 @@ def make_runner(responses: dict[tuple[str, ...], tuple[int, str, str]]):
 
 
 _SESSIONS_OUT = """SESSION_ID                  PORT    PID      STARTED_AT               PROJECT_PATH
-03hess-salt                 41515   3701047  2026-06-15T00:45:45Z     /home/discord
+03hess-salt                 41515   3701047  2026-06-15T00:45:45Z     /home/slack
 03hqrb-life                 34017   4074715  2026-06-15T03:18:35Z     /tmp/pt probe with spaces
 """
 
@@ -92,7 +92,7 @@ class TestListSessions:
         rows = await sup.list_sessions()
         assert len(rows) == 2
         assert rows[0] == SessionInfo(
-            "03hess-salt", 41515, 3701047, "2026-06-15T00:45:45Z", "/home/discord"
+            "03hess-salt", 41515, 3701047, "2026-06-15T00:45:45Z", "/home/slack"
         )
         assert rows[1].project_path == "/tmp/pt probe with spaces"
 

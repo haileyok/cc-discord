@@ -1,567 +1,692 @@
-"""discord.app_commands tree for task lifecycle control.
+"""Slack commands, shortcuts, modals, and task-root controls.
 
-Registered guild-scoped (instant sync). Bot must finish on_ready before sync runs.
+The command layer deliberately does not depend on a Slack web framework.  The
+Socket Mode adapter hands this module either a raw Socket Mode envelope or a
+normalized payload; :class:`CommandDispatcher` acknowledges the envelope first
+and then runs the potentially slow registry operation.
 """
+from __future__ import annotations
 
+import inspect
+import json
 import logging
-import re
-from datetime import datetime, timezone
+import shlex
+from dataclasses import dataclass
 from pathlib import Path
-
-import discord
-from discord import app_commands
+from typing import Any, Awaitable, Callable, Mapping
 
 from bridge import skills, usage
-from bridge.bot import Bot, BotMissingPermission
-from bridge.projects import Project
+from bridge.domain import ConversationKey
+from bridge.redaction import safe_error, safe_log
 from bridge.tasks import (
     Task,
     TaskNotFound,
+    TaskPrivilegeError,
     TaskRegistry,
     TaskRestartError,
+    TaskRoutingError,
     TaskSpawnError,
+    normalize_message,
 )
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# Reasoning-effort levels accepted by `/effort`. The daemon validates the level
-# against the active model's capabilities and falls back gracefully.
-_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "none"]
-
-
-class _NotInTaskThread(Exception):
-    """Raised when a thread-context command is used outside a task thread."""
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "none")
+_ACKED = "_bridge_acknowledged"
 
 
-def build_tree(
-    bot: Bot,
-    registry: TaskRegistry,
-    projects: list[Project] | None = None,
-) -> app_commands.CommandTree:
-    """Construct and return the CommandTree (not yet synced; caller decides when)."""
-    tree = app_commands.CommandTree(bot.client)
-    projects_list: list[Project] = list(projects or [])
-    projects_by_key: dict[str, Project] = {
-        f"{p.root_label}/{p.name}": p for p in projects_list
+@dataclass(frozen=True)
+class SlackResponse:
+    """A transport-neutral response returned by :meth:`dispatch`.
+
+    ``text`` and ``blocks`` are useful to tests and adapters which do not expose
+    a response URL.  ``ephemeral`` expresses the intended visibility; Slack's
+    response URL or Web API adapter is responsible for enforcing it.
+    """
+
+    text: str = ""
+    blocks: list[dict[str, Any]] | None = None
+    ephemeral: bool = True
+    modal: dict[str, Any] | None = None
+
+
+def _get(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _actor_id(payload: Mapping[str, Any]) -> str:
+    user = payload.get("user")
+    if isinstance(user, Mapping):
+        return str(user.get("id") or user.get("user_id") or "")
+    return str(payload.get("user_id") or payload.get("actor_id") or user or "")
+
+
+def _channel_id(payload: Mapping[str, Any]) -> str:
+    channel = payload.get("channel")
+    if isinstance(channel, Mapping):
+        return str(channel.get("id") or "")
+    return str(payload.get("channel_id") or channel or "")
+
+
+def _team_id(payload: Mapping[str, Any], bot: Any = None) -> str:
+    team = payload.get("team")
+    if isinstance(team, Mapping):
+        team = team.get("id")
+    return str(payload.get("team_id") or team or getattr(bot, "team_id", "") or "")
+
+
+def _root_ts(payload: Mapping[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, Mapping):
+        return str(
+            payload.get("root_ts")
+            or payload.get("thread_ts")
+            or message.get("thread_ts")
+            or message.get("ts")
+            or payload.get("message_ts")
+            or ""
+        )
+    return str(
+        payload.get("root_ts")
+        or payload.get("thread_ts")
+        or payload.get("message_ts")
+        or payload.get("ts")
+        or ""
+    )
+
+
+def _json_or_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(decoded) if isinstance(decoded, Mapping) else {}
+    return {}
+
+
+def normalize_socket_payload(envelope: Any) -> dict[str, Any]:
+    """Normalize Slack Socket Mode and direct callback fixtures.
+
+    Slack sends interactive payloads as JSON strings in ``payload`` while slash
+    commands and events are often mappings.  This function accepts both forms
+    and preserves ``envelope_id``, an optional ack callback, and response
+    callbacks for the dispatcher.
+    """
+    if not isinstance(envelope, Mapping):
+        raise ValueError("malformed Slack envelope: expected object")
+    raw = dict(envelope)
+    payload_value = raw.get("payload", raw)
+    payload = _json_or_mapping(payload_value)
+    if not payload:
+        raise ValueError("malformed Slack envelope payload")
+    # Socket Mode wraps event callbacks in payload.event; retain the event type
+    # while leaving event fields at the top level for a simple registry contract.
+    event = payload.get("event")
+    if isinstance(event, Mapping):
+        normalized = dict(event)
+        normalized.update({k: v for k, v in payload.items() if k != "event"})
+        normalized["type"] = "events" if normalized.get("type") == "event_callback" else normalized.get("type", "events")
+    else:
+        normalized = dict(payload)
+    envelope_type = str(raw.get("type") or payload.get("type") or "")
+    if envelope_type in {"slash_commands", "slash_command", "command"} or "command" in payload:
+        normalized.setdefault("type", "slash_commands")
+    elif envelope_type in {"interactive", "block_actions", "view_submission", "shortcut", "shortcuts"}:
+        normalized.setdefault("type", str(payload.get("type") or envelope_type or "interactive"))
+    elif envelope_type in {"events_api", "event_callback", "events"} or isinstance(event, Mapping):
+        normalized.setdefault("type", "events")
+    normalized.setdefault("envelope_id", raw.get("envelope_id"))
+    for key in ("ack", "respond", "response_url", "trigger_id"):
+        if key in raw and key not in normalized:
+            normalized[key] = raw[key]
+    normalized["_raw_envelope"] = raw
+    return normalized
+
+
+def _text_field(values: Mapping[str, Any], *names: str) -> str:
+    """Read a Slack modal state value by action_id."""
+    for block in values.values():
+        if not isinstance(block, Mapping):
+            continue
+        for action in block.values():
+            if not isinstance(action, Mapping):
+                continue
+            action_id = str(action.get("action_id") or "")
+            if action_id in names or any(name in action_id for name in names):
+                value = action.get("value")
+                if value is None:
+                    selected = action.get("selected_option")
+                    value = selected.get("value") if isinstance(selected, Mapping) else ""
+                return str(value or "").strip()
+    return ""
+
+
+def build_task_root_blocks(task_id: str, *, mode: str = "personal") -> list[dict[str, Any]]:
+    """Return stable Block Kit controls for a task's root message."""
+    value = str(task_id)
+    first = [
+        ("task.compact", "Compact", "primary"),
+        ("task.todos", "Todos", None),
+        ("task.stats", "Stats", None),
+        ("task.stop", "Stop", "danger"),
+        ("task.kill", "Kill", "danger"),
+    ]
+    second = [
+        ("task.participants", "Participants", None),
+        ("task.promote", "Promote", None),
+    ] if mode != "collaborative" else [
+        ("task.participants", "Participants", None),
+        ("task.title", "Title", None),
+    ]
+
+    def button(action_id: str, text: str, style: str | None) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "type": "button",
+            "action_id": action_id,
+            "text": {"type": "plain_text", "text": text},
+            "value": value,
+        }
+        if style:
+            item["style"] = style
+        return item
+
+    return [
+        {"type": "actions", "block_id": f"task-controls-{value}", "elements": [button(*item) for item in first]},
+        {"type": "actions", "block_id": f"task-controls-more-{value}", "elements": [button(*item) for item in second]},
+    ]
+
+
+# Public spelling used by a few adapters.
+task_root_blocks = build_task_root_blocks
+
+
+class CommandDispatcher:
+    """Route Slack slash commands and interactivity to a TaskRegistry."""
+
+    def __init__(self, bot: Any, registry: TaskRegistry, projects: list[Any] | None = None,
+                 *, ack: Callable[[str], Awaitable[Any]] | None = None) -> None:
+        self.bot = bot
+        self.registry = registry
+        self.projects = list(projects or [])
+        self._ack_callback = ack
+        self._models_cache: list[str] = []
+
+    async def _ack(self, envelope: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+        # Bot versions which own Socket Mode acknowledgement mark the callback
+        # payload.  Never acknowledge an already-acked envelope a second time.
+        if payload.get(_ACKED) or envelope.get(_ACKED) or payload.get("acknowledged") or envelope.get("acknowledged"):
+            return
+        callback = payload.get("ack") or envelope.get("ack") or self._ack_callback
+        envelope_id = str(envelope.get("envelope_id") or payload.get("envelope_id") or "")
+        if callable(callback):
+            result = callback(envelope_id) if envelope_id else callback()
+            if inspect.isawaitable(result):
+                await result
+        elif envelope_id:
+            bot_ack = getattr(self.bot, "ack", None)
+            if callable(bot_ack):
+                result = bot_ack(envelope_id)
+                if inspect.isawaitable(result):
+                    await result
+
+    async def handle_socket_envelope(self, envelope: Any) -> SlackResponse:
+        raw = envelope if isinstance(envelope, Mapping) else {}
+        payload = normalize_socket_payload(envelope)
+        await self._ack(raw, payload)
+        return await self._dispatch(payload)
+
+    async def dispatch(self, payload: Any) -> SlackResponse:
+        """Dispatch an already normalized payload (or normalize a raw one)."""
+        raw = payload if isinstance(payload, Mapping) else {}
+        normalized = normalize_socket_payload(payload)
+        await self._ack(raw, normalized)
+        return await self._dispatch(normalized)
+
+    def _require_ingress(self, payload: Mapping[str, Any]) -> None:
+        expected = str(getattr(self.bot, "team_id", "") or "")
+        supplied = _team_id(payload, self.bot) if payload.get("team_id") or payload.get("team") else ""
+        if not expected or not supplied or supplied != expected:
+            raise TaskRoutingError("unauthenticated or mismatched Slack team")
+
+    async def _dispatch(self, payload: Mapping[str, Any]) -> SlackResponse:
+        kind = str(payload.get("type") or "").lower()
+        self._require_ingress(payload)
+        try:
+            if kind in {"slash_commands", "slash_command", "command"}:
+                return await self._slash(payload)
+            if kind in {"interactive", "block_actions", "view_submission", "shortcut", "shortcuts"}:
+                return await self._interactive(payload)
+            if kind in {"events", "event_callback", "message"} or isinstance(payload.get("event"), Mapping):
+                return await self._event(payload)
+            # A direct payload containing a command is a convenient test and
+            # webhook contract even if type was omitted.
+            if payload.get("command"):
+                return await self._slash(payload)
+            return await self._error(payload, "Unsupported Slack interaction. Use `/agent help`.")
+        except (TaskPrivilegeError, PermissionError) as exc:
+            return await self._error(payload, "Not allowed. Only the task owner may use this control.")
+        except (TaskNotFound, TaskSpawnError, TaskRestartError, TaskRoutingError, ValueError) as exc:
+            return await self._error(payload, safe_error(exc, "Could not complete that request"))
+        except Exception as exc:  # interaction handlers must not crash Socket Mode
+            log.exception("Slack interaction failed: %s", safe_log(type(exc).__name__))
+            return await self._error(payload, "Unexpected bridge error. Try again or check the task status.")
+
+    async def handle_interaction(self, payload: Any) -> SlackResponse:
+        """Authenticated public entrypoint for interactive payloads."""
+        return await self.dispatch(payload)
+
+    async def handle_command(self, payload: Any) -> SlackResponse:
+        """Authenticated public entrypoint for slash commands."""
+        return await self.dispatch(payload)
+
+    async def handle_event(self, payload: Any) -> SlackResponse:
+        """Authenticated public entrypoint for Events API payloads."""
+        return await self.dispatch(payload)
+
+    async def _slash(self, payload: Mapping[str, Any]) -> SlackResponse:
+        command = str(payload.get("command") or "")
+        text = str(payload.get("text") or "").strip()
+        if command and command.rstrip("/").split("/")[-1] not in {"agent", "start", "spawn", "list", "stop", "kill", "restart", "skill", "model", "facet", "effort", "title", "rename", "stats", "todos", "tasks", "pin", "unpin"}:
+            return await self._error(payload, "Unknown command. Try `/agent help`.")
+        if command.rstrip("/").split("/")[-1] != "agent" and command:
+            text = " ".join([command.lstrip("/"), text]).strip()
+        try:
+            tokens = shlex.split(text)
+        except ValueError as exc:
+            return await self._error(payload, "Invalid command quoting. Check quoting and try again.")
+        if not tokens:
+            return await self._reply(payload, self._help_text())
+        name = tokens.pop(0).lower()
+        args = self._parse_args(tokens)
+        actor = _actor_id(payload)
+        if name in {"help", "?"}:
+            return await self._reply(payload, self._help_text())
+        if name in {"start", "spawn"}:
+            self._configured_owner(actor)
+            return await self._start(payload, name, args, tokens, actor)
+        if name == "list":
+            self._configured_owner(actor)
+            tasks = await self.registry.list_tasks(actor)
+            if not tasks:
+                return await self._reply(payload, "No active tasks.")
+            lines = ["*Active tasks:*"]
+            for task in tasks:
+                lines.append(f"• `{task.task_id[:8]}` · `{Path(task.cwd).name or '/'}` · {task.status} · <#{task.channel_id}>")
+            return await self._reply(payload, "\n".join(lines))
+        if name == "restart":
+            task = await self._task_from_payload(payload, actor, require_owner=True)
+            return await self._reply(payload, f"❌ Restart is unsupported for `{task.task_id[:8]}`; use `/agent kill` then `/agent start` (headless resume is unavailable).")
+        if name in {"stop", "kill", "compact", "skill", "model", "facet", "effort", "title", "rename", "stats", "todos", "tasks", "pin", "unpin"}:
+            return await self._session_command(payload, name, args, tokens, actor)
+        return await self._error(payload, "Unknown `/agent` command. Try `/agent help`.")
+
+    @staticmethod
+    def _parse_args(tokens: list[str]) -> dict[str, str]:
+        args: dict[str, str] = {}
+        positional: list[str] = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token.startswith("--"):
+                token = token[2:]
+            if "=" in token:
+                key, value = token.split("=", 1)
+                args[key.strip().lower()] = value
+            elif token.startswith("-") and len(token) > 1:
+                args[token.lstrip("-").lower()] = tokens[i + 1] if i + 1 < len(tokens) else ""
+                i += 1
+            else:
+                positional.append(token)
+            i += 1
+        args["_positional"] = " ".join(positional)
+        return args
+
+    def _configured_owner(self, actor: str) -> None:
+        owner = str(getattr(self.bot, "owner_user_id", "") or "")
+        if owner and actor != owner:
+            raise TaskPrivilegeError(f"actor {actor or '<unknown>'} is not the configured owner")
+
+    async def _start(self, payload: Mapping[str, Any], name: str, args: dict[str, str], tokens: list[str], actor: str) -> SlackResponse:
+        if name == "spawn":
+            project = args.get("project") or args.get("name") or args.get("_positional", "")
+            selected = next((p for p in self.projects if f"{getattr(p, 'root_label', '')}/{getattr(p, 'name', '')}" == project or getattr(p, "name", "") == project), None)
+            if selected is None:
+                return await self._error(payload, "`spawn` needs a configured project name. Use `/agent spawn project=<name>`.")
+            cwd = str(selected.path)
+        else:
+            cwd = args.get("cwd") or args.get("_positional", "")
+        if not cwd:
+            return await self._error(payload, "This command needs a configured working directory.")
+        prompt = args.get("prompt")
+        team = _team_id(payload, self.bot)
+        channel = _channel_id(payload) or str(getattr(self.bot, "home_channel_id", ""))
+        task = await self.registry.spawn_task(cwd, team_id=team, channel_id=channel, owner_user_id=actor, prompt=prompt)
+        await self._decorate_root(task)
+        return await self._reply(payload, f"✅ Started task `{task.task_id[:8]}` in `{Path(task.cwd).name}` → <#{task.channel_id}>", blocks=build_task_root_blocks(task.task_id, mode=task.mode))
+
+    async def _session_command(self, payload: Mapping[str, Any], name: str, args: dict[str, str], tokens: list[str], actor: str) -> SlackResponse:
+        task = await self._task_from_payload(payload, actor, require_owner=True)
+        if name == "stop":
+            ok = await self.registry.stop_task(task.task_id, actor)
+            return await self._reply(payload, f"✅ Stopped `{task.task_id[:8]}`" if ok else f"⚠️ Could not terminate `{task.task_id[:8]}`; it remains active.")
+        if name == "kill":
+            ok = await self.registry.kill_task(task.task_id, actor)
+            return await self._reply(payload, f"💥 Killed `{task.task_id[:8]}`" if ok else f"⚠️ Could not terminate `{task.task_id[:8]}`; it remains active.")
+        if name == "compact":
+            client_for = getattr(self.registry, "_client_for", None)
+            if not callable(client_for):
+                raise TaskRoutingError("compact is unavailable in this registry")
+            await client_for(task).compact()
+            return await self._reply(payload, f"🧹 Compaction requested for `{task.task_id[:8]}`.")
+        if name == "skill":
+            skill_name = args.get("name") or (args.get("_positional", "").split(maxsplit=1) or [""])[0]
+            skill_args = args.get("args")
+            if not skill_name:
+                return await self._error(payload, "`skill` needs a skill name.")
+            await self.registry.invoke_skill(task.task_id, skill_name, skill_args, owner_user_id=actor)
+            return await self._reply(payload, f"✅ Sent `@{skill_name}` to `{task.task_id[:8]}`.")
+        if name == "model":
+            model = args.get("name") or args.get("_positional", "")
+            if not model:
+                return await self._error(payload, "`model` needs a model name.")
+            await self.registry.set_model(task.task_id, model, owner_user_id=actor, reasoning_effort=args.get("effort"))
+            return await self._reply(payload, f"🔧 Switched `{task.task_id[:8]}` to `{model}`.")
+        if name == "facet":
+            facet = args.get("name") or args.get("_positional", "")
+            if not facet:
+                return await self._error(payload, "`facet` needs a facet name.")
+            await self.registry.set_facet(task.task_id, facet, owner_user_id=actor)
+            return await self._reply(payload, f"🎭 Switched `{task.task_id[:8]}` to facet `{facet}`.")
+        if name == "effort":
+            level = args.get("level") or args.get("_positional", "")
+            if level not in _EFFORT_LEVELS:
+                return await self._error(payload, f"Effort must be one of: {', '.join(_EFFORT_LEVELS)}.")
+            await self.registry.set_effort(task.task_id, level, owner_user_id=actor)
+            return await self._reply(payload, f"⚙️ Set effort to `{level}`.")
+        if name in {"title", "rename"}:
+            title = args.get("name") or args.get("title") or args.get("_positional", "")
+            if args.get("_positional") and (args.get("name") or args.get("title")):
+                title = f"{title} {args['_positional']}"
+            if not title:
+                title = await self.registry.generate_root_title(task.task_id, owner_user_id=actor)
+            title = " ".join((title or "").split())[:100]
+            if not title:
+                return await self._error(payload, "No title is available; pass `name=<title>`." )
+            await self.bot.edit_message(task.channel_id, task.root_ts, text=title)
+            return await self._reply(payload, f"✏️ Renamed task to `{title}`.")
+        if name in {"stats", "todos", "tasks"}:
+            state = await self.registry.get_state(task.task_id, actor)
+            if not state:
+                return await self._error(payload, "Could not reach the task daemon; try again shortly.")
+            if name == "stats":
+                return await self._reply(payload, usage.format_state_summary(state))
+            return await self._reply(payload, _format_todos(state.get("todos") or []))
+        if name == "pin":
+            text = args.get("text") or args.get("_positional", "")
+            if not text:
+                return await self._error(payload, "`pin` needs text to pin.")
+            key = ConversationKey(task.team_id, task.channel_id, task.root_ts)
+            pin = await self.registry.pin_channel(key, text, actor)
+            return await self._reply(payload, f"📌 Pinned `{pin.pin_id}`: {text}")
+        if name == "unpin":
+            pin_id = args.get("id") or args.get("pin") or args.get("_positional", "")
+            if not pin_id:
+                return await self._error(payload, "`unpin` needs a pin id.")
+            key = ConversationKey(task.team_id, task.channel_id, task.root_ts)
+            removed = await self.registry.unpin_channel(key, actor, pin_id)
+            return await self._reply(payload, "📍 Unpinned." if removed else "That pin was not found.")
+        raise ValueError("unknown command")
+
+    async def _interactive(self, payload: Mapping[str, Any]) -> SlackResponse:
+        kind = str(payload.get("type") or "interactive").lower()
+        if kind == "view_submission" or payload.get("view"):
+            return await self._view_submission(payload)
+        if kind in {"shortcut", "shortcuts"} or payload.get("callback_id") and not payload.get("actions"):
+            return await self._shortcut(payload)
+        actions = payload.get("actions") or []
+        if isinstance(actions, Mapping):
+            actions = [actions]
+        if not actions:
+            return await self._error(payload, "This interaction did not include an action. Refresh and try again.")
+        action = actions[0] if isinstance(actions[0], Mapping) else {}
+        return await self._block_action(payload, action)
+
+    async def _block_action(self, payload: Mapping[str, Any], action: Mapping[str, Any]) -> SlackResponse:
+        action_id = str(action.get("action_id") or action.get("name") or "")
+        value = _json_or_mapping(action.get("value"))
+        task_id = str(value.get("task_id") or payload.get("task_id") or (action.get("value") if isinstance(action.get("value"), str) and not value else ""))
+        actor = _actor_id(payload)
+        if action_id.startswith("interrogative") or payload.get("interrogative_id"):
+            return await self._answer_from_interaction(payload, action, actor)
+        task = await self._task_from_payload(payload, actor, task_id=task_id or None, require_owner=True)
+        operation = action_id.rsplit(".", 1)[-1].rsplit(":", 1)[-1].lower()
+        if operation in {"stop", "kill"}:
+            ok = await (self.registry.stop_task(task.task_id, actor) if operation == "stop" else self.registry.kill_task(task.task_id, actor))
+            return await self._reply(payload, f"{'✅ Stopped' if operation == 'stop' and ok else '💥 Killed' if operation == 'kill' and ok else '⚠️ Termination rejected'} `{task.task_id[:8]}`.")
+        if operation == "compact":
+            client_for = getattr(self.registry, "_client_for")
+            await client_for(task).compact()
+            return await self._reply(payload, "🧹 Compaction requested.")
+        if operation == "stats":
+            state = await self.registry.get_state(task.task_id, actor)
+            return await self._reply(payload, usage.format_state_summary(state or {}))
+        if operation in {"todos", "tasks"}:
+            state = await self.registry.get_state(task.task_id, actor)
+            return await self._reply(payload, _format_todos((state or {}).get("todos") or []))
+        if operation == "promote":
+            promoted = await self.registry.promote_task(task.task_id, actor)
+            await self._decorate_root(promoted)
+            return await self._reply(payload, f"🤝 Promoted `{promoted.task_id[:8]}` to collaborative mode in <#{promoted.channel_id}>.")
+        if operation == "participants":
+            return await self._open_participants_modal(payload, task)
+        if operation == "title":
+            return await self._reply(payload, "Use `/agent title name=<new title>` to rename this task.")
+        return await self._error(payload, "Unknown task control. Refresh the task root.")
+
+    async def _shortcut(self, payload: Mapping[str, Any]) -> SlackResponse:
+        callback = str(payload.get("callback_id") or payload.get("callback") or "agent")
+        if callback not in {"agent", "bridge.agent", "agent_shortcut", "task_agent"}:
+            return await self._error(payload, "Unknown shortcut.")
+        actor = _actor_id(payload)
+        task_id = ""
+        message = payload.get("message")
+        if isinstance(message, Mapping):
+            task_id = str(message.get("task_id") or "")
+        view = _agent_modal(task_id=task_id, channel_id=_channel_id(payload), root_ts=_root_ts(payload))
+        return await self._open_modal(payload, view)
+
+    async def _view_submission(self, payload: Mapping[str, Any]) -> SlackResponse:
+        view = _mapping(payload.get("view")) or payload
+        callback = str(view.get("callback_id") or payload.get("callback_id") or "")
+        values = _mapping(_mapping(view.get("state")).get("values"))
+        metadata = _json_or_mapping(view.get("private_metadata"))
+        actor = _actor_id(payload) or str(_mapping(view.get("user")).get("id") or "")
+        if callback in {"bridge.agent", "agent_modal", "bridge.command"}:
+            command = _text_field(values, "command", "agent_command")
+            text = _text_field(values, "text", "agent_text")
+            command = command or "agent"
+            if text:
+                command = f"{command} {text}"
+            return await self._slash({**dict(payload), "type": "slash_commands", "command": "/agent", "text": command, "user_id": actor, **metadata})
+        task_id = str(metadata.get("task_id") or _text_field(values, "task_id"))
+        if callback in {"bridge.participants", "participants_modal"}:
+            task = await self._task_from_payload(payload, actor, task_id=task_id, require_owner=True)
+            add_ids = _text_field(values, "participants", "participant_ids", "add_participants")
+            entries = [item.strip() for item in add_ids.replace(",", " ").split() if item.strip()]
+            for entry in entries:
+                parts = entry.split(":", 1)
+                participant = parts[0].strip()
+                kind = parts[1].strip().lower() if len(parts) == 2 else "human"
+                if not participant or kind not in {"human", "app"}:
+                    raise ValueError("participants must use actor_id[:human|app]")
+                adder = self.registry.add_participant
+                result = adder(task.task_id, actor, participant, display_name=None, kind=kind)
+                if inspect.isawaitable(result):
+                    await result
+            return await self._reply(payload, f"✅ Updated participants for `{task.task_id[:8]}`.")
+        return await self._error(payload, "Unknown modal submission; close it and try again.")
+
+    async def _answer_from_interaction(self, payload: Mapping[str, Any], action: Mapping[str, Any], actor: str) -> SlackResponse:
+        task = await self._task_from_payload(payload, actor, task_id=str(payload.get("task_id") or "") or None, require_owner=False)
+        answer = str(action.get("value") or payload.get("answer") or payload.get("text") or "").strip()
+        await self._answer(task, actor, answer, str(payload.get("interrogative_id") or ""))
+        return await self._reply(payload, "✅ Answer sent.")
+
+    async def _answer(self, task: Task, actor: str, text: str, interrogative_id: str = "") -> None:
+        pending_for = getattr(self.registry, "_pending_for", None)
+        answer = getattr(self.registry, "_answer_interrogative", None)
+        if not callable(pending_for) or not callable(answer):
+            raise TaskRoutingError("interrogative answers are unavailable")
+        pending = await pending_for(task, actor)
+        if pending is None or (interrogative_id and str(pending.interrogative_id) != interrogative_id):
+            raise TaskRoutingError("no pending question is addressed to you")
+        await answer(task, pending, text)
+
+    async def _task_from_payload(self, payload: Mapping[str, Any], actor: str, *, task_id: str | None = None, require_owner: bool) -> Task:
+        team = _team_id(payload, self.bot)
+        channel = _channel_id(payload)
+        root = _root_ts(payload)
+        # A task id is an explicit capability, but its binding must still match
+        # any supplied conversation context. Otherwise require the complete,
+        # exact (team, channel, root) binding. Never select an arbitrary task by
+        # channel alone.
+        if task_id:
+            task = self.registry.get_by_task_id(task_id)
+            if task is None:
+                raise TaskNotFound("unknown task id")
+            if (channel or root) and (team, channel, root) != (task.team_id, task.channel_id, task.root_ts):
+                raise TaskRoutingError("task id does not match the supplied Slack conversation")
+        else:
+            if not team or not channel or not root:
+                raise TaskRoutingError("task controls require task_id or exact team/channel/root context")
+            task = self.registry.get_by_conversation(team, channel, root)
+        if task is None:
+            raise TaskNotFound("no task is bound to this Slack root message")
+        if str(task.team_id) != team:
+            raise TaskRoutingError("task belongs to another Slack team")
+        if require_owner:
+            checker = getattr(self.registry, "_require_owner", None)
+            if callable(checker):
+                checker(task, actor)
+            elif actor != task.owner_user_id:
+                raise TaskPrivilegeError("actor is not task owner")
+        return task
+
+    async def _event(self, payload: Mapping[str, Any]) -> SlackResponse:
+        event = payload.get("event")
+        if isinstance(event, Mapping):
+            event = dict(event)
+            event.setdefault("team", _team_id(payload, self.bot))
+        else:
+            event = dict(payload)
+        if str(event.get("type") or "") == "message" and not event.get("root_ts"):
+            # TaskRegistry.normalize_message accepts raw Slack event fields.
+            event["team"] = event.get("team") or _team_id(payload, self.bot)
+        routed = await self.registry.maybe_route_message(normalize_message(event))
+        return SlackResponse("" if routed else "Message ignored.", ephemeral=True)
+
+    async def _reply(self, payload: Mapping[str, Any], text: str, *, blocks: list[dict[str, Any]] | None = None, ephemeral: bool = True) -> SlackResponse:
+        response = SlackResponse(text=text, blocks=blocks, ephemeral=ephemeral)
+        responder = payload.get("respond") or payload.get("response")
+        if callable(responder):
+            result = responder({"text": text, "blocks": blocks, "response_type": "ephemeral" if ephemeral else "in_channel"})
+            if inspect.isawaitable(result):
+                await result
+        elif callable(getattr(self.bot, "respond", None)):
+            result = self.bot.respond(payload, response)
+            if inspect.isawaitable(result):
+                await result
+        return response
+
+    async def _error(self, payload: Mapping[str, Any], text: str) -> SlackResponse:
+        return await self._reply(payload, f"❌ {text}", ephemeral=True)
+
+    async def _open_modal(self, payload: Mapping[str, Any], view: dict[str, Any]) -> SlackResponse:
+        opener = getattr(self.bot, "open_modal", None) or getattr(self.bot, "views_open", None)
+        trigger = payload.get("trigger_id")
+        if callable(opener) and trigger:
+            result = opener(trigger, view) if getattr(opener, "__name__", "") == "open_modal" else opener(trigger_id=trigger, view=view)
+            if inspect.isawaitable(result):
+                await result
+        responder = payload.get("respond")
+        if callable(responder):
+            result = responder({"response_action": "push", "view": view})
+            if inspect.isawaitable(result):
+                await result
+        return SlackResponse("", modal=view, ephemeral=True)
+
+    async def _open_participants_modal(self, payload: Mapping[str, Any], task: Task) -> SlackResponse:
+        return await self._open_modal(payload, _participants_modal(task))
+
+    async def _decorate_root(self, task: Task) -> None:
+        editor = getattr(self.bot, "edit_message", None)
+        if not callable(editor):
+            return
+        blocks = build_task_root_blocks(task.task_id, mode=task.mode)
+        result = editor(task.channel_id, task.root_ts,
+                        text=f"Task `{task.task_id[:8]}` · `{Path(task.cwd).name}`", blocks=blocks)
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
+    def _help_text() -> str:
+        return ("*Polytoken commands:* `/agent start cwd=<path> [prompt=<text>]`, `/agent spawn project=<name>`, "
+                "`list`, `stop`, `kill`, `restart`, `compact`, `skill`, `model`, `facet`, `effort`, `title`, "
+                "`stats`, `todos`, `pin`, `unpin`. Task controls are also available on each root message.")
+
+
+def _agent_modal(*, task_id: str = "", channel_id: str = "", root_ts: str = "") -> dict[str, Any]:
+    return {
+        "type": "modal", "callback_id": "bridge.agent", "title": {"type": "plain_text", "text": "Polytoken"},
+        "submit": {"type": "plain_text", "text": "Run"}, "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": json.dumps({"task_id": task_id, "channel_id": channel_id, "root_ts": root_ts}),
+        "blocks": [
+            {"type": "input", "block_id": "command", "label": {"type": "plain_text", "text": "Command"}, "element": {"type": "plain_text_input", "action_id": "command", "initial_value": "help"}},
+            {"type": "input", "block_id": "text", "optional": True, "label": {"type": "plain_text", "text": "Arguments"}, "element": {"type": "plain_text_input", "action_id": "text"}},
+        ],
     }
 
-    @tree.command(name="start", description="Start a new Polytoken task in a fresh thread")
-    @app_commands.describe(
-        cwd="Working directory the task should run in (must exist)",
-        prompt="Optional first message to send to the new session",
-    )
-    async def start(
-        interaction: discord.Interaction,
-        cwd: str,
-        prompt: str | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = await registry.spawn_task(cwd=cwd, prompt=None)
-        except TaskSpawnError as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        if prompt:
-            await registry.write_initial_prompt(task.task_id, prompt)
-        thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
-        await interaction.followup.send(
-            f"✅ Started task `{task.task_id[:8]}` → <#{task.thread_id}> ({thread_url})",
-            ephemeral=True,
-        )
 
-    async def _project_autocomplete(
-        interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        cur = current.lower()
-        out: list[app_commands.Choice[str]] = []
-        for key, proj in projects_by_key.items():
-            if cur and cur not in proj.name.lower() and cur not in proj.root_label.lower():
-                continue
-            label = f"{proj.name} — {proj.root_label}"
-            out.append(app_commands.Choice(name=label[:100], value=key[:100]))
-            if len(out) >= 25:
-                break
-        return out
-
-    @tree.command(
-        name="spawn",
-        description="Spawn a Polytoken task in a configured project folder (see BRIDGE_PROJECT_ROOTS)",
-    )
-    @app_commands.describe(
-        project="Project folder (autocomplete shows immediate subfolders of BRIDGE_PROJECT_ROOTS)",
-        prompt="Optional first message to send to the new session",
-    )
-    @app_commands.autocomplete(project=_project_autocomplete)
-    async def spawn(
-        interaction: discord.Interaction,
-        project: str,
-        prompt: str | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        if not projects_by_key:
-            await interaction.followup.send(
-                "❌ No project roots configured. Set `BRIDGE_PROJECT_ROOTS` "
-                "(colon-separated parent paths) and restart the daemon.",
-                ephemeral=True,
-            )
-            return
-        proj = projects_by_key.get(project)
-        if proj is None:
-            await interaction.followup.send(
-                f"❌ Unknown project `{project}`. Pick one from the autocomplete list.",
-                ephemeral=True,
-            )
-            return
-        try:
-            task = await registry.spawn_task(cwd=str(proj.path), prompt=None)
-        except TaskSpawnError as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        if prompt:
-            await registry.write_initial_prompt(task.task_id, prompt)
-        thread_url = f"https://discord.com/channels/{interaction.guild_id}/{task.thread_id}"
-        await interaction.followup.send(
-            f"✅ Started task `{task.task_id[:8]}` in `{proj.name}` "
-            f"({proj.root_label}) → <#{task.thread_id}> ({thread_url})",
-            ephemeral=True,
-        )
-
-    @tree.command(name="list", description="List active tasks")
-    async def list_cmd(interaction: discord.Interaction) -> None:
-        tasks = await registry.list_tasks()
-        if not tasks:
-            await interaction.response.send_message("No active tasks.", ephemeral=True)
-            return
-        lines = ["**Active tasks:**"]
-        for t in tasks:
-            cwd_leaf = Path(t.cwd).name or "/"
-            ago = _humanize_age(t.last_activity)
-            lines.append(
-                f"- `{t.task_id[:8]}` · {cwd_leaf} · {t.status} · {ago} · <#{t.thread_id}>"
-            )
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-    @tree.command(name="stop", description="Stop a task (cancels any turn and terminates the daemon)")
-    @app_commands.describe(thread="Thread to stop (defaults to invocation thread)")
-    async def stop(
-        interaction: discord.Interaction,
-        thread: discord.Thread | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, thread)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        try:
-            stopped = await registry.stop_task(task.task_id)
-        except TaskNotFound:
-            await interaction.followup.send("❌ Task not found", ephemeral=True)
-            return
-        if stopped:
-            await interaction.followup.send(f"✅ Stopped `{task.task_id[:8]}`", ephemeral=True)
-        else:
-            await interaction.followup.send(
-                f"⚠️ Couldn't terminate `{task.task_id[:8]}` — the daemon rejected it and is "
-                "still running. The task stays active; see the thread for details.",
-                ephemeral=True,
-            )
-
-    @tree.command(name="kill", description="Immediately terminate a task's daemon")
-    @app_commands.describe(thread="Thread to kill (defaults to invocation thread)")
-    async def kill(
-        interaction: discord.Interaction,
-        thread: discord.Thread | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, thread)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        try:
-            killed = await registry.kill_task(task.task_id)
-        except TaskNotFound:
-            await interaction.followup.send("❌ Task not found", ephemeral=True)
-            return
-        if killed:
-            await interaction.followup.send(f"💥 Killed `{task.task_id[:8]}`", ephemeral=True)
-        else:
-            await interaction.followup.send(
-                f"⚠️ Couldn't terminate `{task.task_id[:8]}` — the daemon rejected it and is "
-                "still running. Check `polytoken sessions` and terminate it manually.",
-                ephemeral=True,
-            )
-
-    @tree.command(name="restart", description="(Unsupported with the daemon backend)")
-    @app_commands.describe(thread="Thread to restart (defaults to invocation thread)")
-    async def restart(
-        interaction: discord.Interaction,
-        thread: discord.Thread | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, thread)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        try:
-            await registry.restart_task(task.task_id)
-        except (TaskNotFound, TaskRestartError) as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        await interaction.followup.send(f"🔄 Restarted `{task.task_id[:8]}`", ephemeral=True)
-
-    async def _skill_autocomplete(
-        interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        cur = current.lower()
-        names: list[str] = []
-        # Prefer the live session's available skills when inside a task thread.
-        task = registry.get_by_thread_id(interaction.channel_id or 0)
-        if task is not None:
-            state = await registry.get_state(task.task_id)
-            if state:
-                names = [s for s in (state.get("available_skills") or []) if isinstance(s, str)]
-        if not names:
-            names = [s.name for s in skills.list_skills()]
-        out: list[app_commands.Choice[str]] = []
-        for name in names:
-            if cur and cur not in name.lower():
-                continue
-            out.append(app_commands.Choice(name=name[:100], value=name[:100]))
-            if len(out) >= 25:
-                break
-        return out
-
-    @tree.command(name="skill", description="Invoke a skill in the task's session")
-    @app_commands.describe(
-        name="Skill name (autocomplete shows the session's available skills)",
-        args="Optional arguments to pass after the skill name",
-    )
-    @app_commands.autocomplete(name=_skill_autocomplete)
-    async def skill_cmd(
-        interaction: discord.Interaction,
-        name: str,
-        args: str | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, None)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        try:
-            await registry.invoke_skill(task.task_id, name, args)
-        except (TaskNotFound, TaskSpawnError) as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        rendered = f"@{name}" + (f" {args}" if args else "")
-        await interaction.followup.send(
-            f"✅ Sent `{rendered}` to `{task.task_id[:8]}`", ephemeral=True
-        )
-
-    @tree.command(name="effort", description="Change the session's reasoning effort level")
-    @app_commands.describe(level="Reasoning effort (the daemon falls back if the model lacks the level)")
-    @app_commands.choices(
-        level=[app_commands.Choice(name=lvl, value=lvl) for lvl in _EFFORT_LEVELS]
-    )
-    async def effort_cmd(
-        interaction: discord.Interaction,
-        level: app_commands.Choice[str],
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, None)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        try:
-            await registry.set_effort(task.task_id, level.value)
-        except (TaskNotFound, TaskSpawnError) as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        await interaction.followup.send(
-            f"⚙️ Set effort to `{level.value}` for `{task.task_id[:8]}`", ephemeral=True
-        )
-
-    _models_cache: list[str] = []
-
-    async def _model_autocomplete(
-        interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        if not _models_cache:
-            _models_cache.extend(await registry.list_models())
-        cur = current.lower()
-        out: list[app_commands.Choice[str]] = []
-        for name in _models_cache:
-            if cur and cur not in name.lower():
-                continue
-            out.append(app_commands.Choice(name=name[:100], value=name[:100]))
-            if len(out) >= 25:
-                break
-        return out
-
-    @tree.command(name="model", description="Switch the session's active model")
-    @app_commands.describe(
-        name="Model registry key (autocomplete shows configured models)",
-        effort="Optional reasoning effort to apply with the switch",
-    )
-    @app_commands.autocomplete(name=_model_autocomplete)
-    @app_commands.choices(
-        effort=[app_commands.Choice(name=lvl, value=lvl) for lvl in _EFFORT_LEVELS]
-    )
-    async def model_cmd(
-        interaction: discord.Interaction,
-        name: str,
-        effort: app_commands.Choice[str] | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, None)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        eff = effort.value if effort is not None else None
-        try:
-            await registry.set_model(task.task_id, name, reasoning_effort=eff)
-        except (TaskNotFound, TaskSpawnError) as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        suffix = f" (effort `{eff}`)" if eff else ""
-        await interaction.followup.send(
-            f"🔧 Switched `{task.task_id[:8]}` to `{name}`{suffix}", ephemeral=True
-        )
-
-    @tree.command(name="facet", description="Switch the session's active facet")
-    @app_commands.describe(facet="Facet name (the daemon validates it and rejects unknowns)")
-    async def facet_cmd(interaction: discord.Interaction, facet: str) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, None)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        try:
-            await registry.set_facet(task.task_id, facet)
-        except (TaskNotFound, TaskSpawnError) as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        await interaction.followup.send(
-            f"🎭 Switched `{task.task_id[:8]}` to facet `{facet}`", ephemeral=True
-        )
-
-    @tree.command(
-        name="rename",
-        description="Rename the task's thread (omit name to use the daemon's session title)",
-    )
-    @app_commands.describe(name="New thread name; omit to use the daemon's auto-generated title")
-    async def rename_cmd(
-        interaction: discord.Interaction,
-        name: str | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, None)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-
-        if name is None:
-            generated = await registry.generate_thread_name(task.task_id)
-            if not generated:
-                await interaction.followup.send(
-                    "❌ The daemon hasn't titled this session yet. Pass a name explicitly.",
-                    ephemeral=True,
-                )
-                return
-            name = generated
-
-        cleaned = " ".join(name.split())[:100]
-        if not cleaned:
-            await interaction.followup.send("❌ Empty name.", ephemeral=True)
-            return
-        try:
-            await bot.rename_thread(task.thread_id, cleaned)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Rename failed: {e}", ephemeral=True)
-            return
-        await interaction.followup.send(f"✏️ Renamed to `{cleaned}`", ephemeral=True)
-
-    @tree.command(name="stats", description="Show model / context-usage stats for a task")
-    @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
-    async def stats_cmd(
-        interaction: discord.Interaction,
-        thread: discord.Thread | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, thread)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        state = await registry.get_state(task.task_id)
-        if state is None:
-            await interaction.followup.send(
-                "❌ Couldn't reach the task's daemon for stats.", ephemeral=True
-            )
-            return
-        await interaction.followup.send(usage.format_state_summary(state), ephemeral=True)
-
-    @tree.command(name="tasks", description="Show the session's todo list")
-    @app_commands.describe(thread="Thread to inspect (defaults to invocation thread)")
-    async def tasks_cmd(
-        interaction: discord.Interaction,
-        thread: discord.Thread | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        try:
-            task = _resolve_task(registry, interaction, thread)
-        except _NotInTaskThread as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        state = await registry.get_state(task.task_id)
-        todos = (state or {}).get("todos") or []
-        if not todos:
-            await interaction.followup.send("ℹ No todos tracked in this session yet.", ephemeral=True)
-            return
-        await interaction.followup.send(_format_todos(todos), ephemeral=True)
-
-    @tree.command(
-        name="pin",
-        description="Create a Discord channel bound to a project; messages auto-spawn a session",
-    )
-    @app_commands.describe(
-        name="Optional channel name (default: cwd basename, normalized)",
-        project=(
-            "Project to bind (autocomplete) — required when /pin runs outside "
-            "a task thread; ignored if inside one (the thread's cwd is inherited)"
-        ),
-    )
-    @app_commands.autocomplete(project=_project_autocomplete)
-    async def pin_cmd(
-        interaction: discord.Interaction,
-        name: str | None = None,
-        project: str | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        existing_task = registry.get_by_thread_id(interaction.channel_id or 0)
-        if existing_task is not None:
-            cwd = existing_task.cwd
-            source = f"inherited from thread <#{existing_task.thread_id}>"
-        else:
-            if not projects_by_key:
-                await interaction.followup.send(
-                    "❌ Not inside a task thread, and no project roots configured. "
-                    "Set `BRIDGE_PROJECT_ROOTS` and restart, or run `/pin` inside an "
-                    "existing task thread.",
-                    ephemeral=True,
-                )
-                return
-            if not project:
-                await interaction.followup.send(
-                    "❌ Outside a task thread — pass `project:` (autocomplete shows "
-                    "subfolders of BRIDGE_PROJECT_ROOTS).",
-                    ephemeral=True,
-                )
-                return
-            proj = projects_by_key.get(project)
-            if proj is None:
-                await interaction.followup.send(
-                    f"❌ Unknown project `{project}`. Pick one from the autocomplete list.",
-                    ephemeral=True,
-                )
-                return
-            cwd = str(proj.path)
-            source = f"project `{proj.name}` ({proj.root_label})"
-
-        channel_name = _sanitize_channel_name(name or Path(cwd).name)
-        try:
-            channel_id = await bot.create_channel(channel_name)
-        except BotMissingPermission as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-        except Exception as e:
-            await interaction.followup.send(f"❌ Channel creation failed: {e}", ephemeral=True)
-            return
-
-        try:
-            await registry.pin_channel(channel_id, cwd)
-        except ValueError as e:
-            await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            return
-
-        await interaction.followup.send(
-            f"📌 Pinned <#{channel_id}> → `{cwd}` ({source}). "
-            "Send a message in that channel to wake a session.",
-            ephemeral=True,
-        )
-
-    @tree.command(
-        name="unpin",
-        description="Remove the pin binding from the current channel (channel itself is not deleted)",
-    )
-    async def unpin_cmd(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        channel_id = interaction.channel_id or 0
-        removed = await registry.unpin_channel(channel_id)
-        if removed:
-            await interaction.followup.send(
-                f"📍 Unpinned <#{channel_id}>. Future messages here won't auto-spawn.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send("ℹ This channel isn't pinned.", ephemeral=True)
-
-    return tree
+def _participants_modal(task: Task) -> dict[str, Any]:
+    return {
+        "type": "modal", "callback_id": "bridge.participants",
+        "title": {"type": "plain_text", "text": "Participants"},
+        "submit": {"type": "plain_text", "text": "Save"}, "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": json.dumps({"task_id": task.task_id}),
+        "blocks": [{"type": "input", "block_id": "participants", "optional": True,
+                     "label": {"type": "plain_text", "text": "Slack user IDs"},
+                     "element": {"type": "plain_text_input", "action_id": "participant_ids", "placeholder": {"type": "plain_text", "text": "U0123, U0456"}}}],
+    }
 
 
-def _resolve_task(
-    registry: TaskRegistry, interaction: discord.Interaction, override: discord.Thread | None
-) -> Task:
-    """Resolve the task context from interaction or override thread.
-
-    Raises _NotInTaskThread if no task is bound to the thread.
-    """
-    target_id = override.id if override else interaction.channel_id
-    task = registry.get_by_thread_id(target_id)
-    if task is None:
-        raise _NotInTaskThread(
-            "This command must run in a task thread (or pass `thread:` arg)."
-        )
-    return task
-
-
-def _format_todos(todos: list) -> str:
-    lines = ["**Session todos:**"]
-    for t in todos:
-        if not isinstance(t, dict):
+def _format_todos(todos: list[Any]) -> str:
+    lines = ["*Session todos:*"]
+    for item in todos:
+        if not isinstance(item, Mapping):
             continue
-        status = t.get("status") or ""
-        content = t.get("content") or t.get("activeForm") or ""
+        status = str(item.get("status") or "")
+        text = str(item.get("content") or item.get("activeForm") or "").strip()
+        if not text:
+            continue
         mark = {"completed": "✅", "in_progress": "▶️"}.get(status, "⬜")
-        lines.append(f"{mark} {content}")
-    return "\n".join(lines)[:1900]
+        lines.append(f"{mark} {text}")
+    return "\n".join(lines)[:3900]
 
 
-_CHANNEL_NAME_INVALID = re.compile(r"[^a-z0-9_-]+")
-_CHANNEL_NAME_COLLAPSE = re.compile(r"-+")
+def build_dispatcher(bot: Any, registry: TaskRegistry, projects: list[Any] | None = None, **kwargs: Any) -> CommandDispatcher:
+    return CommandDispatcher(bot, registry, projects, **kwargs)
 
 
-def _sanitize_channel_name(name: str) -> str:
-    """Coerce a string into a Discord text-channel-name-safe form."""
-    cleaned = _CHANNEL_NAME_INVALID.sub("-", name.lower())
-    cleaned = _CHANNEL_NAME_COLLAPSE.sub("-", cleaned).strip("-")
-    return cleaned[:100] or "cc-pin"
-
-
-def _humanize_age(epoch: int) -> str:
-    """Format an epoch timestamp as a human-readable age string."""
-    delta = datetime.now(timezone.utc).timestamp() - epoch
-    if delta < 60:
-        return f"{int(delta)}s ago"
-    if delta < 3600:
-        return f"{int(delta // 60)}m ago"
-    if delta < 86400:
-        return f"{int(delta // 3600)}h ago"
-    return f"{int(delta // 86400)}d ago"
+__all__ = [
+    "CommandDispatcher", "SlackResponse", "build_dispatcher", "build_task_root_blocks",
+    "normalize_socket_payload", "task_root_blocks",
+]

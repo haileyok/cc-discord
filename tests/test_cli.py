@@ -1,4 +1,5 @@
-"""Tests for bridge CLI using click.testing.CliRunner."""
+"""Focused tests for the Slack operational CLI."""
+from __future__ import annotations
 
 import json
 import stat
@@ -11,244 +12,225 @@ from bridge.cli import cli
 from bridge.secrets import Secrets, write_secrets
 
 
-class TestInitCommand:
-    """Tests for `claude-discord-bridge init` subcommand."""
-
-    def _get_ready_fake_bot(self):
-        class FakeBot:
-            def __init__(self, token: str, channel_id: int):
-                self.token = token
-                self.channel_id = channel_id
-                self._is_ready = False
-
-            @property
-            def is_ready(self) -> bool:
-                return self._is_ready
-
-            async def start(self) -> None:
-                self._is_ready = True
-
-            async def close(self) -> None:
-                pass
-
-            async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
-                return [123]
-
-        return FakeBot
-
-    def test_init_writes_secrets_file(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
-        result = CliRunner().invoke(cli, ["init"], input="test_token_abc\n12345\n")
-        assert result.exit_code == 0
-        assert secrets_file.exists()
-
-    def test_init_sets_0600_perms(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
-        result = CliRunner().invoke(cli, ["init"], input="test_token_abc\n12345\n")
-        assert result.exit_code == 0
-        assert stat.S_IMODE(secrets_file.stat().st_mode) == 0o600
-
-    def test_init_rejects_non_integer_channel_id(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setattr("bridge.cli.Bot", self._get_ready_fake_bot())
-        result = CliRunner().invoke(cli, ["init"], input="test_token_abc\nnot_a_number\n12345\n")
-        assert result.exit_code == 0
-        assert secrets_file.exists()
-
-    def test_init_aborts_if_file_exists_and_user_says_no(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        write_secrets(Secrets(bot_token="old_token", channel_id=999), path=secrets_file)
-        result = CliRunner().invoke(cli, ["init"], input="n\n")
-        assert result.exit_code == 1
-
-    def test_init_validates_token_bot_not_ready(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-
-        class FakeBot:
-            def __init__(self, token: str, channel_id: int):
-                self._is_ready = False
-
-            @property
-            def is_ready(self) -> bool:
-                return self._is_ready
-
-            async def start(self) -> None:
-                pass
-
-            async def close(self) -> None:
-                pass
-
-        monkeypatch.setattr("bridge.cli._TOKEN_VALIDATION_TIMEOUT", 0.1)
-        monkeypatch.setattr("bridge.cli.Bot", FakeBot)
-        result = CliRunner().invoke(cli, ["init"], input="test_token\n12345\n")
-        assert result.exit_code == 2
-        assert "could not connect" in result.output
-        assert secrets_file.exists()
-
-    def test_init_validates_token_bot_ready_posts_message(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        posted = []
-
-        class FakeBot:
-            def __init__(self, token: str, channel_id: int):
-                self._is_ready = False
-
-            @property
-            def is_ready(self) -> bool:
-                return self._is_ready
-
-            async def start(self) -> None:
-                self._is_ready = True
-
-            async def close(self) -> None:
-                pass
-
-            async def post(self, message: str, *, thread_id: int | None = None) -> list[int]:
-                posted.append(message)
-                return [123]
-
-        monkeypatch.setattr("bridge.cli.Bot", FakeBot)
-        result = CliRunner().invoke(cli, ["init"], input="test_token\n12345\n")
-        assert result.exit_code == 0
-        assert any("init succeeded" in m for m in posted)
+def make_secrets() -> Secrets:
+    return Secrets(
+        bot_token="xoxb-test-token",
+        app_token="xapp-test-token",
+        team_id="T012345",
+        home_channel_id="C012345",
+        owner_user_id="U012345",
+    )
 
 
-def _mock_subprocess(*, which="/usr/local/bin/polytoken", version_rc=0, spawn_out="session_id=s1 port=33333", spawn_rc=0):
-    """Build a (which_patch, run_fn) pair for the polytoken doctor checks."""
+class ReadyBot:
+    instances: list["ReadyBot"] = []
+    should_start = True
 
+    def __init__(self, token: str, *, team_id: str, owner_user_id: str,
+                 home_channel_id: str, app_token: str, **kwargs) -> None:
+        self.token = token
+        self.team_id = team_id
+        self.owner_user_id = owner_user_id
+        self.home_channel_id = home_channel_id
+        self.app_token = app_token
+        self.is_ready = False
+        self.posts: list[str] = []
+        self.__class__.instances.append(self)
+
+    async def start(self) -> None:
+        if self.should_start:
+            self.is_ready = True
+        else:
+            raise RuntimeError("Slack unavailable")
+
+    async def close(self) -> None:
+        self.is_ready = False
+
+    async def post(self, text: str, *args, **kwargs) -> list[str]:
+        self.posts.append(text)
+        return ["1.000"]
+
+    def health(self) -> dict:
+        return {
+            "bot_connected": self.is_ready,
+            "socket_mode_connected": self.is_ready,
+            "team_id": self.team_id,
+            "bot_user_id": "U-BOT",
+        }
+
+
+def _mock_subprocess(*, which="/usr/local/bin/polytoken", version_rc=0,
+                     spawn_out="session_id=s1 port=33333", spawn_rc=0):
     def run_fn(cmd, *args, **kwargs):
         result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        result.stderr = ""
         if "--version" in cmd:
             result.returncode = version_rc
             result.stdout = "polytoken 0.1.20\n"
-            result.stderr = ""
         elif "new" in cmd:
             result.returncode = spawn_rc
             result.stdout = spawn_out
-            result.stderr = ""
-        else:
-            result.returncode = 0
-            result.stdout = ""
-            result.stderr = ""
+        elif "is-active" in cmd:
+            # Legacy runtime is inactive in the healthy fixture.
+            result.returncode = 1
         return result
-
     return which, run_fn
 
 
-def _health_mock(*, bot_connected=True):
-    mock = MagicMock()
-    mock.status = 200
-    mock.read.return_value = json.dumps({"bot_connected": bot_connected}).encode("utf-8")
-    mock.__enter__ = lambda s: s
-    mock.__exit__ = lambda s, *a: None
-    return mock
+def _health_mock(*, bot_connected=True, socket_mode_connected=True):
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = json.dumps({
+        "bot_connected": bot_connected,
+        "socket_mode_connected": socket_mode_connected,
+    }).encode()
+    response.close.return_value = None
+    return response
+
+
+class TestInitCommand:
+    def test_init_writes_slack_secrets_and_validates_bot(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(path))
+        ReadyBot.instances.clear()
+        monkeypatch.setattr("bridge.cli.Bot", ReadyBot)
+        result = CliRunner().invoke(
+            cli, ["init"],
+            input="xoxb-test-token\nxapp-test-token\nT012345\nC012345\nU012345\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        data = json.loads(path.read_text())
+        assert set(data) == {
+            "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_TEAM_ID",
+            "SLACK_HOME_CHANNEL_ID", "SLACK_OWNER_USER_ID",
+        }
+        assert ReadyBot.instances[0].team_id == "T012345"
+        assert any("init succeeded" in message for message in ReadyBot.instances[0].posts)
+
+    def test_init_rejects_bad_token_before_bot_start(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(path))
+        monkeypatch.setattr("bridge.cli.Bot", ReadyBot)
+        result = CliRunner().invoke(
+            cli, ["init"], input="legacy-token\nxapp-test-token\nT1\nC1\nU1\n"
+        )
+        assert result.exit_code == 1
+        assert "xoxb-" in result.output
+
+    def test_init_existing_file_can_be_declined(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(path))
+        write_secrets(make_secrets(), path)
+        result = CliRunner().invoke(cli, ["init"], input="n\n")
+        assert result.exit_code == 1
+
+    def test_init_reports_startup_failure(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(path))
+        ReadyBot.should_start = False
+        monkeypatch.setattr("bridge.cli.Bot", ReadyBot)
+        result = CliRunner().invoke(
+            cli, ["init"], input="xoxb-test-token\nxapp-test-token\nT1\nC1\nU1\n"
+        )
+        ReadyBot.should_start = True
+        assert result.exit_code == 2
+        assert "Slack startup validation failed" in result.output
 
 
 class TestDoctorCommand:
-    """Tests for `claude-discord-bridge doctor` (Polytoken backend)."""
-
-    def _run(self, tmp_path, monkeypatch, *, which, run_fn, urlopen):
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
+    def _run(self, tmp_path: Path, monkeypatch, *, which, run_fn,
+             urlopen, bot=ReadyBot):
+        path = tmp_path / "secrets.json"
+        state = tmp_path / "state"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(path))
+        monkeypatch.setenv("BRIDGE_STATE_DIR", str(state))
         monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
-        monkeypatch.setenv("HOME", str(tmp_path))
-        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
+        write_secrets(make_secrets(), path)
+        monkeypatch.setattr("bridge.cli.Bot", bot)
         with patch("urllib.request.urlopen", urlopen), \
              patch("bridge.cli.shutil.which", return_value=which), \
-             patch("subprocess.run", side_effect=run_fn):
+             patch("bridge.cli.subprocess.run", side_effect=run_fn):
             return CliRunner().invoke(cli, ["doctor"])
 
     def test_doctor_all_ok(self, tmp_path, monkeypatch) -> None:
-        which, run_fn = _mock_subprocess()
+        which, run = _mock_subprocess()
         result = self._run(
-            tmp_path, monkeypatch, which=which, run_fn=run_fn,
-            urlopen=lambda *a, **k: _health_mock(bot_connected=True),
+            tmp_path, monkeypatch, which=which, run_fn=run,
+            urlopen=lambda *args, **kwargs: _health_mock(),
         )
         assert result.exit_code == 0, result.output
-        assert "[ok] polytoken CLI" in result.output
-        assert "[ok] polytoken spawn" in result.output
+        assert "[ok] Slack startup" in result.output
+        assert "[ok] Polytoken smoke" in result.output
+        assert "[ok] storage" in result.output
+
+    def test_doctor_bad_slack_startup_fails(self, tmp_path, monkeypatch) -> None:
+        class BadBot(ReadyBot):
+            async def start(self):
+                raise RuntimeError("private home channel membership failed")
+        which, run = _mock_subprocess()
+        result = self._run(
+            tmp_path, monkeypatch, which=which, run_fn=run,
+            urlopen=lambda *args, **kwargs: _health_mock(), bot=BadBot,
+        )
+        assert result.exit_code == 1
+        assert "[fail] Slack startup" in result.output
 
     def test_doctor_polytoken_missing(self, tmp_path, monkeypatch) -> None:
-        _, run_fn = _mock_subprocess()
+        _, run = _mock_subprocess()
         result = self._run(
-            tmp_path, monkeypatch, which=None, run_fn=run_fn,
-            urlopen=lambda *a, **k: _health_mock(bot_connected=True),
+            tmp_path, monkeypatch, which=None, run_fn=run,
+            urlopen=lambda *args, **kwargs: _health_mock(),
         )
         assert result.exit_code == 1
-        assert "[fail] polytoken CLI" in result.output
+        assert "[fail] Polytoken CLI" in result.output
 
     def test_doctor_spawn_fails(self, tmp_path, monkeypatch) -> None:
-        which, run_fn = _mock_subprocess(spawn_out="garbage", spawn_rc=1)
+        which, run = _mock_subprocess(spawn_out="garbage", spawn_rc=1)
         result = self._run(
-            tmp_path, monkeypatch, which=which, run_fn=run_fn,
-            urlopen=lambda *a, **k: _health_mock(bot_connected=True),
+            tmp_path, monkeypatch, which=which, run_fn=run,
+            urlopen=lambda *args, **kwargs: _health_mock(),
         )
         assert result.exit_code == 1
-        assert "[fail] polytoken spawn" in result.output
+        assert "[fail] Polytoken smoke" in result.output
 
-    def test_doctor_bot_connected_false(self, tmp_path, monkeypatch) -> None:
-        which, run_fn = _mock_subprocess()
-        result = self._run(
-            tmp_path, monkeypatch, which=which, run_fn=run_fn,
-            urlopen=lambda *a, **k: _health_mock(bot_connected=False),
-        )
-        assert result.exit_code == 0
-        assert "[warn] Daemon health" in result.output
-
-    def test_doctor_bridge_unreachable(self, tmp_path, monkeypatch) -> None:
-        which, run_fn = _mock_subprocess()
-
-        def urlopen(req, *a, **k):
-            url = getattr(req, "full_url", str(req))
-            if "/v1/health" in url:
-                raise Exception("refused")
+    def test_doctor_health_unreachable(self, tmp_path, monkeypatch) -> None:
+        which, run = _mock_subprocess()
+        def urlopen(request, *args, **kwargs):
+            if "/v1/health" in getattr(request, "full_url", str(request)):
+                raise OSError("refused")
             return _health_mock()
-
-        result = self._run(tmp_path, monkeypatch, which=which, run_fn=run_fn, urlopen=urlopen)
+        result = self._run(tmp_path, monkeypatch, which=which, run_fn=run, urlopen=urlopen)
         assert result.exit_code == 1
-        assert "[fail] Daemon health" in result.output
+        assert "[fail] daemon health" in result.output
 
-    def test_doctor_secrets_file_mode_0644(self, tmp_path, monkeypatch) -> None:
-        which, run_fn = _mock_subprocess()
-        secrets_file = tmp_path / "secrets.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        monkeypatch.setenv("BRIDGE_URL", "http://127.0.0.1:9999")
-        monkeypatch.setenv("HOME", str(tmp_path))
-        write_secrets(Secrets(bot_token="token", channel_id=12345), path=secrets_file)
-        secrets_file.chmod(0o644)
-        with patch("urllib.request.urlopen", lambda *a, **k: _health_mock()), \
+    def test_doctor_bad_secret_mode_fails(self, tmp_path, monkeypatch) -> None:
+        which, run = _mock_subprocess()
+        path = tmp_path / "secrets.json"
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(path))
+        monkeypatch.setenv("BRIDGE_STATE_DIR", str(tmp_path / "state"))
+        write_secrets(make_secrets(), path)
+        path.chmod(0o644)
+        with patch("bridge.cli.Bot", ReadyBot), \
+             patch("urllib.request.urlopen", lambda *a, **k: _health_mock()), \
              patch("bridge.cli.shutil.which", return_value=which), \
-             patch("subprocess.run", side_effect=run_fn):
+             patch("bridge.cli.subprocess.run", side_effect=run):
             result = CliRunner().invoke(cli, ["doctor"])
         assert result.exit_code == 1
-        assert "[fail]" in result.output and "0600" in result.output
+        assert "secrets file permissions" in result.output
 
 
 class TestServeCommand:
-    """Tests for `claude-discord-bridge serve` subcommand."""
-
-    def test_serve_help_prints_help_text(self) -> None:
-        result = CliRunner().invoke(cli, ["serve", "--help"])
-        assert result.exit_code == 0
-        assert "serve" in result.output.lower() or "Usage:" in result.output
-
-    def test_serve_without_secrets_exits_2(self, tmp_path: Path, monkeypatch) -> None:
-        secrets_file = tmp_path / "nonexistent.json"
-        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(secrets_file))
-        result = CliRunner().invoke(cli, ["serve"])
-        assert result.exit_code == 2
-        assert "init" in result.output.lower() or "not found" in result.output.lower()
-
-    def test_serve_help_includes_host_port_options(self) -> None:
+    def test_serve_help_has_host_and_port(self) -> None:
         result = CliRunner().invoke(cli, ["serve", "--help"])
         assert result.exit_code == 0
         assert "--host" in result.output
         assert "--port" in result.output
+
+    def test_serve_without_slack_secrets_exits_2(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("BRIDGE_SECRETS_PATH", str(tmp_path / "missing.json"))
+        result = CliRunner().invoke(cli, ["serve"])
+        assert result.exit_code == 2
+        assert "invalid or unreadable Slack configuration" in result.output

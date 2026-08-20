@@ -21,6 +21,8 @@ from typing import Any
 
 import aiohttp
 
+from bridge.redaction import safe_error
+
 log = logging.getLogger(__name__)
 
 # Per-request timeout for ordinary (non-streaming) calls. The /events stream
@@ -36,9 +38,11 @@ class PolytokenClientError(Exception):
     """
 
     def __init__(self, message: str, *, status: int | None = None, body: str | None = None) -> None:
+        # Never retain provider response bodies: they may contain prompts,
+        # credentials, paths, or upstream diagnostics.
         super().__init__(message)
         self.status = status
-        self.body = body
+        self.body = None
 
 
 class TurnInFlight(PolytokenClientError):
@@ -159,18 +163,17 @@ class PolytokenClient:
                 except json.JSONDecodeError:
                     return text
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise PolytokenClientError(
-                f"{method} {path} failed: {exc!r}", status=None
-            ) from exc
+            log.warning("Polytoken %s %s transport failure: %s", method, path, safe_error(exc, "transport failure"))
+            raise PolytokenClientError("Polytoken daemon transport failure", status=None)
 
     @staticmethod
     def _raise_for_status(method: str, path: str, status: int, body: str) -> None:
         if status == 409 and path == "/prompt":
-            raise TurnInFlight("a turn is already in flight", status=status, body=body)
+            raise TurnInFlight("a turn is already in flight", status=status)
         if status == 422 and path == "/prompt":
-            raise PromptDenied("prompt denied by a pre-prompt hook", status=status, body=body)
+            raise PromptDenied("prompt denied by a pre-prompt hook", status=status)
         raise PolytokenClientError(
-            f"{method} {path} -> HTTP {status}", status=status, body=body
+            "Polytoken daemon rejected the request", status=status
         )
 
     # -- prompting --------------------------------------------------------
@@ -283,7 +286,7 @@ class PolytokenClient:
                 if resp.status != 200:
                     body = await resp.text()
                     raise PolytokenClientError(
-                        f"GET /events -> HTTP {resp.status}", status=resp.status, body=body
+                        "Polytoken event stream rejected the request", status=resp.status
                     )
                 data_lines: list[str] = []
                 async for raw in resp.content:
@@ -308,18 +311,19 @@ class PolytokenClient:
                     if env is not None:
                         yield env
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise PolytokenClientError(f"GET /events failed: {exc!r}", status=None) from exc
+            log.warning("Polytoken event stream transport failure: %s", safe_error(exc, "transport failure"))
+            raise PolytokenClientError("Polytoken event stream transport failure", status=None)
 
     @staticmethod
     def _parse_envelope(data: str) -> SseEnvelope | None:
         try:
             obj = json.loads(data)
         except json.JSONDecodeError:
-            log.warning("dropping unparseable SSE data frame: %r", data[:200])
+            log.warning("dropping unparseable Polytoken SSE data frame")
             return None
         event = obj.get("event")
         if not isinstance(event, dict):
-            log.warning("SSE envelope missing event object: %r", obj)
+            log.warning("Polytoken SSE envelope missing event object")
             return None
         return SseEnvelope(
             seq=obj.get("seq"),

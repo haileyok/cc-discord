@@ -1,433 +1,256 @@
-"""Tests for the discord bot wrapper."""
+"""Slack adapter acceptance tests.
 
-from unittest import mock
+AC.1 = startup identity/channel validation and health contract.
+AC.4 = bounded retry policy and Slack message/file/channel operations.
+AC.9 = Socket Mode quick ack and normalized dispatch hooks.
+"""
+from __future__ import annotations
 
-import discord
+from pathlib import Path
+from typing import Any
+
 import pytest
 
-from bridge.bot import MAX_CHUNK, _chunk, Bot, BotNotReady
+from bridge.bot import (
+    MAX_CHUNK,
+    Bot,
+    BotNotReady,
+    SlackAdapterError,
+    _chunk,
+    _with_retry,
+    sanitize_channel_name,
+    unique_channel_name,
+)
+from tests.fakes import (
+    FakeEnvelopeAcknowledger,
+    FakeSlackClient,
+    FakeSocketMode,
+    MalformedSlackFixture,
+    ScriptedSlackResponse,
+    UnexpectedSlackCall,
+)
 
 
-class Test_chunk:
-    """Unit tests for the _chunk() function."""
-
-    def test_single_char(self):
-        """Single character returns a single chunk."""
-        result = _chunk("a")
-        assert result == ["a"]
-
-    def test_under_limit(self):
-        """Text under limit returns single chunk."""
-        text = "a" * 1899
-        result = _chunk(text)
-        assert result == [text]
-        assert len(result) == 1
-
-    def test_exact_limit(self):
-        """Text exactly at limit returns single chunk."""
-        text = "a" * MAX_CHUNK
-        result = _chunk(text)
-        assert result == [text]
-        assert len(result) == 1
-
-    def test_over_limit_splits(self):
-        """Text over limit is split into multiple chunks."""
-        text = "a" * 5000
-        result = _chunk(text)
-        assert len(result) > 1
-        # Verify all chunks are under limit
-        for chunk in result:
-            assert len(chunk) <= MAX_CHUNK
-        # Verify concatenation equals original (except stripped newlines)
-        reconstructed = "".join(result)
-        assert reconstructed == text
-
-    def test_splits_on_newlines(self):
-        """Prefers breaking on newlines over hard split."""
-        # Create a string with lots of newlines, exceeding limit
-        text = "line1\n" * 1000  # ~6000 chars
-        result = _chunk(text)
-
-        # Should have multiple chunks
-        assert len(result) > 1
-
-        # Each chunk should be under or at the limit
-        for chunk in result:
-            assert len(chunk) <= MAX_CHUNK
-
-        # Verify content is preserved (though newlines may be stripped between chunks)
-        reconstructed = "".join(result)
-        # After stripping, we may have fewer newlines, so just check content
-        assert "line1" in reconstructed
-        assert len(reconstructed) <= len(text)
-
-    def test_hard_split_no_newline(self):
-        """Falls back to hard split when no good newline break exists."""
-        # One very long line with no breaks
-        text = "a" * 2500
-        result = _chunk(text)
-
-        # Should split at MAX_CHUNK boundary
-        assert result[0] == "a" * MAX_CHUNK
-        assert result[1] == "a" * (2500 - MAX_CHUNK)
-
-        # Verify reconstruction
-        reconstructed = "".join(result)
-        assert reconstructed == text
-
-    def test_hard_split_poor_newline(self):
-        """Hard splits if only newlines in lower half of chunk."""
-        # Force hard split by putting newline only in lower half
-        text = "a" * (MAX_CHUNK // 4) + "\n" + "b" * (MAX_CHUNK + 100)
-        result = _chunk(text)
-
-        # First chunk should be hard-split at limit
-        assert len(result[0]) == MAX_CHUNK
-
-        # Verify reconstruction
-        reconstructed = "".join(result)
-        assert reconstructed == text
-
-    def test_strips_leading_newlines(self):
-        """Strips leading newlines when continuing after a chunk."""
-        text = "first part" + "\n" * 10 + ("x" * 1900)
-        result = _chunk(text)
-
-        # Should have 2 chunks
-        assert len(result) == 2
-
-        # Second chunk should not have leading newlines (key behavior of lstrip)
-        assert not result[1].startswith("\n")
-
-        # All chunks except the final should be at or under the limit
-        for chunk in result[:-1]:
-            assert len(chunk) <= MAX_CHUNK
-
-        # Final chunk should be under the limit
-        assert len(result[-1]) <= MAX_CHUNK
-
-        # Verify reconstruction preserves content
-        reconstructed = "".join(result)
-        assert "first part" in reconstructed
-        assert "x" in reconstructed
-
-    def test_custom_limit(self):
-        """Custom limit parameter is respected."""
-        text = "a" * 500
-        result = _chunk(text, limit=100)
-
-        # Should be split at custom limit
-        assert len(result) > 1
-        for chunk in result:
-            assert len(chunk) <= 100
-
-    def test_empty_string(self):
-        """Empty string returns single empty chunk."""
-        result = _chunk("")
-        assert result == [""]
+def _startup_script(*, private: bool = True, member: bool = True) -> list[tuple[str, Any]]:
+    return [
+        ("auth_test", {"ok": True, "team_id": "T1", "user_id": "UBOT"}),
+        ("users_info", {"ok": True, "user": {"id": "UOWNER", "name": "owner"}}),
+        ("conversations_info", {
+            "ok": True,
+            "channel": {"id": "GHOME", "name": "home", "team_id": "T1", "is_private": private,
+                         "is_member": member},
+        }),
+    ]
 
 
-class TestBot:
-    """Unit tests for the Bot class."""
+def _ready_bot(*, client: FakeSlackClient | None = None, socket: FakeSocketMode | None = None,
+               on_message=None, on_reaction=None) -> Bot:
+    return Bot(
+        "xoxb-token", team_id="T1", owner_user_id="UOWNER", home_channel_id="GHOME",
+        client=client or FakeSlackClient(script=_startup_script()),
+        socket_client=socket, on_message=on_message, on_reaction=on_reaction,
+    )
 
-    def test_bot_not_ready_exception(self):
-        """BotNotReady is a RuntimeError subclass."""
-        exc = BotNotReady("test")
-        assert isinstance(exc, RuntimeError)
-        assert str(exc) == "test"
 
-    def test_bot_init(self):
-        """Bot initializes with token and channel_id."""
-        bot = Bot("test_token", 12345)
-        assert bot.channel_id == 12345
+class TestTextHelpers:
+    def test_chunk_contract(self) -> None:
+        assert _chunk("") == [""]
+        assert _chunk("a" * MAX_CHUNK) == ["a" * MAX_CHUNK]
+        chunks = _chunk("a" * 5000)
+        assert all(len(item) <= MAX_CHUNK for item in chunks)
+        assert "".join(chunks) == "a" * 5000
 
-    def test_bot_not_ready_initially(self):
-        """Bot is not ready immediately after creation."""
-        bot = Bot("test_token", 12345)
-        assert not bot.is_ready
+    def test_sanitized_unique_names(self) -> None:
+        assert sanitize_channel_name("  My résumé / task!!! ") == "my-resume-task"
+        assert unique_channel_name("My task", {"my-task"}) == "my-task-2"
+
+
+class TestAC1StartupAndHealth:
+    @pytest.mark.asyncio
+    async def test_startup_validates_team_owner_private_home_and_membership(self) -> None:
+        client = FakeSlackClient(script=_startup_script())
+        socket = FakeSocketMode()
+        bot = _ready_bot(client=client, socket=socket)
+
+        await bot.start()
+
+        assert bot.is_ready
+        assert bot.health_fields == {
+            "bot_connected": True,
+            "slack_connected": True,
+            "socket_mode_connected": True,
+            "team_id": "T1",
+            "owner_user_id": "UOWNER",
+            "home_channel_id": "GHOME",
+            "channel_id": "GHOME",
+            "bot_user_id": "UBOT",
+            "last_error": None,
+        }
+        assert [call.method for call in client.calls] == [
+            "auth_test", "users_info", "conversations_info"
+        ]
+        assert socket.connected
 
     @pytest.mark.asyncio
-    async def test_bot_post_not_ready_raises(self):
-        """Bot.post() raises BotNotReady if bot is not connected."""
-        bot = Bot("test_token", 12345)
-        with pytest.raises(BotNotReady, match="not connected"):
-            await bot.post("test message")
+    async def test_startup_rejects_public_or_nonmember_home(self) -> None:
+        for private, member, message in [
+            (False, True, "must be private"),
+            (True, False, "not a member"),
+        ]:
+            client = FakeSlackClient(script=_startup_script(private=private, member=member))
+            bot = _ready_bot(client=client)
+            with pytest.raises(SlackAdapterError, match=message):
+                await bot.start()
+            assert not bot.is_ready
 
     @pytest.mark.asyncio
-    async def test_bot_close_without_start(self):
-        """Bot.close() works even if start() was never called."""
-        bot = Bot("test_token", 12345)
-        # Should not raise
-        await bot.close()
-
-    @pytest.mark.asyncio
-    async def test_bot_create_thread_not_ready_raises(self):
-        """Bot.create_thread() raises BotNotReady if bot is not connected."""
-        bot = Bot("test_token", 12345)
-        with pytest.raises(BotNotReady, match="not connected"):
-            await bot.create_thread("test thread")
-
-    @pytest.mark.asyncio
-    async def test_bot_on_message_callback_without_callback(self):
-        """Bot init without on_message callback doesn't register dispatcher."""
-        bot = Bot("test_token", 12345)
-        # Should not have registered an on_message listener
-        # (we can't easily verify this without mocking, but at least it shouldn't crash)
-        assert bot._on_message_cb is None
-
-    @pytest.mark.asyncio
-    async def test_bot_on_message_callback_with_callback(self):
-        """Bot init with on_message callback registers dispatcher."""
-        call_count = 0
-
-        async def dummy_callback(msg):
-            nonlocal call_count
-            call_count += 1
-
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
-        assert bot._on_message_cb is dummy_callback
-
-    @pytest.mark.asyncio
-    async def test_bot_on_message_filters_own_messages(self):
-        """on_message ignores messages from the bot itself."""
-        call_count = 0
-
-        async def dummy_callback(msg):
-            nonlocal call_count
-            call_count += 1
-
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
-
-        # Create a mock message where author == client.user
-        mock_msg = mock.MagicMock()
-        mock_msg.author = bot._client.user
-
-        await bot.on_message(mock_msg)
-
-        # Callback should NOT have been called
-        assert call_count == 0
-
-    @pytest.mark.asyncio
-    async def test_bot_on_message_invokes_callback_for_other_messages(self):
-        """on_message invokes callback for non-bot messages."""
-        call_count = 0
-        received_msg = None
-
-        async def dummy_callback(msg):
-            nonlocal call_count, received_msg
-            call_count += 1
-            received_msg = msg
-
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
-
-        # Create a mock message where author != client.user
-        mock_author = mock.MagicMock()
-        mock_author.id = 123456
-        mock_author.bot = False
-
-        mock_msg = mock.MagicMock()
-        mock_msg.author = mock_author
-
-        await bot.on_message(mock_msg)
-
-        # Callback should have been called
-        assert call_count == 1
-        assert received_msg is mock_msg
-
-    @pytest.mark.asyncio
-    async def test_bot_on_message_dispatch_wiring(self):
-        """on_message is registered with discord.py's dispatcher."""
-        call_count = 0
-
-        async def dummy_callback(msg):
-            nonlocal call_count
-            call_count += 1
-
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
-
-        # Create a mock message from a non-bot author
-        mock_author = mock.MagicMock()
-        mock_author.id = 999
-        mock_author.bot = False
-
-        mock_msg = mock.MagicMock()
-        mock_msg.author = mock_author
-
-        # Simulate discord.py dispatcher calling by event name
-        # The dispatcher looks up getattr(client, "on_message") after an event fires
-        handler = getattr(bot._client, "on_message", None)
-        assert handler is not None, "on_message should be registered"
-        assert callable(handler)
-
-        # Calling it should invoke the callback
-        await handler(mock_msg)
-        assert call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_bot_on_message_dispatch_filters_own_messages_via_dispatch(self):
-        """Dispatcher filters bot's own messages."""
-        call_count = 0
-
-        async def dummy_callback(msg):
-            nonlocal call_count
-            call_count += 1
-
-        bot = Bot("test_token", 12345, on_message=dummy_callback)
-
-        # Create a mock message where author == client.user
-        mock_msg = mock.MagicMock()
-        mock_msg.author = bot._client.user
-
-        # Call via the registered dispatcher
-        handler = getattr(bot._client, "on_message", None)
-        await handler(mock_msg)
-
-        # Callback should NOT have been called
-        assert call_count == 0
-
-    def test_bot_client_property(self):
-        """Bot.client returns the underlying discord.Client."""
-        bot = Bot("test_token", 12345)
-        assert bot.client is bot._client
-
-    def test_bot_channel_property_before_ready(self):
-        """Bot.channel is None before on_ready is called."""
-        bot = Bot("test_token", 12345)
-        assert bot.channel is None
-
-    @pytest.mark.asyncio
-    async def test_archive_thread_raises_when_not_ready(self):
-        """archive_thread raises BotNotReady if bot is not ready."""
-        from bridge.bot import BotNotReady
-
-        bot = Bot("test_token", 12345)
-        # Bot is not ready yet
-
+    async def test_not_ready_guard(self) -> None:
+        bot = Bot("token", home_channel_id="GHOME")
         with pytest.raises(BotNotReady):
-            await bot.archive_thread(9999)
+            await bot.post("hello")
+
+
+class TestAC4WebApiAndRetry:
+    @pytest.mark.asyncio
+    async def test_retries_only_transient_and_honors_retry_after(self) -> None:
+        attempts = 0
+        waits: list[float] = []
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise SlackAdapterError("limited", status=429, retry_after=7)
+            return "ok"
+
+        assert await _with_retry("test", operation, sleeper=waits.append) == "ok"
+        assert attempts == 2
+        assert waits == [7]
+
+        async def non_retryable() -> None:
+            raise SlackAdapterError("bad auth", status=200, error="invalid_auth")
+
+        with pytest.raises(SlackAdapterError):
+            await _with_retry("test", non_retryable, sleeper=waits.append)
+        assert waits == [7]
 
     @pytest.mark.asyncio
-    async def test_archive_thread_swallows_404(self):
-        """archive_thread silently ignores discord.NotFound (404)."""
-        bot = Bot("test_token", 12345)
-        # Set ready event and channel manually
-        bot._ready.set()
-        bot._channel = mock.MagicMock(spec=discord.TextChannel)
-
-        # Mock _client.fetch_channel to raise NotFound
-        async def mock_fetch(channel_id):
-            resp = mock.MagicMock()
-            resp.status = 404
-            raise discord.NotFound(resp, "Not Found")
-
-        bot._client.fetch_channel = mock_fetch
-
-        # Should not raise
-        await bot.archive_thread(9999)
-
-    @pytest.mark.asyncio
-    async def test_archive_thread_ignores_non_thread(self):
-        """archive_thread does nothing if fetch_channel returns non-Thread."""
-        bot = Bot("test_token", 12345)
-        bot._ready.set()
-        bot._channel = mock.MagicMock(spec=discord.TextChannel)
-
-        # Mock fetch_channel to return a TextChannel (not a Thread)
-        mock_channel = mock.MagicMock(spec=discord.TextChannel)
-        mock_channel.edit = mock.AsyncMock()
-
-        async def mock_fetch(channel_id):
-            return mock_channel
-
-        bot._client.fetch_channel = mock_fetch
-
-        # Should not raise, and edit should not be called
-        await bot.archive_thread(9999)
-        mock_channel.edit.assert_not_called()
+    async def test_root_thread_blocks_edit_and_reactions(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("chat_postMessage", {"ok": True, "ts": "1.1"}),
+            ("chat_postMessage", {"ok": True, "ts": "1.2"}),
+            ("chat_update", {"ok": True, "ts": "1.2"}),
+            ("reactions_add", {"ok": True}),
+            ("reactions_add", {"ok": True}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        assert await bot.post("root") == ["1.1"]
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "live"}}]
+        assert await bot.post_blocks(blocks, "live", root_ts="1.1") == ["1.2"]
+        await bot.edit_message("GHOME", "1.2", blocks=blocks, text="fallback")
+        await bot.add_reaction("GHOME", "1.2", ":white_check_mark:")
+        await bot.add_reaction("GHOME", "1.2", "x")
+        calls = client.calls
+        post_calls = [call for call in calls if call.method == "chat_postMessage"]
+        assert post_calls[1].kwargs["thread_ts"] == "1.1"
+        assert post_calls[1].kwargs["text"] == "live"
+        assert calls[-1].kwargs["name"] == "x"
 
     @pytest.mark.asyncio
-    async def test_archive_thread_happy_path(self):
-        """archive_thread calls thread.edit(archived=True) for a Thread."""
-        bot = Bot("test_token", 12345)
-        bot._ready.set()
-        bot._channel = mock.MagicMock(spec=discord.TextChannel)
+    async def test_external_upload_flow_is_preflight_upload_complete(self, tmp_path: Path) -> None:
+        # The HTTP leg is intentionally not faked by a permissive MagicMock;
+        # this verifies the two Slack API legs and file existence/size guards.
+        path = tmp_path / "report.txt"
+        path.write_text("hello")
+        client = FakeSlackClient(script=_startup_script() + [
+            ("files_getUploadURLExternal", {
+                "ok": True, "upload_url": "https://uploads.slack.test/upload", "file_id": "F1"
+            }),
+            ("files_completeUploadExternal", {"ok": True, "file_id": "F1", "ts": "2.1"}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        # The explicit upload implementation needs an injected aiohttp-like
+        # object; a fake that supports async post is deterministic and bounded.
+        class Response:
+            status = 200
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return None
 
-        # Mock fetch_channel to return a Thread
-        mock_thread = mock.MagicMock(spec=discord.Thread)
-        mock_thread.edit = mock.AsyncMock()
+        class Session:
+            def post(self, url, **kwargs):
+                assert url.endswith("/upload")
+                assert kwargs["allow_redirects"] is False
+                assert hasattr(kwargs["data"], "__aiter__")
+                return Response()
 
-        async def mock_fetch(channel_id):
-            return mock_thread
-
-        bot._client.fetch_channel = mock_fetch
-
-        # Call archive_thread
-        await bot.archive_thread(9999)
-
-        # Verify edit was called with archived=True
-        mock_thread.edit.assert_called_once_with(archived=True)
-
-    @pytest.mark.asyncio
-    async def test_add_reactions_calls_add_reaction(self):
-        """add_reactions calls add_reaction for each emoji."""
-        bot = Bot("test_token", 12345)
-        bot._ready.set()
-
-        # Mock fetch_channel to return a channel with fetch_message
-        mock_channel = mock.MagicMock()
-        mock_msg = mock.MagicMock()
-        mock_msg.add_reaction = mock.AsyncMock()
-
-        bot._client.fetch_channel = mock.AsyncMock(return_value=mock_channel)
-        mock_channel.fetch_message = mock.AsyncMock(return_value=mock_msg)
-
-        # Call add_reactions
-        await bot.add_reactions(1001, 1002, ["✅", "❌"])
-
-        # Verify fetch_channel and fetch_message were called correctly
-        bot._client.fetch_channel.assert_called_once_with(1002)
-        mock_channel.fetch_message.assert_called_once_with(1001)
-        # Verify add_reaction was called for each emoji
-        assert mock_msg.add_reaction.call_count == 2
-        calls = mock_msg.add_reaction.call_args_list
-        assert calls[0] == mock.call("✅")
-        assert calls[1] == mock.call("❌")
+        bot._http_session = Session()
+        result = await bot.upload_file(path, initial_comment="attached")
+        assert result.get("file_id") == "F1"
+        assert [call.method for call in client.calls[-2:]] == [
+            "files_getUploadURLExternal", "files_completeUploadExternal"
+        ]
 
     @pytest.mark.asyncio
-    async def test_add_reactions_raises_when_not_ready(self):
-        """add_reactions raises BotNotReady if bot not connected."""
-        bot = Bot("test_token", 12345)
-        # Don't set _ready
-        with pytest.raises(BotNotReady):
-            await bot.add_reactions(1001, 1002, ["✅"])
+    async def test_private_channel_create_invite_and_home_archive_guard(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("conversations_create", {"ok": True, "channel": {"id": "GNEW"}}),
+            ("conversations_info", {"ok": True, "channel": {"id": "GNEW", "team_id": "T1", "is_private": True, "is_member": True}}),
+            ("conversations_info", {"ok": True, "channel": {"id": "GNEW", "team_id": "T1", "is_private": True, "is_member": True}}),
+            ("conversations_invite", {"ok": True}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        assert await bot.create_private_channel("Unsafe Project / 1") == "GNEW"
+        assert next(call for call in client.calls if call.method == "conversations_create").kwargs["name"] == "unsafe-project-1"
+        with pytest.raises(ValueError, match="home channel"):
+            await bot.archive_channel("GHOME")
+
+
+class TestAC9SocketMode:
+    @pytest.mark.asyncio
+    async def test_quick_ack_and_normalized_message_dispatch(self) -> None:
+        messages = []
+        reactions = []
+        socket = FakeSocketMode(FakeEnvelopeAcknowledger(expected=["E1", "E2"]))
+        bot = _ready_bot(socket=socket, on_message=messages.append, on_reaction=reactions.append)
+        await bot.start()
+        await socket.dispatch({
+            "envelope_id": "E1",
+            "payload": {"team_id": "T1", "event": {"type": "message", "team": "T1", "channel": "GHOME", "user": "U1",
+                                     "text": "hello", "ts": "3.1"}},
+        })
+        await socket.dispatch({
+            "envelope_id": "E2",
+            "payload": {"team_id": "T1", "event": {"type": "reaction_added", "team": "T1", "user": "U1", "reaction": "eyes",
+                                     "item": {"channel": "GHOME", "ts": "3.1"}}},
+        })
+        assert [message.text for message in messages] == ["hello"]
+        assert messages[0].channel_id == "GHOME"
+        assert reactions[0]["emoji"] == "eyes"
+        socket.acknowledger.assert_complete()
 
     @pytest.mark.asyncio
-    async def test_on_raw_reaction_add_dispatches_to_callback(self):
-        """on_raw_reaction_add calls the registered callback."""
-        callback_called = []
-
-        async def mock_callback(payload):
-            callback_called.append(payload)
-
-        bot = Bot("test_token", 12345, on_reaction=mock_callback)
-
-        # Create a mock RawReactionActionEvent
-        payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
-
-        # Call on_raw_reaction_add
-        await bot.on_raw_reaction_add(payload)
-
-        # Verify callback was called with payload
-        assert len(callback_called) == 1
-        assert callback_called[0] is payload
+    async def test_malformed_socket_fixture_and_strict_call_fail(self) -> None:
+        socket = FakeSocketMode()
+        bot = _ready_bot(socket=socket)
+        await bot.start()
+        with pytest.raises(ValueError, match="malformed"):
+            await bot.handle_socket_envelope({"envelope_id": "E", "payload": "bad"})
+        client = FakeSlackClient(script=[])
+        with pytest.raises(UnexpectedSlackCall):
+            await client.chat_postMessage(channel="GHOME", text="unexpected")
+        with pytest.raises(MalformedSlackFixture):
+            await FakeSlackClient(script=[("auth_test", object())]).auth_test()
 
     @pytest.mark.asyncio
-    async def test_on_raw_reaction_add_no_callback(self):
-        """on_raw_reaction_add does nothing if no callback registered."""
-        bot = Bot("test_token", 12345)  # No on_reaction callback
-
-        # Create a mock RawReactionActionEvent
-        payload = mock.MagicMock(spec=discord.RawReactionActionEvent)
-
-        # Should not raise
-        await bot.on_raw_reaction_add(payload)
+    async def test_bot_messages_are_not_dispatched(self) -> None:
+        received = []
+        bot = _ready_bot(on_message=received.append)
+        await bot.start()
+        await bot.handle_socket_envelope({
+            "envelope_id": "E", "payload": {"team_id": "T1", "event": {"type": "message", "team": "T1", "channel": "GHOME",
+                                                          "user": "UBOT", "text": "self", "ts": "1"}}
+        })
+        assert received == []

@@ -36,7 +36,7 @@ def context_limit_override() -> int | None:
 
 
 def format_state_summary(state: dict) -> str:
-    """Render a one-line Discord stats footer from a ``/state`` snapshot."""
+    """Render a one-line Slack stats footer from a ``/state`` snapshot."""
     model = state.get("active_model") or "?"
     parts = [f"🤖 `{model}`"]
 

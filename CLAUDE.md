@@ -1,83 +1,117 @@
-# claude-discord-bridge
+# claude-slack-bridge contributor guide
 
-Localhost bridge between **Polytoken daemon sessions** and Discord. Single-process Python daemon — `aiohttp` server and `discord.py` client share one asyncio event loop. Each Discord task is one Polytoken daemon process; the bridge drives it over HTTP (`POST /prompt`) and follows its `GET /events` SSE stream.
+This repository is the Slack adapter for a localhost bridge between Polytoken daemon sessions and a trusted private Slack workspace. Read this document before changing behavior. It records operational invariants and migration hazards that are easy to miss from individual modules.
 
 Freshness: 2026-06-15
 
-## Repo location and tooling
+## Scope and local tooling
 
-This repo lives at `/home/discord/claude-discord-bridge`, **outside** the `/home/discord/discord` monorepo. `clyde`, `clint`, the monorepo's pre-commit hooks, and Buildkite CI do not apply here. Don't import from or symlink into the monorepo.
-
-Python is pinned to 3.12 via `uv` (`.python-version`). The system `python3` is 3.10 — always invoke through uv:
-
-- Tests: `uv run pytest` (not `pytest`)
-- Run daemon in foreground: `scripts/run-foreground.sh` (uses `uv run`)
+- Python is pinned to 3.12 via `.python-version`; use `uv run pytest`, not the system Python.
+- The bridge runs as one Python process. `aiohttp`, Slack Web API calls, Socket Mode, task rendering, and lifecycle coordination share one asyncio event loop.
+- The Polytoken executable must be on `PATH`. The systemd unit sets an explicit conservative PATH; shell PATH and systemd PATH are not assumed identical.
+- The checked-in app manifest is `slack-app-manifest.yaml`. Operational names are `claude-slack-bridge`, `~/.config/claude-slack-bridge`, and `~/.local/state/claude-slack-bridge`.
+- This is a shared migration worktree. Preserve unrelated concurrent changes. Inspect `src/bridge/bot.py` before integrating adapter-facing code; do not revert or duplicate its Slack API.
 
 ## Architecture
 
 ```
-Discord ──(discord.py)──> bot.py / commands.py            [Discord surface]
+Slack Web API + Socket Mode
+            │
+            ▼
+    bot.py / server.py ──> TaskRegistry (tasks.py)
                               │
-                       TaskRegistry (tasks.py)
-              ┌───────────────┴────────────────┐
-   inbound: POST /prompt            outbound: GET /events (SSE, seq-tracked)
-              │                                │
-        polytoken_client.py  ◄──────►  events.py translator ──► tool_summary / embeds
-              │
-       daemon_supervisor.py  (polytoken new --no-attach; terminate; reconcile via `polytoken sessions`)
-              ▼
-   one polytoken daemon per task  (127.0.0.1:PORT, own agent loop, bypass perms)
+                 ┌────────────┴─────────────┐
+       inbound Slack thread message       outbound actions
+                              │              ▲
+                         /prompt       events.py translator
+                              │              │
+                     Polytoken daemon ← polytoken_client.py
+                     one process/task       /events SSE
+                              ▲
+                     daemon_supervisor.py
 ```
 
-## Gotchas
+`Bot.start()` validates `auth.test`, configured team, owner lookup, and the configured private home channel's identity/private/member flags. If an app token is configured it connects Socket Mode and dispatches `message`, `app_mention`, and reaction events. The `Bot` surface intentionally has provider-neutral method names consumed by `TaskRegistry`; Slack-specific behavior belongs in `bot.py`, not in task logic.
 
-- **`MESSAGE_CONTENT` privileged intent.** `bot.py` sets `intents.message_content = True` because reply routing reads message text. The bot user in the Discord Developer Portal must have this intent enabled, or `on_message` payloads arrive empty.
-- **Single event loop, shared by aiohttp + discord.py.** Long blocking work (sync DB calls, `time.sleep`, `requests`) inside any handler starves both the HTTP server and the Discord gateway. Use the async equivalents (`aiosqlite`, `asyncio.sleep`, the `aiohttp`-based `PolytokenClient`).
-- **One daemon per task; the port is runtime-only.** A task row stores `polytoken_session_id` and `port`. The port is captured at spawn (`polytoken new --no-attach` prints `session_id=<id> port=<port>`) and re-discovered on bridge restart via `polytoken sessions` (a fixed-width table; the supervisor splits the last column on maxsplit=4 so project paths with spaces survive). Per-task daemons are separate processes that **survive a bridge restart** — `load_from_db(reconcile_with_daemons=True)` re-attaches the event consumer to live sessions and marks missing ones `crashed`.
-- **`subagent_handle` is the routing key.** Almost every `DaemonEvent` carries an optional `subagent_handle`. Set ⇒ the activity belongs to a spawned subagent and routes to that subagent's live embed; unset ⇒ main session, routes to the thread aggregator. This replaces the old JSONL sidechain heuristic. Do not infer subagent membership any other way.
-- **Bypass permission mode — no approval UX.** The daemon is trusted; permission interrogatives never need a user answer (`events.py` suppresses `interrogative_type == "permission"`). There is no Discord reaction/approval round-trip. Only `ask_user_question`, `clarification`, and `confirmation` interrogatives surface to the user.
-- **Trust boundary: anyone who can post in the configured channel controls the agent.** Discord message text is proxied verbatim into `POST /prompt`, and the daemon runs in bypass mode with full tools (including `shell_exec`). So a channel participant can make the agent run arbitrary commands — and `@<path>` references (used for attachments) are *not* a wider hole than the shell already grants. This is the intended model for a single-operator personal tool: **treat the bot's channel as local-operator-level trust.** Don't invite untrusted users, and don't widen the bot's channel/guild access expecting the `@`-reference or prompt text to be sandboxed — they aren't.
-- **A pending interrogative consumes the next plain-text reply.** When the daemon asks a question, `TaskRegistry` stashes a `PendingInterrogative` on the task; the user's next text-only message in the thread is interpreted as the answer (`POST /interrogative/{id}/respond`) instead of a new prompt. Numeric replies select an option; otherwise free text is sent. A reply carrying attachments/voice is treated as a normal prompt and the pending question is re-stashed.
-- **Attachments become `@`-references, not inlined paths.** `maybe_route_message` saves Discord attachments under `~/.local/state/claude-discord-bridge/attachments/<task_id>/` and appends `@<absolute-path>` tokens to the prompt content; the daemon resolves them (emitting `image_reference_resolved`). The reference syntax is `@<path>` (confirmed via the daemon's `Message` schema). Audio attachments are split off and transcribed by `voice.transcribe()` into `[voice memo] <text>` segments before reaching the daemon.
-- **Agent → Discord file attachments use the `[[attach: <path>]]` marker.** When a streamed assistant text block contains `[[attach: /absolute/path]]`, `_parse_attach_markers` strips it, resolves the path (must be absolute and exist), and `Bot.post_with_attachments` uploads up to 10 files alongside the cleaned text.
-- **Tool-name adapter.** Polytoken tool names are snake_case (`file_read`, `shell_exec`, `file_edit_search_replace`, …); `tool_summary` is keyed on Claude Code names (`Read`, `Bash`, `Edit`). `events.py::_adapt_tool` maps name + input-field differences so the existing summarizer renders sensible one-liners; unknown tools fall through to the generic formatter.
-- **SSE resume covers connection drops, not in-stream gaps.** `PolytokenClient.stream_events(last_seq=...)` sends `Last-Event-ID`, so on **reconnect** the daemon replays after the last seen `seq` — that's the recovery for a dropped connection (the consumer reconnects with exponential backoff, capped 10s). An **in-stream** gap (`stream_discontinuity` or a seq jump on a live connection) is *not* replayed frame-by-frame yet: `events.Translator` emits a `Reconcile` action and `_handle_reconcile` makes it **user-visible** (a thread notice) and re-syncs cheap state (`/state` title/todos) rather than silently dropping output. Full `/history` item replay is a future improvement.
-- **A vanished daemon is detected, not retried forever.** On a transport failure the consumer checks `polytoken sessions` (`_daemon_is_gone`); if the session is confirmed absent it posts a notice, marks the task `crashed`, and tears down — instead of looping on a dead port. An inconclusive signal (no session id, or the registry listing itself failing) keeps it retrying. `load_from_db` reconcile applies the same rule: a failed `polytoken sessions` listing keeps rows as-is rather than mass-crashing every task.
-- **`/stop` and `/kill` both terminate the daemon; `/restart` is unsupported.** Headless resume isn't available in polytoken 0.1.20 (`polytoken continue` requires a TTY). `/stop` cancels any in-flight turn then terminates; `/kill` terminates immediately; `/restart` returns a clear "not supported" message. There is no "stop but keep the daemon idle" state.
-- **`/effort` re-selects the active model.** Polytoken effort is a reasoning variant on the model, so `set_effort` reads `/state.active_model` and re-POSTs `/model` with the new `reasoning_effort`. The daemon validates the level against the model's capabilities and falls back gracefully.
-- **`/model` resets effort; `/facet` is free-text.** A bare `/model <name>` switch resets reasoning effort to the new model's default (`POST /model` with no `reasoning_effort`); pass an `effort:` to set it in the same call. `/model` autocompletes from `polytoken models` (lazily cached in the command tree). `/facet <name>` is free-text because `/state` exposes only `active_facet`, not an available-facets list — the daemon 400s on an unknown facet and `set_facet` surfaces that as an error. `/stats` shows model + effort + facet.
-- **Dollar cost is not derivable.** `/state.context_usage` is `{used_tokens, limit_tokens}` (context-window occupancy only); there are no per-turn token-usage events. `/stats` shows model + effort + context window; `usage.MODEL_PRICES` is kept dormant for if/when per-turn token counts become available.
-- **`load_from_db` defers Discord posts to `flush_startup_notices()`.** Reconcile-against-`polytoken sessions` happens before the bot logs in, so staged notices are flushed after `bot.is_ready`. Don't add `self._bot.*` calls inside the reconcile branch.
-- **Attachment cleanup + sweep.** Terminal lifecycle paths call `_cleanup_task_attachments(task_id)`; `sweep_old_attachments()` runs at startup and hourly, deleting files older than `BRIDGE_ATTACHMENT_TTL_SECS` (default 7 days).
+A task is keyed by `(team_id, channel_id, root_ts)` and owned by one Slack user. Personal tasks accept the owner; collaborative tasks maintain explicit participants and can create a private channel. A task runs one Polytoken daemon rooted at its project directory. Runtime ports are stored/discovered for reattachment but are not stable identities.
 
-## Schema
+## Security / threat model (non-negotiable)
 
-`state.py` (aiosqlite, WAL). Tables: `sessions`, `tasks`, `pins`.
+The configured Slack channel is a local-operator trust boundary, not a sandbox. A person who can post a routed message can cause the bypass-mode Polytoken agent to run arbitrary host commands, read/write project files, use network tools, and resolve `@<path>` references. Prompt text is proxied verbatim. Never invite untrusted users; never put secrets or sensitive production work in a shared task channel.
 
-`tasks` columns: `task_id, thread_id, cwd, status, polytoken_session_id, port, created_at, last_activity`. `init_schema` runs `_migrate_legacy_tasks`: if a pre-daemon `tasks` table is detected (any of `zellij_pane_id` / `current_claude_session_id` / `current_transcript_path`), it is **dropped and recreated** (and `approval_log` is dropped). In-flight zellij tasks don't migrate to daemons, and the DB is disposable bookkeeping, so a clean recreate is intentional.
+The loopback Polytoken HTTP daemon is unauthenticated by design. Keep the health server on `127.0.0.1`; do not expose it to a network. A compromised local account, project checkout, Slack workspace member, or prompt-injected file is outside the bridge's defense boundary. Agent attachment markers are not a sandbox expansion: shell access already exists.
 
-## Deployment paths
+Secrets are Slack-only JSON fields:
 
-The systemd unit at `packaging/claude-discord-bridge.service` hardcodes `%h/.local/bin/claude-discord-bridge` — it assumes `uv tool install .`, not `uv run`. The two install paths are not interchangeable.
+- `SLACK_BOT_TOKEN` (`xoxb-`)
+- `SLACK_APP_TOKEN` (`xapp-`)
+- `SLACK_TEAM_ID`
+- `SLACK_HOME_CHANNEL_ID`
+- `SLACK_OWNER_USER_ID`
 
-`systemctl --user` is **not** available on the coder workstation by default ("Operation not permitted"). The verified-working path is `scripts/run-foreground.sh` under tmux/nohup. To use real systemd, run `loginctl enable-linger $USER` first.
+`src/bridge/secrets.py` never reads Discord keys or probes a Discord path. Writes use 0600 for the file and 0700 for its directory. Do not log token values, include them in errors, or add user-token impersonation. Keep Slack file downloads authenticated, HTTPS-only, and bounded; keep uploads bounded and limited to the adapter's supported APIs.
 
-The `polytoken` binary must be on `PATH` for the daemon process (the supervisor shells out to it). launchd/systemd units don't inherit your shell `PATH` — set it explicitly in the unit.
+Manifest scopes are intentionally bot scopes for private channels, files, reactions, users, and channel management. There must be no `oauth_config.scopes.user` block. If a new feature needs a scope, update the manifest, README, and threat-model review together.
 
-## Architecture quick reference
+## Event and routing invariants
 
-- `src/bridge/server.py` — aiohttp app, single endpoint `GET /v1/health`, plus `make_message_dispatcher` (routes Discord messages to `TaskRegistry.maybe_route_message`).
-- `src/bridge/bot.py` — discord.py wrapper. `_with_retry` wraps every `fetch_channel` / `send` with bounded backoff on transient 5xx. `post`, `post_with_attachments`, `post_embed`, `edit_message`, `rename_thread`, `create_thread`, `create_channel`.
-- `src/bridge/polytoken_client.py` — async (aiohttp) client for one daemon session: `prompt`, `stream_events` (SSE async-gen yielding `SseEnvelope`, seq + `Last-Event-ID`), `state`, `history`, `respond_interrogative`, `set_title`/`set_model`/`set_facet`, `cancel_turn`, `compact`, `terminate`, `health`.
-- `src/bridge/daemon_supervisor.py` — `spawn(cwd)` (parses `session_id=…port=…`), `list_sessions()`, `find_session()`, `terminate(session_id)`. Injectable subprocess runner + client factory for tests.
-- `src/bridge/events.py` — pure translator: stateful `Translator.handle(envelope) -> list[Action]`. Buffers text/thinking content blocks, pairs `tool_call`/`tool_result` by `call_id`, routes by `subagent_handle`, maps interrogatives, emits `Reconcile` on gaps. `Action` is a small typed set `TaskRegistry` pattern-matches on.
-- `src/bridge/tasks.py` — `TaskRegistry`: spawn-via-supervisor, one `_consume_events` task per active task driving `_render(action)`, prompt routing, subagent embeds, interrogative replies, stop/kill via terminate, reconcile via `polytoken sessions`.
-- `src/bridge/commands.py` — discord.py slash-command tree (`/start`, `/spawn`, `/list`, `/stop`, `/kill`, `/restart`, `/skill`, `/effort`, `/model`, `/facet`, `/rename`, `/stats`, `/tasks`, `/pin`, `/unpin`).
-- `src/bridge/state.py` — aiosqlite. Tables `sessions`, `tasks`, `pins`.
-- `src/bridge/tool_summary.py` — pure one-liner formatter + fenced diff/code/checklist blocks, keyed on Claude tool names (fed via `events.py`'s adapter).
-- `src/bridge/usage.py` — `format_state_summary(state)` for `/stats` from `/state.context_usage`. `MODEL_PRICES` dormant.
-- `src/bridge/voice.py` — audio transcription (Wispr Flow API or local `whisper` CLI).
-- `src/bridge/skills.py` — filesystem fallback for `/skill` autocomplete; the primary source is the session's `/state.available_skills`.
-- `src/bridge/secrets.py` — 0600 JSON at `~/.config/claude-discord-bridge/secrets.json`.
-- `src/bridge/cli.py` — click CLI: `init`, `serve`, `doctor` (checks secrets, daemon health, the `polytoken` binary + a headless spawn smoke, attachments dir).
-- `src/bridge/threads.py`, `src/bridge/listener.py`, `src/bridge/transcript.py` — retained but no longer on the hot path (threads/listener were the old hook-notify/ask machinery; `MessageLike` still lives in `listener.py`).
+- `subagent_handle` is the only subagent routing key. Set means the activity belongs to a live subagent block; unset means main-session aggregation. Do not infer subagents from sidecar files or text.
+- `Translator` is pure and stateful only for sequence/content-block pairing. It emits typed actions; `TaskRegistry` renders them through `Bot`.
+- SSE `Last-Event-ID` resume repairs dropped connections. A sequence gap on a live connection emits a visible reconcile notice and re-reads cheap `/state` data; it does not silently discard output. Full `/history` replay remains a future improvement.
+- A vanished daemon is checked against `polytoken sessions`; confirmed absence marks the task crashed instead of retrying forever. Inconclusive session listing remains retryable.
+- Permission interrogatives are suppressed because Polytoken runs in bypass mode. Choice/clarification/confirmation questions are posted to the task thread. The next plain-text reply is consumed as the answer; files/voice are treated as a normal prompt and the question remains pending.
+- Incoming Slack files are downloaded under `~/.local/state/claude-slack-bridge/attachments/<task_id>/`, size bounded, and appended as `@<absolute-path>` tokens. Agent output `[[attach: /absolute/path]]` is stripped from text and uploaded only when the path is absolute and exists. Terminal paths clean task files; a periodic sweep removes files older than `BRIDGE_ATTACHMENT_TTL_SECS` (default seven days).
+- Slack has no named thread object or archive operation. Root message timestamps are task conversation keys. Rename edits root text. Closing a disposable collaborative private channel may archive that channel; the configured home channel is protected.
+- Slack provider limits require chunking and fallback text for blocks. Do not assume Discord's numeric IDs, embeds, reaction payloads, or 2,000-character rules in new Slack code.
+
+## App-to-app loop cap
+
+Collaborative task routing permits explicitly authorized app actors but bounds app-to-app exchanges using `BRIDGE_APP_EXCHANGE_BUDGET` (default 20). The counter is per task. Once the count exceeds the budget, the task is paused, persisted, and the owner is alerted once. Keep this cap when adding bot/app routing; never create an unbounded Slack/agent echo loop.
+
+## Operational commands and checks
+
+`claude-slack-bridge init` explains and assumes `slack-app-manifest.yaml`, prompts for the five Slack fields, writes secure config, then starts the real `Bot` and posts a confirmation. It does not silently read Discord config.
+
+`claude-slack-bridge serve` loads only `BRIDGE_SECRETS_PATH` or `~/.config/claude-slack-bridge/secrets.json`, starts the health endpoint and Slack adapter, reconciles persisted tasks, then consumes daemon events.
+
+`claude-slack-bridge doctor` checks:
+
+1. Secrets file exists and is 0600; parent config directory is 0700.
+2. All Slack fields and token prefixes validate.
+3. Real Slack startup validates bot identity, workspace/team, owner, private home-channel membership, and observable Socket Mode state.
+4. Local `/v1/health` is reachable and reports connected state.
+5. `polytoken --version` and a throwaway `polytoken new --no-attach` smoke succeed; the smoke daemon is terminated.
+6. `~/.local/state/claude-slack-bridge` (or `BRIDGE_STATE_DIR`) is private and writable.
+7. A running `claude-discord-bridge` service/process is warned about, never silently stopped or deleted.
+
+Network checks are live checks and can fail because Slack, Socket Mode, or the daemon is unavailable. Doctor distinguishes hard failures from warnings; a warning is not proof that production operation is healthy.
+
+## Deployment
+
+- `scripts/run-foreground.sh` runs `uv run claude-slack-bridge serve`; tmux/nohup is the verified fallback when user systemd is unavailable.
+- `scripts/install-systemd-user.sh` installs `packaging/claude-slack-bridge.service`. The service assumes `uv tool install .` and invokes `%h/.local/bin/claude-slack-bridge`.
+- Do not mix `uv run` and `uv tool install` assumptions. If systemd cannot start, inspect `systemctl --user status claude-slack-bridge` and the explicit PATH before changing code.
+- The service rename is deliberately not an automatic migration. Doctor warns about old service/process names so an operator can stop them safely.
+
+## State and migration
+
+The provider migration uses new Slack conversation keys and new paths. Existing Discord tasks/channels are not resumable as Slack tasks. Stop the old bridge, retain old files only as an intentional backup, run the Slack app install and `init`, then start the new bridge and new tasks. There is no Discord secret fallback, path probing, or automatic SQLite row conversion. The state DB is bookkeeping and can be recreated after migration; do not claim old Discord threads were migrated.
+
+The current shared worktree may contain transitional Discord wording in unowned provider-neutral modules while the parent agent completes the adapter cutover. Do not “fix” those files opportunistically: report exact dependencies instead. In particular, if `server.py` still constructs the old `Bot` signature or `state.py` still points at the old state path, coordinate the required parent-owned edits rather than changing them here.
+
+## Collaboration rules
+
+- Keep edits confined to the requested ownership set unless the parent explicitly expands it.
+- Before touching `bot.py`, inspect existing Slack constructor, `start()` validation, retry policy, Socket Mode, file bounds, and normalized event types.
+- Prefer pure translators and injectable fakes. Keep network calls async; never use blocking requests, sleeps, DB calls, or subprocess loops inside event handlers.
+- Add focused tests for config paths, token/key rejection, permission bits, startup validation, and doctor failure/warning classification.
+- Run `uv run pytest -q tests/test_cli.py tests/test_secrets.py` before broader tests. Scan owned files for old `claude-discord-bridge`, `DISCORD_*`, and Discord setup instructions before handing back.
+
+## Owned operational files
+
+- `src/bridge/secrets.py`: Slack credentials and secure paths.
+- `src/bridge/cli.py`: init/serve/doctor.
+- `tests/test_cli.py`, `tests/test_secrets.py`: focused operational tests.
+- `README.md`, `CLAUDE.md`: user/contributor documentation and threat model.
+- `packaging/claude-slack-bridge.service`, `scripts/*`: deployment names and startup scripts.
+- `slack-app-manifest.yaml`: Socket Mode app declaration.

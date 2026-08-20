@@ -1,6 +1,6 @@
 """Supervise per-task Polytoken daemon processes via the ``polytoken`` CLI.
 
-The bridge runs one daemon per Discord task. This module owns the process
+The bridge runs one daemon per Slack task. This module owns the process
 side of that: spawning a fresh headless session, listing the live session
 registry, and terminating a session. The HTTP side of a session lives in
 :class:`bridge.polytoken_client.PolytokenClient`.

@@ -1,4 +1,4 @@
-"""Pure formatter: convert PostToolUse payloads into one-line Discord messages."""
+"""Pure formatter: convert PostToolUse payloads into one-line Slack messages."""
 
 from typing import Any
 
@@ -123,7 +123,7 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
         return f"{emoji} TaskGet: #{task_id}"
 
     if tool_name == "EnterWorktree":
-        # Surface the chosen branch / slug so the thread shows where claude
+        # Surface the chosen branch / slug so the root message shows where claude
         # ended up working.
         slug = (
             tool_input.get("branch")
@@ -168,22 +168,18 @@ def _diff_summary(tool_input: dict) -> str:
     return f"+{plus} -{minus}"
 
 
-# Discord's hard limit is 2000 chars per message; bot.py chunks at 1900
-# (`MAX_CHUNK`) to leave attribution-header headroom. Diff/code blocks get
-# wrapped in a fenced container (` ```diff\n…\n``` ` ≈ 12 chars) and may
-# also append a `\n…` truncation marker, so the body budget must stay
-# below 1900 minus that overhead — otherwise the bot's chunker splits a
-# fenced block in the middle and the second message arrives with no
-# opening fence (and the closing fence renders as visible text).
-_DISCORD_LIMIT = 2000
+# Keep checklist output within the neutral message budget used by the bridge;
+# bot.py chunks at 1900 to keep tool output readable. Diff/code blocks get
+# wrapped in a fenced container and may append a truncation marker.
+_MESSAGE_LIMIT = 2000
 _DIFF_BUDGET = 1850
 
 
 def diff_block(tool_name: str, tool_input: dict) -> str | None:
-    """Return a fenced Discord-renderable diff/content block for Edit / MultiEdit
+    """Return a fenced Slack-renderable diff/content block for Edit / MultiEdit
     / Write / TodoWrite, or None for tools that don't have a block to emit.
 
-    Truncates at ~_DISCORD_LIMIT to fit a single Discord message.
+    Truncates to keep a single Slack message readable.
     """
     if tool_name == "Edit":
         return _format_edit_diff(
@@ -217,7 +213,7 @@ def diff_block(tool_name: str, tool_input: dict) -> str | None:
 
 
 def _format_todo_checklist(todos: list) -> str:
-    """Render a Claude TodoWrite payload as a Discord-friendly checklist.
+    """Render a Claude TodoWrite payload as a Slack-friendly checklist.
 
     Each todo has `content`, `status` (pending|in_progress|completed), and
     `activeForm`. Use ▶ for in_progress, [x] for completed, [ ] otherwise.
@@ -238,8 +234,8 @@ def _format_todo_checklist(todos: list) -> str:
             mark = "⬜"
         lines.append(f"{mark} {content}")
     body = "\n".join(lines)
-    if len(body) > _DISCORD_LIMIT - 50:
-        body = body[: _DISCORD_LIMIT - 50] + "\n…"
+    if len(body) > _MESSAGE_LIMIT - 50:
+        body = body[: _MESSAGE_LIMIT - 50] + "\n…"
     return body
 
 

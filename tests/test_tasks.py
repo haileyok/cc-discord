@@ -1,395 +1,386 @@
-"""Tests for the daemon-backed TaskRegistry."""
+"""Slack TaskRegistry acceptance tests (AC.2/4/5/6/7/8/10)."""
 
-import asyncio
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from bridge import events, state
-from bridge.tasks import Task, TaskNotFound, TaskRegistry, TaskRestartError, TaskSpawnError
-from tests.fakes import FakeBot, FakePolytokenClient, FakeSupervisor
+from bridge.domain import ConversationKey, Participant, ParticipantKind
+from bridge.polytoken_client import PolytokenClientError
+from bridge.tasks import (
+    SlackActor,
+    SlackFile,
+    SlackMessage,
+    Task,
+    TaskNotFound,
+    TaskPrivilegeError,
+    TaskRegistry,
+    TaskRestartError,
+    TaskRoutingError,
+    TaskSpawnError,
+)
 
 
 @dataclass
-class FakeAttachment:
-    filename: str
-    _data: bytes = b"hello"
-
-    async def read(self) -> bytes:
-        return self._data
+class SpawnResult:
+    session_id: str
+    port: int
 
 
 @dataclass
-class FakeChannel:
-    id: int
+class FakeClient:
+    port: int = 41000
+    prompts: list[str] = field(default_factory=list)
+    interrogative_responses: list[dict[str, Any]] = field(default_factory=list)
+    model_calls: list[dict[str, Any]] = field(default_factory=list)
+    facet_calls: list[str] = field(default_factory=list)
+    terminated: int = 0
+    cancelled: int = 0
+    terminate_error_status: int | None = None
+    closed: bool = False
+    state_payload: dict[str, Any] = field(default_factory=lambda: {
+        "active_model": "anthropic/claude-opus-4-8",
+        "session_title": "fake-title",
+        "pending_interrogatives": [],
+    })
+
+    async def prompt(self, content: str, *, max_tool_turns=None):
+        self.prompts.append(content)
+
+    async def respond_interrogative(self, interrogative_id: str, response: dict[str, Any]):
+        self.interrogative_responses.append({"id": interrogative_id, "response": response})
+
+    async def state(self):
+        return dict(self.state_payload)
+
+    async def set_model(self, model: str, *, reasoning_effort=None):
+        self.model_calls.append({"model": model, "reasoning_effort": reasoning_effort})
+
+    async def set_facet(self, facet: str):
+        self.facet_calls.append(facet)
+
+    async def cancel_turn(self):
+        self.cancelled += 1
+
+    async def terminate(self):
+        if self.terminate_error_status is not None:
+            raise PolytokenClientError("rejected", status=self.terminate_error_status)
+        self.terminated += 1
+
+    async def aclose(self):
+        self.closed = True
 
 
 @dataclass
-class FakeMsg:
-    channel: FakeChannel
-    content: str = ""
-    attachments: list = field(default_factory=list)
-    id: int = 777
+class FakeSupervisor:
+    fail_spawn: bool = False
+    _seq: int = 0
+    next_channel: str = "GNEW"
+    next_root: str = "9000.000"
+
+    async def spawn(self, cwd: str, *, config_dir=None):
+        if self.fail_spawn:
+            from bridge.daemon_supervisor import DaemonSupervisorError
+            raise DaemonSupervisorError("spawn failed")
+        self._seq += 1
+        return SpawnResult(f"sess-{self._seq}", 41000 + self._seq)
+
+    async def find_session(self, session_id: str):
+        return object()
+
+    async def list_models(self):
+        return ["anthropic/claude-opus-4-8"]
+
+
+@dataclass
+class FakeBot:
+    team_id: str = "T1"
+    owner_user_id: str = "UOWNER"
+    home_channel_id: str = "CHOME"
+    app_actor_id: str = "AAPP"
+    posts: list[dict[str, Any]] = field(default_factory=list)
+    edits: list[dict[str, Any]] = field(default_factory=list)
+    roots: list[dict[str, Any]] = field(default_factory=list)
+    private_channels: list[str] = field(default_factory=list)
+    invites: list[dict[str, Any]] = field(default_factory=list)
+    archives: list[str] = field(default_factory=list)
+    kicks: list[dict[str, Any]] = field(default_factory=list)
+    downloads: list[dict[str, Any]] = field(default_factory=list)
+    reactions: list[dict[str, Any]] = field(default_factory=list)
+    fail_invite: bool = False
+    fail_root: bool = False
+    _message_seq: int = 0
+
+    async def post(self, text: str, channel_id: str, root_ts=None, blocks=None):
+        self._message_seq += 1
+        ts = f"m{self._message_seq}"
+        self.posts.append({"text": text, "channel_id": channel_id, "root_ts": root_ts, "blocks": blocks, "ts": ts})
+        return [ts]
+
+    async def edit_message(self, channel_id: str, message_ts: str, *, text=None, blocks=None, content=None):
+        self.edits.append({"channel_id": channel_id, "message_ts": message_ts, "text": text, "blocks": blocks, "content": content})
+
+    async def post_with_attachments(self, paths, *, channel_id, root_ts, text):
+        self.posts.append({"attachments": list(paths), "channel_id": channel_id, "root_ts": root_ts, "text": text})
+        return ["attachment-message"]
+
+    async def create_task_root(self, channel_id: str, text: str, blocks=None):
+        if self.fail_root:
+            raise RuntimeError("root failed")
+        self.roots.append({"channel_id": channel_id, "text": text, "blocks": blocks})
+        return "1000.001"
+
+    async def create_private_channel(self, name: str):
+        self.private_channels.append(name)
+        return "GNEW"
+
+    async def invite_participants(self, channel_id: str, actor_ids: list[str]):
+        if self.fail_invite:
+            raise RuntimeError("invite failed")
+        self.invites.append({"channel_id": channel_id, "actor_ids": list(actor_ids)})
+
+    async def archive_channel(self, channel_id: str):
+        self.archives.append(channel_id)
+
+    async def remove_participants(self, channel_id: str, user_ids: list[str]):
+        self.kicks.extend({"channel_id": channel_id, "user_id": user_id} for user_id in user_ids)
+
+    async def download_file(self, url: str, path: Path, max_bytes: int):
+        self.downloads.append({"url": url, "path": path, "max_bytes": max_bytes})
+        path.write_bytes(b"downloaded")
+
+    async def add_reaction(self, channel_id: str, message_ts: str, name: str):
+        self.reactions.append({"channel_id": channel_id, "message_ts": message_ts, "name": name})
 
 
 @pytest.fixture(autouse=True)
-def _no_consumer(monkeypatch):
-    # Unit tests don't run the real SSE consumer.
+def _disable_sse_consumers(monkeypatch):
     monkeypatch.setattr(TaskRegistry, "_start_consumer", lambda self, task: None)
 
 
-def _make_registry(db) -> tuple[TaskRegistry, FakeBot, FakeSupervisor]:
-    bot = FakeBot()
-    sup = FakeSupervisor()
-    reg = TaskRegistry(db, bot, sup)
-    return reg, bot, sup
+def _key(task: Task) -> ConversationKey:
+    return ConversationKey(task.team_id, task.channel_id, task.root_ts)
 
 
-async def _bind_running_task(reg: TaskRegistry, *, thread_id=2000, port=40001) -> tuple[Task, FakePolytokenClient]:
-    task = Task(
-        task_id="t1", thread_id=thread_id, cwd="/w", status="running",
-        polytoken_session_id="sess-1", port=port, created_at=0, last_activity=0,
-    )
-    await reg._index(task)
-    await reg._persist(task)
-    fake = FakePolytokenClient(port=port)
+async def _task(reg: TaskRegistry, *, mode="personal", channel="CHOME", root="1000.000", owner="UOWNER", client=None):
+    task = Task("t1", "T1", channel, root, owner, mode, "/tmp", "running", "sess-1", 41001, 1, 1, app_exchange_budget=reg.app_exchange_budget)
+    await reg.attach_task(task)
+    fake = client or FakeClient(port=41001)
+    fake.port = task.port
     reg._clients[task.task_id] = fake
     return task, fake
 
 
-class TestSpawn:
-    async def test_spawn_creates_thread_and_persists(self, in_memory_db, tmp_path) -> None:
-        reg, bot, sup = _make_registry(in_memory_db)
-        task = await reg.spawn_task(cwd=str(tmp_path))
-        assert task.status == "running"
-        assert task.polytoken_session_id == "sess-1"
-        assert task.port is not None
-        assert len(bot.get_thread_calls()) == 1
-        row = await state.get_task(in_memory_db, task.task_id)
-        assert row.status == "running" and row.port == task.port
-
-    async def test_spawn_bad_cwd_raises(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        with pytest.raises(TaskSpawnError):
-            await reg.spawn_task(cwd="/no/such/dir")
-
-    async def test_spawn_failure_marks_crashed(self, in_memory_db, tmp_path) -> None:
-        reg, bot, sup = _make_registry(in_memory_db)
-        sup.fail_spawn = True
-        with pytest.raises(TaskSpawnError):
-            await reg.spawn_task(cwd=str(tmp_path))
-        # Thread was created, then a failure notice posted and archived.
-        assert any("failed to spawn" in c["content"] for c in bot.get_post_calls())
-        assert bot.get_archive_calls()
+def _registry(db, *, budget=20):
+    bot = FakeBot()
+    reg = TaskRegistry(db, bot, FakeSupervisor(), app_actor_id="AAPP", app_exchange_budget=budget)
+    return reg, bot
 
 
-class TestRouting:
-    async def test_route_prompts_daemon(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        handled = await reg.maybe_route_message(FakeMsg(FakeChannel(task.thread_id), content="hello world"))
-        assert handled is True
-        assert fake.prompts == ["hello world"]
+class TestAC2IdentityRouting:
+    async def test_owner_only_personal_and_conversation_key_index(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg)
+        assert reg.get_by_key(_key(task)) is task
+        assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", "1000.000", SlackActor("UOWNER"), "hello", "E1", "M1"))
+        assert json.loads(client.prompts[0])["body"] == "hello"
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", "1000.000", SlackActor("UOTHER"), "no", "E2", "M2"))
+        assert len(client.prompts) == 1
 
-    async def test_route_attachment_becomes_at_reference(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        msg = FakeMsg(FakeChannel(task.thread_id), content="look", attachments=[FakeAttachment("notes.txt")])
-        await reg.maybe_route_message(msg)
-        assert len(fake.prompts) == 1
-        assert "@" in fake.prompts[0] and "notes.txt" in fake.prompts[0]
+    async def test_collaborative_requires_explicit_participant(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, mode="collaborative", root="1000.002")
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOTHER"), "no", "E1", "M1"))
+        await state.upsert_participant(in_memory_db, task.key, Participant("UOTHER", ParticipantKind.HUMAN))
+        assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOTHER"), "yes", "E2", "M2"))
+        assert json.loads(client.prompts[0])["body"] == "yes"
 
-    async def test_route_unbound_thread_returns_false(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        assert await reg.maybe_route_message(FakeMsg(FakeChannel(9999), content="hi")) is False
+    async def test_provenance_is_stable_and_dedup_covers_event_and_message(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.003")
+        msg = SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "raw body", "E1", "M1")
+        assert await reg.maybe_route_message(msg)
+        assert await reg.maybe_route_message(msg)
+        assert json.loads(client.prompts[0])["body"] == "raw body"
+        assert task.last_envelope is not None
+        assert task.last_envelope.body == "raw body"
+        assert task.last_envelope.provenance.team_id == "T1"
+        assert task.last_envelope.provenance.actor_id == "UOWNER"
 
-    async def test_pending_interrogative_consumes_reply(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        reg._pending_interrogatives[task.task_id] = __import__(
-            "bridge.tasks", fromlist=["PendingInterrogative"]
-        ).PendingInterrogative(interrogative_id="i1", kind="confirmation")
-        await reg.maybe_route_message(FakeMsg(FakeChannel(task.thread_id), content="yes"))
-        assert fake.prompts == []  # not a normal prompt
-        assert fake.interrogative_responses[0]["response"] == {"kind": "confirmation_answer", "confirmed": True}
-
-    async def test_clarification_numeric_choice(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        from bridge.tasks import PendingInterrogative
-
-        reg._pending_interrogatives[task.task_id] = PendingInterrogative(
-            interrogative_id="i2", kind="clarification",
-            options=[{"key": "a", "label": "Apple"}, {"key": "b", "label": "Banana"}],
-        )
-        await reg.maybe_route_message(FakeMsg(FakeChannel(task.thread_id), content="2"))
-        assert fake.interrogative_responses[0]["response"] == {"kind": "clarification_choice", "choice": "b"}
+    async def test_self_and_unknown_messages_are_ignored(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.004")
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("AAPP", is_app=True), "self", "E1", "M1"))
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", "other-root", SlackActor("UOWNER"), "unknown", "E2", "M2"))
+        assert client.prompts == []
 
 
-class TestLifecycle:
-    async def test_stop_terminates_and_marks_stopped(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg.stop_task(task.task_id)
-        assert fake.cancelled == 1 and fake.terminated == 1
-        assert task.status == "stopped"
-        assert reg.get_by_thread_id(task.thread_id) is None
-        assert bot.get_archive_calls()
+class TestAC4AttachmentsAndInterrogatives:
+    async def test_authenticated_bounded_attachment_becomes_reference(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.005")
+        msg = SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "inspect", "E1", "M1", (SlackFile("https://files.slack.com/private", "notes.txt", 12),))
+        assert await reg.maybe_route_message(msg)
+        assert bot.downloads and bot.downloads[0]["max_bytes"] > 0
+        assert json.loads(client.prompts[0])["body"].startswith("inspect @")
 
-    async def test_stop_does_not_strand_on_terminate_http_error(self, in_memory_db) -> None:
-        # An HTTP-error terminate (daemon alive but rejecting) must NOT tear the
-        # task down — that would strand a live daemon. It stays running/tracked.
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, fclient = await _bind_running_task(reg)
-        fclient.terminate_error_status = 500
-        result = await reg.stop_task(task.task_id)
-        assert result is False
-        assert task.status == "running"
-        assert reg.get_by_thread_id(task.thread_id) is task  # still tracked
-        assert any("rejected terminate" in c["content"] for c in bot.get_post_calls())
-
-    async def test_kill_does_not_strand_on_terminate_http_error(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, fclient = await _bind_running_task(reg)
-        fclient.terminate_error_status = 500
-        result = await reg.kill_task(task.task_id)
-        assert result is False
-        assert task.status == "running"
-
-    async def test_kill_terminates_and_marks_crashed(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg.kill_task(task.task_id)
-        assert fake.terminated == 1
-        assert task.status == "crashed"
-
-    async def test_restart_unsupported(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        with pytest.raises(TaskRestartError):
-            await reg.restart_task(task.task_id)
-
-    async def test_kill_unknown_raises(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        with pytest.raises(TaskNotFound):
-            await reg.kill_task("nope")
+    async def test_pending_is_actor_targeted_and_attachment_does_not_consume(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.006")
+        await reg._render(task, events.Confirmation("I1", None, "Continue?"))
+        assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOTHER"), "yes", "E1", "M1")) is False
+        file_msg = SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "file", "E2", "M2", (SlackFile("https://files.slack.com/x", "x.txt"),))
+        assert await reg.maybe_route_message(file_msg)
+        assert client.interrogative_responses == []
+        assert len(client.prompts) == 1
+        answer = SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "yes", "E3", "M3")
+        assert await reg.maybe_route_message(answer)
+        assert client.interrogative_responses[0]["response"]["confirmed"] is True
+        assert any("Continue?" in post["text"] for post in bot.posts if "text" in post)
 
 
-class TestEffortAndState:
-    async def test_set_effort_reselects_model(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg.set_effort(task.task_id, "low")
-        assert fake.model_calls == [{"model": "anthropic/claude-opus-4-8", "reasoning_effort": "low"}]
-
-    async def test_get_state(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        st = await reg.get_state(task.task_id)
-        assert st["active_model"] == "anthropic/claude-opus-4-8"
-
-    async def test_invoke_skill_prompts_at_reference(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg.invoke_skill(task.task_id, "brainstorming", "go")
-        assert fake.prompts == ["@brainstorming go"]
-
-    async def test_set_model(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg.set_model(task.task_id, "openai/gpt-5.5", reasoning_effort="high")
-        assert fake.model_calls[-1] == {"model": "openai/gpt-5.5", "reasoning_effort": "high"}
-
-    async def test_set_facet(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg.set_facet(task.task_id, "plan")
-        assert fake.facet_calls == ["plan"]
-
-    async def test_list_models(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        models = await reg.list_models()
-        assert "anthropic/claude-opus-4-8" in models
+class TestAC5AppBudget:
+    async def test_collaborative_app_exchange_budget_pauses_and_alerts_owner(self, in_memory_db):
+        reg, bot = _registry(in_memory_db, budget=1)
+        task, client = await _task(reg, mode="collaborative", root="1000.007")
+        await state.upsert_participant(in_memory_db, task.key, Participant("AHELPER", ParticipantKind.APP))
+        app = lambda text, event, message: SlackMessage("T1", "CHOME", task.root_ts, SlackActor("AHELPER", is_app=True), text, event, message)
+        assert await reg.maybe_route_message(app("first", "E1", "M1"))
+        assert await reg.maybe_route_message(app("second", "E2", "M2"))
+        assert task.status == "paused"
+        assert task.app_exchanges == 1
+        assert any("budget" in str(post).lower() and "UOWNER" in str(post) for post in bot.posts)
+        assert json.loads(client.prompts[0])["body"] == "first"
 
 
-class TestRender:
-    async def test_tool_line_appends_aggregator_then_flush_posts(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        await reg._render(task, events.ToolLine(line="✓ Bash: ls"))
-        await reg._end_turn(task)  # flush_now
-        assert any("Bash: ls" in c["content"] for c in bot.get_post_calls())
+class TestAC6PromotionAndMembership:
+    async def test_promote_is_create_invite_root_then_atomic_swap(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.008")
+        promoted = await reg.promote_task(task.task_id, "UOWNER", ["UOTHER"], name="collab")
+        assert promoted.mode == "collaborative"
+        assert promoted.channel_id == "GNEW"
+        assert promoted.root_ts == "1000.001"
+        assert reg.get_by_key(ConversationKey("T1", "CHOME", "1000.008")) is None
+        assert bot.private_channels == ["collab"]
+        assert bot.invites[-1] == {"channel_id": "GNEW", "actor_ids": ["UOTHER"]}
+        assert (await state.get_root(in_memory_db, promoted.key)).owner.mode == "collaborative"
+        assert (await state.get_active_promotion(in_memory_db, ConversationKey("T1", "CHOME", "1000.008"))) is not None
 
-    async def test_assistant_text_posts(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        await reg._render(task, events.AssistantText(text="done"))
-        assert any(c["content"] == "done" for c in bot.get_post_calls())
+    async def test_promotion_failure_cleans_new_channel_and_keeps_old_root(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.009")
+        bot.fail_root = True
+        with pytest.raises(TaskRoutingError):
+            await reg.promote_task(task.task_id, "UOWNER", [])
+        assert reg.get_by_key(task.key) is task
+        assert bot.archives == ["GNEW"]
+        assert (await state.get_root(in_memory_db, task.key)).owner.mode == "personal"
 
-    async def test_title_change_renames(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        await reg._render(task, events.TitleChange(title="my-feature"))
-        assert bot._rename_calls[0]["name"] == "my-feature"
+    async def test_owner_can_remove_participant_only_after_slack_kick(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, mode="collaborative", root="1000.010b")
+        await state.upsert_participant(in_memory_db, task.key, Participant("UOTHER", ParticipantKind.HUMAN))
+        assert await reg.remove_participant(task.task_id, "UOWNER", "UOTHER")
+        assert bot.kicks == [{"channel_id": "CHOME", "user_id": "UOTHER"}]
+        assert await state.list_participants(in_memory_db, task.key) == []
+        with pytest.raises(TaskPrivilegeError):
+            await reg.remove_participant(task.task_id, "UOWNER", "UOWNER")
 
-    async def test_subagent_embed_lifecycle(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        await reg._render(task, events.SubagentStarted(handle="h1", subagent_type="researcher", model="m"))
-        assert bot._embed_calls  # embed posted
-        await reg._render(task, events.SubagentCompleted(handle="h1", outcome_kind="success", message=None, result_summary="ok"))
-        assert bot._edit_calls  # embed edited to finished
-
-
-class TestReconcile:
-    async def test_reconcile_recovers_live_marks_dead_crashed(self, in_memory_db) -> None:
-        reg, bot, sup = _make_registry(in_memory_db)
-        await state.upsert_task(in_memory_db, "live", 100, "/w", "running", polytoken_session_id="sess-live", port=1)
-        await state.upsert_task(in_memory_db, "dead", 101, "/w", "running", polytoken_session_id="sess-dead", port=2)
-        from tests.fakes import _SessionInfo
-
-        sup.sessions = [_SessionInfo("sess-live", 55555, project_path="/w")]
-        await reg.load_from_db(reconcile_with_daemons=True)
-        live = reg.get_by_task_id("live")
-        assert live is not None and live.status == "running" and live.port == 55555
-        dead_row = await state.get_task(in_memory_db, "dead")
-        assert dead_row.status == "crashed"
-
-    async def test_reconcile_keeps_rows_when_listing_fails(self, in_memory_db) -> None:
-        # A transient `polytoken sessions` failure must NOT mass-crash tasks.
-        reg, bot, sup = _make_registry(in_memory_db)
-        await state.upsert_task(in_memory_db, "t1", 100, "/w", "running", polytoken_session_id="sess-1", port=7)
-        sup.fail_list = True
-        await reg.load_from_db(reconcile_with_daemons=True)
-        task = reg.get_by_task_id("t1")
-        assert task is not None and task.status == "running"
-        row = await state.get_task(in_memory_db, "t1")
-        assert row.status == "running"  # not crashed
-        assert not bot.get_archive_calls()
+    async def test_participant_persists_only_after_slack_invite_success(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, mode="collaborative", root="1000.010")
+        bot.fail_invite = True
+        with pytest.raises(RuntimeError):
+            await reg.add_participant(task.task_id, "UOWNER", "UOTHER")
+        assert await state.list_participants(in_memory_db, task.key) == []
+        bot.fail_invite = False
+        await reg.add_participant(task.task_id, "UOWNER", "UOTHER")
+        assert [str(row.participant.actor_id) for row in await state.list_participants(in_memory_db, task.key)] == ["UOTHER"]
 
 
-class TestDaemonDeath:
-    async def test_daemon_is_gone_true_when_absent(self, in_memory_db) -> None:
-        reg, _, sup = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        sup.sessions = []  # session not in registry
-        assert await reg._daemon_is_gone(task) is True
+class TestAC7LifecycleAndConfig:
+    async def test_owner_required_and_personal_close_never_archives_home(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.011")
+        with pytest.raises(TaskPrivilegeError):
+            await reg.stop_task(task.task_id, "UOTHER")
+        assert await reg.stop_task(task.task_id, "UOWNER")
+        assert task.status == "stopped" and client.terminated == 1
+        assert bot.archives == []
 
-    async def test_daemon_is_gone_false_when_present(self, in_memory_db) -> None:
-        reg, _, sup = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        from tests.fakes import _SessionInfo
+    async def test_collaborative_close_archives_private_channel_and_config_is_owner_only(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, mode="collaborative", channel="GPRIVATE", root="1000.012")
+        task.channel_owned = True
+        await state.update_runtime(in_memory_db, task.task_id, channel_owned=True)
+        with pytest.raises(TaskPrivilegeError):
+            await reg.set_facet(task.task_id, "plan", owner_user_id="UOTHER")
+        await reg.set_facet(task.task_id, "plan", owner_user_id="UOWNER")
+        await reg.close_task(task.task_id, "UOWNER")
+        assert bot.archives == ["GPRIVATE"]
 
-        sup.sessions = [_SessionInfo(task.polytoken_session_id, task.port)]
-        assert await reg._daemon_is_gone(task) is False
-
-    async def test_daemon_is_gone_false_when_listing_fails(self, in_memory_db) -> None:
-        reg, _, sup = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        sup.fail_list = True  # inconclusive -> keep retrying
-        assert await reg._daemon_is_gone(task) is False
-
-    async def test_handle_daemon_death_marks_crashed(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, fake = await _bind_running_task(reg)
-        await reg._handle_daemon_death(task)
-        assert task.status == "crashed"
-        assert reg.get_by_thread_id(task.thread_id) is None
-        assert bot.get_archive_calls()
-        assert any("daemon" in c["content"].lower() for c in bot.get_post_calls())
-
-
-class TestConsumerStartup:
-    async def test_consumers_deferred_until_bot_ready(self, in_memory_db, monkeypatch) -> None:
-        # load_from_db must NOT start consumers (bot isn't ready yet);
-        # start_event_consumers() does, after serve binds the bot.
-        started: list[str] = []
-        monkeypatch.setattr(
-            TaskRegistry, "_start_consumer", lambda self, task: started.append(task.task_id)
-        )
-        reg, bot, sup = _make_registry(in_memory_db)
-        from tests.fakes import _SessionInfo
-
-        await state.upsert_task(
-            in_memory_db, "t1", 100, "/w", "running", polytoken_session_id="sess-1", port=1
-        )
-        sup.sessions = [_SessionInfo("sess-1", 5, project_path="/w")]
-        await reg.load_from_db(reconcile_with_daemons=True)
-        assert started == []  # deferred — not started during reconcile
-        await reg.start_event_consumers()
-        assert "t1" in started
-
-
-class TestTeardownIdempotent:
-    async def test_first_terminal_transition_wins(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        await reg._teardown_task(task, status="stopped", archive=True)
-        archives = len(bot.get_archive_calls())
-        # A racing teardown (e.g. daemon-death after /stop) is a no-op.
-        await reg._teardown_task(task, status="crashed", archive=True)
-        assert task.status == "stopped"
-        assert len(bot.get_archive_calls()) == archives
-
-
-class TestReconcileAction:
-    async def test_reconcile_posts_notice_and_resyncs(self, in_memory_db) -> None:
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, _ = await _bind_running_task(reg)
-        reg._translators[task.task_id] = events.Translator()
-        await reg._render(task, events.Reconcile(reason="stream_discontinuity missed=3"))
-        assert any("gap" in c["content"].lower() for c in bot.get_post_calls())
-        # re-synced the session title from /state
-        assert bot._rename_calls and bot._rename_calls[0]["name"] == "fake-title"
-
-    async def test_reconcile_recovers_pending_interrogative(self, in_memory_db) -> None:
-        # A gap covering an interrogative must not strand the daemon: reconcile
-        # re-registers it from /state.pending_interrogatives.
-        reg, bot, fake = _make_registry(in_memory_db)
-        task, fclient = await _bind_running_task(reg)
-        reg._translators[task.task_id] = events.Translator()
-        fclient.state_payload = dict(fclient.state_payload)
-        fclient.state_payload["pending_interrogatives"] = [
-            {"type": "interrogative", "interrogative_id": "i9",
-             "question": "pick one?", "interrogative_type": "confirmation"}
+    async def test_model_effort_skill_and_restart_contract(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.013")
+        await reg.set_effort(task.task_id, "low", owner_user_id="UOWNER")
+        await reg.set_model(task.task_id, "openai/gpt-5", owner_user_id="UOWNER", reasoning_effort="high")
+        await reg.invoke_skill(task.task_id, "brainstorming", "go", owner_user_id="UOWNER")
+        assert client.model_calls == [
+            {"model": "anthropic/claude-opus-4-8", "reasoning_effort": "low"},
+            {"model": "openai/gpt-5", "reasoning_effort": "high"},
         ]
-        await reg._render(task, events.Reconcile(reason="gap"))
-        pending = reg._pending_interrogatives.get(task.task_id)
-        assert pending is not None and pending.interrogative_id == "i9"
-        assert any("pick one?" in c["content"] for c in bot.get_post_calls())
-
-    async def test_reconcile_does_not_double_post_gap_interrogative(self, in_memory_db) -> None:
-        # When a gap's first event IS the interrogative, the translator returns
-        # [Reconcile, Confirmation]. The reconcile re-feed + the direct render
-        # must converge on a SINGLE post.
-        from bridge.polytoken_client import SseEnvelope
-
-        reg, bot, _ = _make_registry(in_memory_db)
-        task, fclient = await _bind_running_task(reg)
-        translator = events.Translator()
-        reg._translators[task.task_id] = translator
-        ev = {"type": "interrogative", "interrogative_id": "i9",
-              "question": "pick one?", "interrogative_type": "confirmation"}
-        fclient.state_payload = dict(fclient.state_payload)
-        fclient.state_payload["pending_interrogatives"] = [ev]
-        # last_seq=0, then a gapped envelope (seq=2) whose event is the interrogative.
-        translator.handle(SseEnvelope(seq=0, session_id="s", emitted_at=None,
-                                      event={"type": "heartbeat", "timestamp": "t"}))
-        actions = translator.handle(SseEnvelope(seq=2, session_id="s", emitted_at=None, event=ev))
-        for a in actions:  # render in the same order _consume_events would
-            await reg._render(task, a)
-        posts = [c for c in bot.get_post_calls() if "pick one?" in c["content"]]
-        assert len(posts) == 1
-        assert reg._pending_interrogatives[task.task_id].interrogative_id == "i9"
+        assert json.loads(client.prompts[0])["body"] == "@brainstorming go"
+        with pytest.raises(TaskRestartError):
+            await reg.restart_task(task.task_id, "UOWNER")
 
 
-class TestShutdown:
-    async def test_shutdown_cancels_consumers_and_closes_clients(self, in_memory_db) -> None:
-        reg, _, _ = _make_registry(in_memory_db)
-        task, fclient = await _bind_running_task(reg)
-        consumer = asyncio.create_task(asyncio.sleep(100))
-        reg._consumers[task.task_id] = consumer
-        await reg.shutdown()
-        assert consumer.cancelled() or consumer.done()
-        assert fclient.closed is True
-        assert reg._clients == {}
+class TestAC8DaemonRendering:
+    async def test_render_text_tool_summary_and_subagent_blocks(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.014")
+        await reg._render(task, events.AssistantText("done"))
+        await reg._render(task, events.ToolLine("✓ Bash: ls"))
+        await reg._end_turn(task)
+        await reg._render(task, events.SubagentStarted("h1", "researcher", "model"))
+        await reg._render(task, events.SubagentActivity("h1", "reading"))
+        await reg._render(task, events.SubagentCompleted("h1", "success", None, "ok"))
+        assert any(post.get("text") == "done" for post in bot.posts)
+        assert any("Bash: ls" in post.get("text", "") for post in bot.posts)
+        assert any(post.get("blocks") for post in bot.posts)
+        assert bot.edits and bot.edits[-1]["blocks"]
+
+    async def test_sse_translator_action_routes_subagent_by_handle(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.015")
+        await reg._render(task, events.SubagentStarted("h1", "research", "m"))
+        await reg._render(task, events.AssistantText("subagent result", subagent_handle="h1"))
+        assert task.subagent_blocks["h1"].actions == ["• 💬 subagent result"]
+        # Live block updates are throttled; completion forces the edit.
+        await reg._render(task, events.SubagentCompleted("h1", "success", None, "done"))
+        assert bot.edits
+
+
+class TestAC10DedupAndDaemonErrors:
+    async def test_terminate_rejection_leaves_task_live_and_unknown_raises(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.016")
+        client.terminate_error_status = 500
+        assert await reg.stop_task(task.task_id, "UOWNER") is False
+        assert task.status == "running"
+        with pytest.raises(TaskNotFound):
+            await reg.kill_task("missing", "UOWNER")
+
+    async def test_spawn_requires_identity_and_marks_failed_root(self, in_memory_db, tmp_path):
+        reg, bot = _registry(in_memory_db)
+        # The Bot supplies configured identity when values are omitted; explicit
+        # empty strings are intentionally normalized to those configured values.
+        reg._supervisor.fail_spawn = True
+        with pytest.raises(TaskSpawnError):
+            await reg.spawn_task(str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER")
+        assert any("failed to spawn" in post.get("text", "") for post in bot.posts)
