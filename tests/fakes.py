@@ -316,6 +316,9 @@ class FakeSlackClient:
     async def chat_update(self, **kwargs: Any) -> Any:
         return await self._call("chat_update", **kwargs)
 
+    async def views_open(self, **kwargs: Any) -> Any:
+        return await self._call("views_open", **kwargs)
+
     async def chat_startStream(self, **kwargs: Any) -> Any:
         return await self._call("chat_startStream", **kwargs)
 

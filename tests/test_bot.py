@@ -162,6 +162,18 @@ class TestAC4WebApiAndRetry:
         assert call.kwargs == {"channel": "GTHREAD", "ts": "100.1", "limit": 100, "cursor": "cursor"}
 
     @pytest.mark.asyncio
+    async def test_production_adapter_opens_interactive_modal(self) -> None:
+        view = {"type": "modal", "callback_id": "bridge.configure", "title": {"type": "plain_text", "text": "Configure"}, "blocks": []}
+        client = FakeSlackClient(
+            script=_startup_script() + [("views_open", {"ok": True})],
+            expected_kwargs={"views_open": {"trigger_id": "TRIGGER-1", "view": view}},
+        )
+        bot = _ready_bot(client=client)
+        await bot.start()
+        await bot.open_modal("TRIGGER-1", view)
+        client.assert_complete()
+
+    @pytest.mark.asyncio
     async def test_socket_command_response_posts_ephemeral_to_verified_actor(self) -> None:
         client = FakeSlackClient(script=_startup_script() + [
             ("chat_postEphemeral", {"ok": True, "message_ts": "1.0"}),

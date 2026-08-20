@@ -685,6 +685,14 @@ class Bot:
             ids.append(self._message_id(response))
         return ids
 
+    async def open_modal(self, trigger_id: str, view: Mapping[str, Any]) -> Any:
+        """Open a Slack modal from a short-lived interactive trigger."""
+        self._require_ready()
+        trigger = str(trigger_id or "").strip()
+        if not trigger:
+            raise SlackAdapterError("Slack modal open omitted trigger_id")
+        return await self._api("views_open", trigger_id=trigger, view=dict(view))
+
     async def respond(self, payload: Mapping[str, Any], response: Any) -> Any:
         """Send a dispatcher response after a Socket Mode envelope was acked.
 
