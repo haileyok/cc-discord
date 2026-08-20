@@ -114,6 +114,8 @@ class TestAC1StartupAndHealth:
         assert "- message.groups" in manifest
         assert "- channels:history" in manifest
         assert "- groups:history" in manifest
+        assert "callback_id: start_agent_here" in manifest
+        assert "type: message" in manifest
 
     @pytest.mark.asyncio
     async def test_not_ready_guard(self) -> None:
@@ -145,6 +147,19 @@ class TestAC4WebApiAndRetry:
         with pytest.raises(SlackAdapterError):
             await _with_retry("test", non_retryable, sleeper=waits.append)
         assert waits == [7]
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_replies_uses_authenticated_retry_api(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("conversations_replies", {"ok": True, "messages": [{"ts": "1.0", "user": "UOWNER", "text": "hello"}], "has_more": True, "response_metadata": {"next_cursor": "next"}}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        page = await bot.fetch_thread_replies("GTHREAD", "100.1", cursor="cursor", limit=500)
+        assert page["messages"][0]["text"] == "hello"
+        call = client.calls[-1]
+        assert call.method == "conversations_replies"
+        assert call.kwargs == {"channel": "GTHREAD", "ts": "100.1", "limit": 100, "cursor": "cursor"}
 
     @pytest.mark.asyncio
     async def test_socket_command_response_posts_ephemeral_to_verified_actor(self) -> None:

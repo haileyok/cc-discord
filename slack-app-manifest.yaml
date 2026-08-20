@@ -16,6 +16,10 @@ features:
       type: global
       callback_id: agent
       description: Open claude-slack-bridge agent controls
+    - name: Start agent here
+      type: message
+      callback_id: start_agent_here
+      description: Start a Polytoken agent in the selected message thread
 settings:
   socket_mode_enabled: true
   interactivity:

@@ -121,6 +121,8 @@ class FakeBot:
     downloads: list[dict[str, Any]] = field(default_factory=list)
     reactions: list[dict[str, Any]] = field(default_factory=list)
     deletions: list[dict[str, Any]] = field(default_factory=list)
+    thread_pages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    thread_calls: list[dict[str, Any]] = field(default_factory=list)
     fail_invite: bool = False
     fail_root: bool = False
     _message_seq: int = 0
@@ -165,6 +167,10 @@ class FakeBot:
     async def download_file(self, url: str, path: Path, max_bytes: int):
         self.downloads.append({"url": url, "path": path, "max_bytes": max_bytes})
         path.write_bytes(b"downloaded")
+
+    async def fetch_thread_replies(self, channel_id: str, root_ts: str, *, cursor=None, limit=100):
+        self.thread_calls.append({"channel_id": channel_id, "root_ts": root_ts, "cursor": cursor, "limit": limit})
+        return self.thread_pages.get(str(cursor or ""), {"messages": [], "has_more": False})
 
     async def add_reaction(self, channel_id: str, message_ts: str, name: str):
         self.reactions.append({"channel_id": channel_id, "message_ts": message_ts, "name": name})
@@ -416,6 +422,18 @@ class TestAC2IdentityRouting:
         assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", "other-root", SlackActor("UOWNER"), "unknown", "E2", "M2"))
         assert client.prompts == []
 
+    async def test_existing_thread_requires_exact_mention_before_auth_or_files(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.004b")
+        task.mention_required = True
+        attachment = SlackFile("https://files.invalid/a", "a.png", 10, "image/png")
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "ordinary chatter", "E1", "M1", (attachment,)))
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "@bridge hello", "E2", "M2"))
+        assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE|bridge> spoof", "E3", "M3"))
+        assert bot.downloads == []
+        assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE> verified", "E4", "M4", (attachment,)))
+        assert json.loads(client.prompts[0])["body"] == "verified @" + str(bot.downloads[0]["path"])
+
 
 class TestAC4AttachmentsAndInterrogatives:
     async def test_authenticated_bounded_attachment_becomes_reference(self, in_memory_db):
@@ -653,6 +671,7 @@ class TestAC8DaemonRendering:
         await reg._render(task, events.SubagentStarted("h1", "researcher", "model"))
         await reg._render(task, events.SubagentActivity("h1", "reading"))
         await reg._render(task, events.SubagentCompleted("h1", "success", None, "ok"))
+        assert task.subagent_blocks["h1"].result_summary == "ok"
         assert any(post.get("text") == "done" for post in bot.posts)
         assert any("Bash: ls" in post.get("text", "") for post in bot.posts)
         assert any(post.get("blocks") for post in bot.posts)
@@ -687,3 +706,56 @@ class TestAC10DedupAndDaemonErrors:
         with pytest.raises(TaskSpawnError):
             await reg.spawn_task(str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER")
         assert any("failed to spawn" in post.get("text", "") for post in bot.posts)
+
+
+@pytest.mark.asyncio
+async def test_existing_root_fetches_paginated_history_once_with_order_files_and_duplicate_guard(in_memory_db, tmp_path):
+    reg, bot = _registry(in_memory_db)
+    bot.thread_pages = {
+        "": {"messages": [
+            {"ts": "3.000", "user": "UOTHER", "text": "newest", "files": [{"name": "unsupported.bin"}]},
+            {"ts": "1.000", "user": "UOWNER", "text": "old", "files": [{"url_private_download": "https://files.invalid/p", "name": "picture.png", "size": 12, "mimetype": "image/png"}]},
+            {"ts": "2.000", "bot_id": "B-BRIDGE", "text": "bridge controls"},
+        ], "has_more": True, "response_metadata": {"next_cursor": "page-2"}},
+        "page-2": {"messages": [
+            {"ts": "3.000", "user": "UOTHER", "text": "duplicate newest"},
+            {"ts": "4.000", "user": "UOTHER", "text": "oversize", "files": [{"url_private_download": "https://files.invalid/huge", "name": "huge.jpg", "size": 11 * 1024 * 1024}]},
+        ], "has_more": False},
+    }
+    prompts: list[str] = []
+
+    async def capture(_task, content, **_kwargs):
+        prompts.append(content)
+        return True
+
+    reg._prompt = capture  # type: ignore[method-assign]
+    task = await reg.spawn_task(
+        str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER",
+        root_ts="root.1", prompt="do the work", bind_existing_root=True,
+    )
+    assert task.mention_required is True
+    runtime = await state.get_runtime(in_memory_db, task.task_id)
+    assert runtime is not None and runtime.mention_required is True
+    restored_reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    await restored_reg.load_from_db()
+    assert restored_reg.get_by_task_id(task.task_id).mention_required is True
+    assert [call["cursor"] for call in bot.thread_calls] == [None, "page-2"]
+    assert len(prompts) == 1
+    body = prompts[0]
+    assert body.index('"body":"old') < body.index('"body":"newest')
+    assert "duplicate newest" not in body and "bridge controls" not in body
+    assert "@" in body and "picture.png" in body
+    assert "unsupported" in body and "per-file size limit" in body
+    assert "[initial user prompt]" in body and "do the work" in body
+    panel = next(post for post in bot.posts if post.get("root_ts") == "root.1" and post.get("blocks"))
+    assert panel["blocks"] and not bot.edits
+    with pytest.raises(TaskRoutingError):
+        await reg.spawn_task(
+            str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER",
+            root_ts="root.1", bind_existing_root=True,
+        )
+    normal_reg, normal_bot = _registry(in_memory_db)
+    await normal_reg.spawn_task(str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER")
+    assert normal_bot.roots and normal_bot.roots[-1]["channel_id"] == "CHOME"
+    root_actions = [element for block in normal_bot.roots[-1]["blocks"] for element in block["elements"]]
+    assert any(item["action_id"] == "task.configure" for item in root_actions)

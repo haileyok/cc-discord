@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,13 @@ class LocalBot:
     edits: list[dict[str, Any]] = field(default_factory=list)
     roots: list[dict[str, Any]] = field(default_factory=list)
     interactions: list[Any] = field(default_factory=list)
+    modal_calls: list[dict[str, Any]] = field(default_factory=list)
 
     async def edit_message(self, channel_id: str, message_ts: str, **kwargs: Any) -> None:
         self.edits.append({"channel_id": channel_id, "message_ts": message_ts, **kwargs})
+
+    async def views_open(self, **kwargs: Any) -> None:
+        self.modal_calls.append(dict(kwargs))
 
 
 @dataclass
@@ -44,6 +49,7 @@ class LocalTask:
     cwd: str = "/tmp/project"
     status: str = "running"
     last_activity: int = 1
+    subagent_blocks: dict[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> ConversationKey:
@@ -55,8 +61,17 @@ class LocalRegistry:
         self.task = task or LocalTask()
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.participants: list[str] = []
-        self.state = {"active_model": "model-a", "active_facet": "execute", "todos": []}
+        self.state = {
+            "active_model": "model-a", "active_reasoning_effort": "medium",
+            "active_facet": "execute", "available_skills": ["brainstorming", "code-review"],
+            "todos": [],
+        }
+        self.models = ["model-a", "model-b"]
         self.pending = None
+
+    async def list_models(self, owner_user_id: str | None = None) -> list[str]:
+        self.calls.append(("list_models", (owner_user_id,), {}))
+        return list(self.models)
 
     def get_by_task_id(self, task_id: str) -> LocalTask | None:
         return self.task if task_id == self.task.task_id else None
@@ -227,3 +242,104 @@ async def test_interrogative_block_action_answers_targeted_question() -> None:
     response = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "interrogative_id": "I1", "actions": [{"action_id": "interrogative.answer", "value": "yes"}]})
     assert "Answer sent" in response.text
     assert any(name == "answer" for name, _, _ in registry.calls)
+
+
+@pytest.mark.asyncio
+async def test_configure_button_resolves_exact_task_and_opens_views_modal() -> None:
+    registry = LocalRegistry()
+    bot = LocalBot()
+    dispatcher = CommandDispatcher(bot, registry)
+    response = await dispatcher.dispatch({
+        "type": "block_actions", "team_id": "T1", "user_id": "UOWNER",
+        "channel_id": "GHOME", "message": {"ts": "100.1"}, "trigger_id": "TR-CONFIG",
+        "actions": [{"action_id": "task.configure", "value": "task-12345678"}],
+    })
+    assert response.modal and response.modal["callback_id"] == "bridge.configure"
+    assert bot.modal_calls == [{"trigger_id": "TR-CONFIG", "view": response.modal}]
+    assert ("get_state", ("task-12345678", "UOWNER"), {}) in registry.calls
+    assert ("list_models", ("UOWNER",), {}) in registry.calls
+    metadata = json.loads(response.modal["private_metadata"])
+    assert metadata["task_id"] == "task-12345678"
+    model = next(block["element"] for block in response.modal["blocks"] if block["block_id"] == "configure_model")
+    assert model["type"] == "static_select"
+    assert model["initial_option"] in model["options"]
+    assert len(model["options"]) <= 100
+
+
+@pytest.mark.asyncio
+async def test_configure_submission_applies_only_changed_settings_and_auth() -> None:
+    registry = LocalRegistry()
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    metadata = json.dumps({
+        "task_id": "task-12345678", "current_model": "model-a", "current_effort": "medium",
+        "current_facet": "execute", "current_skill": "",
+    })
+    values = {
+        "configure_model": {"model": {"action_id": "model", "selected_option": {"value": "model-b"}}},
+        "configure_effort": {"effort": {"action_id": "effort", "selected_option": {"value": "high"}}},
+        "configure_facet": {"facet": {"action_id": "facet", "value": "plan"}},
+        "configure_skill": {"skill": {"action_id": "skill", "selected_option": {"value": "brainstorming"}}},
+    }
+    response = await dispatcher.dispatch({
+        "type": "view_submission", "team_id": "T1", "user_id": "UOWNER",
+        "view": {"callback_id": "bridge.configure", "private_metadata": metadata, "state": {"values": values}},
+    })
+    assert "model, facet, skill" in response.text
+    assert ("set_model", ("task-12345678", "model-b"), {"owner_user_id": "UOWNER", "reasoning_effort": "high"}) in registry.calls
+    assert not any(name == "set_effort" for name, _, _ in registry.calls)
+    assert ("set_facet", ("task-12345678", "plan"), {"owner_user_id": "UOWNER"}) in registry.calls
+    assert ("invoke_skill", ("task-12345678", "brainstorming"), {"owner_user_id": "UOWNER"}) in registry.calls
+
+    denied = await dispatcher.dispatch({
+        "type": "view_submission", "team_id": "T1", "user_id": "UOTHER",
+        "view": {"callback_id": "bridge.configure", "private_metadata": metadata, "state": {"values": values}},
+    })
+    assert denied.ephemeral and "not allowed" in denied.text.lower()
+    assert len([name for name, _, _ in registry.calls if name in {"set_model", "set_facet", "invoke_skill"}]) == 3
+
+
+@pytest.mark.asyncio
+async def test_activity_button_is_owner_only_and_retains_completion_summary() -> None:
+    registry = LocalRegistry()
+    registry.task.subagent_blocks["h1"] = type("Block", (), {
+        "handle": "h1", "attribution": "researcher", "started_at": 1.0,
+        "finished_at": 4.0, "actions": ["read file", "ran tests"], "result_summary": "done",
+    })()
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    response = await dispatcher.dispatch({
+        "type": "block_actions", "team_id": "T1", "user_id": "UOWNER",
+        "channel_id": "GHOME", "message": {"ts": "100.1"},
+        "actions": [{"action_id": "task.activity", "value": "task-12345678"}],
+    })
+    assert "completed" in response.text and "2 actions" in response.text
+    assert "ran tests" in response.text and "result: done" in response.text
+    denied = await dispatcher.dispatch({
+        "type": "block_actions", "team_id": "T1", "user_id": "UOTHER",
+        "channel_id": "GHOME", "message": {"ts": "100.1"},
+        "actions": [{"action_id": "task.activity", "value": "task-12345678"}],
+    })
+    assert denied.ephemeral and "not allowed" in denied.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_start_agent_here_shortcut_binds_selected_thread_without_editing_root(tmp_path: Path) -> None:
+    registry = LocalRegistry()
+    bot = LocalBot()
+    dispatcher = CommandDispatcher(bot, registry)
+    shortcut = await dispatcher.dispatch({
+        "type": "message_action", "callback_id": "start_agent_here", "trigger_id": "TR-HERE",
+        "team": {"id": "T1"}, "user": {"id": "UOWNER"}, "channel": {"id": "GHOME"},
+        "message": {"ts": "200.2", "thread_ts": "100.1", "text": "human root"},
+    })
+    assert shortcut.modal and shortcut.modal["callback_id"] == "bridge.start_agent_here"
+    assert json.loads(shortcut.modal["private_metadata"]) == {"team_id": "T1", "channel_id": "GHOME", "root_ts": "100.1"}
+    submitted = await dispatcher.dispatch({
+        "type": "view_submission", "team_id": "T1", "user_id": "UOWNER",
+        "view": {"callback_id": "bridge.start_agent_here", "private_metadata": shortcut.modal["private_metadata"],
+                 "state": {"values": {"start_here_cwd": {"cwd": {"action_id": "cwd", "value": str(tmp_path)}}}}},
+    })
+    assert "Started" in submitted.text
+    call = next(call for call in registry.calls if call[0] == "spawn_task")
+    assert call[1] == (str(tmp_path),)
+    assert call[2]["root_ts"] == "100.1" and call[2]["bind_existing_root"] is True
+    assert not bot.edits

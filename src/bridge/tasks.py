@@ -18,7 +18,7 @@ import re
 import shutil
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 
@@ -114,6 +114,9 @@ ATTACHMENT_TTL_SECS = int(os.environ.get("BRIDGE_ATTACHMENT_TTL_SECS", str(7 * 8
 MAX_ATTACHMENT_BYTES = int(os.environ.get("BRIDGE_MAX_ATTACHMENT_BYTES", str(10 * 1024 * 1024)))
 MAX_ATTACHMENTS_PER_MESSAGE = int(os.environ.get("BRIDGE_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
 MAX_ATTACHMENT_AGGREGATE_BYTES = int(os.environ.get("BRIDGE_MAX_ATTACHMENT_AGGREGATE_BYTES", str(50 * 1024 * 1024)))
+MAX_HISTORICAL_MESSAGES = int(os.environ.get("BRIDGE_MAX_HISTORICAL_MESSAGES", "200"))
+MAX_HISTORICAL_CONTEXT_CHARS = int(os.environ.get("BRIDGE_MAX_HISTORICAL_CONTEXT_CHARS", "24000"))
+MAX_HISTORICAL_ATTACHMENTS = int(os.environ.get("BRIDGE_MAX_HISTORICAL_ATTACHMENTS", "20"))
 PROVENANCE_VERSION = 1
 SUBAGENT_BLOCK_MAX_ACTIONS = 5
 SUBAGENT_EDIT_THROTTLE_SECS = 1.5
@@ -220,6 +223,8 @@ class SubagentBlock:
     finished_at: float | None = None
     last_edit_at: float = 0.0
     actions: list[str] = field(default_factory=list)
+    # Runtime-only completion detail used by the task-root Activity control.
+    result_summary: str | None = None
 
 
 @dataclass
@@ -260,6 +265,8 @@ class Task:
     progress_started: bool = False
     progress_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
+    # Existing-thread tasks require an explicit verified bot mention to route.
+    mention_required: bool = False
 
     @property
     def key(self) -> ConversationKey:
@@ -365,6 +372,16 @@ def normalize_message(value: Any) -> SlackMessage:
         message_ts=str(message_ts) if message_ts is not None else None,
         files=tuple(_file(item) for item in files),
     )
+
+
+def _strip_verified_mention(text: str, bot_user_id: str | None) -> str | None:
+    """Strip only Slack's exact user mention; display-name text never qualifies."""
+    if not bot_user_id:
+        return None
+    token = re.compile(rf"(?<!\S)<@{re.escape(str(bot_user_id))}>(?!\S)")
+    if token.search(str(text)) is None:
+        return None
+    return token.sub("", str(text)).strip()
 
 
 def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
@@ -474,6 +491,7 @@ class TaskRegistry:
         # external app's stable B... identity separate: it is a participant,
         # not the bridge itself.
         self.app_actor_id = getattr(bot, "bot_user_id", None) or app_actor_id
+        self._bridge_user_id = getattr(bot, "bot_user_id", None)
         self._bridge_bot_id = getattr(bot, "bot_id", None)
         self._daemon_presence_known = False
         self._known_daemon_sessions: set[str] = set()
@@ -500,6 +518,7 @@ class TaskRegistry:
     def bind_bot(self, bot: "Bot") -> None:
         self._bot = bot
         self.app_actor_id = getattr(bot, "bot_user_id", None) or self.app_actor_id
+        self._bridge_user_id = getattr(bot, "bot_user_id", None) or self._bridge_user_id
         self._bridge_bot_id = getattr(bot, "bot_id", None)
         self.home_channel_id = self.home_channel_id or getattr(bot, "home_channel_id", None)
 
@@ -555,7 +574,7 @@ class TaskRegistry:
             app_exchange_budget=task.app_exchange_budget, app_exchanges=task.app_exchanges,
             owner_alerted=task.owner_alerted, promotion_state=task.promotion_state,
             binding_id=task.binding_id, cleanup_pending=task.cleanup_pending,
-            channel_owned=task.channel_owned,
+            channel_owned=task.channel_owned, mention_required=task.mention_required,
         )
 
     async def _persist_root(self, task: Task, *, now: int | None = None) -> None:
@@ -599,13 +618,13 @@ class TaskRegistry:
                 if runtime.session_id and info is None and status in {"spawning", "running", "paused", "rebinding"}:
                     status = "crashed"
                     await update_runtime(self._conn, runtime.task_id, status=status, promotion_state="failed", now=int(time.time()))
-                    self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=None), "💥 The session daemon was not found; task is crashed."))
+                    self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=None, mention_required=runtime.mention_required), "💥 The session daemon was not found; task is crashed."))
                 elif info is not None:
                     credential_file_path = getattr(info, "credential_file_path", None)
                     if runtime.port != info.port or runtime.cwd != info.project_path:
                         await update_runtime(self._conn, runtime.task_id, port=info.port, cwd=info.project_path)
-                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned)
-            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path)
+                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, runtime.mention_required)
+            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path, mention_required=runtime.mention_required)
             if task.channel_owned and self._bot is not None:
                 remember = getattr(self._bot, "remember_owned_channel", None)
                 if callable(remember):
@@ -1086,6 +1105,7 @@ class TaskRegistry:
         if block is None:
             return
         block.finished_at = time.time()
+        block.result_summary = action.result_summary
         if action.result_summary:
             block.actions.append(f"• ✅ {action.result_summary[:140]}")
         await self._maybe_edit_subagent(task, block, True, force=True)
@@ -1209,6 +1229,7 @@ class TaskRegistry:
         root_ts: str | None = None,
         prompt: str | None = None,
         participants: list[str] | None = None,
+        bind_existing_root: bool = False,
     ) -> Task:
         if not Path(cwd).is_dir():
             raise TaskSpawnError(f"cwd does not exist: {cwd}")
@@ -1221,13 +1242,28 @@ class TaskRegistry:
         mode = str(mode).strip().lower()
         if mode not in {"personal", "collaborative"}:
             raise TaskSpawnError("mode must be personal or collaborative")
+        if bind_existing_root:
+            root_ts = str(root_ts or "").strip()
+            if not root_ts:
+                raise TaskRoutingError("existing-root tasks require the selected message timestamp")
+            existing = self.get_by_conversation(team_id, channel_id, root_ts)
+            if existing is not None and existing.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
+                raise TaskRoutingError("that Slack thread already has an active task")
         task_id = str(uuid.uuid4())
         created = int(time.time())
         if root_ts is None:
-            roots = await bot.create_task_root(channel_id, f"Starting `{Path(cwd).name}`…")
+            from bridge.commands import build_task_root_blocks
+            roots = await bot.create_task_root(
+                channel_id, f"Starting `{Path(cwd).name}`…",
+                blocks=build_task_root_blocks(task_id, mode=mode),
+            )
             root_ts = str(roots)
         channel_owned = bool(mode == "collaborative" and channel_id != self.home_channel_id and channel_id in getattr(bot, "_owned_channel_ids", set()))
-        task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned)
+        task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned, mention_required=bind_existing_root)
+        if bind_existing_root:
+            # Reserve the exact key synchronously before the first await so two
+            # simultaneous message-shortcut submissions cannot both bind it.
+            self._by_key[task.key] = task
         await self.attach_task(task)
         try:
             result = await self._supervisor.spawn(cwd)
@@ -1262,8 +1298,28 @@ class TaskRegistry:
         self._start_consumer(task)
         if participants and mode == "collaborative":
             await self._invite_then_persist(task, participants)
-        if prompt:
-            await self._prompt(task, prompt)
+        if bind_existing_root:
+            # The selected message belongs to a human.  Keep it untouched and
+            # make the task controls a bot-authored reply in its thread.
+            from bridge.commands import build_task_root_blocks
+            await self._post(
+                task,
+                f"🤖 *Agent task* `{task.task_id[:8]}` · `{Path(task.cwd).name}`\n"
+                "Reply in this thread to work with the agent.",
+                blocks=build_task_root_blocks(task.task_id, mode=task.mode),
+            )
+        initial_body = prompt
+        if bind_existing_root:
+            try:
+                history = await self._historical_context(task)
+            except Exception:
+                # A malformed history item must not invalidate a live daemon
+                # binding; keep the failure explicit in the one initial prompt.
+                log.warning("historical Slack context assembly failed")
+                history = "[historical Slack context unavailable: malformed thread data]"
+            initial_body = history + (f"\n\n[initial user prompt]\n{prompt}" if prompt else "")
+        if initial_body:
+            await self._prompt(task, initial_body)
         return task
 
     async def write_initial_prompt(self, task_id: str, prompt: str, owner_user_id: str | SlackActor | None = None) -> None:
@@ -1302,6 +1358,13 @@ class TaskRegistry:
             return False
         if task.status not in {"running", "spawning"}:
             return True
+        if task.mention_required:
+            cleaned = _strip_verified_mention(msg.text, self._bridge_user_id)
+            if cleaned is None:
+                # Existing human threads are opt-in: attachments alone and
+                # display-name lookalikes must never reach the daemon.
+                return False
+            msg = replace(msg, text=cleaned)
         if msg.actor.is_app and (
             (self.app_actor_id and msg.actor_id == str(self.app_actor_id))
             or (self._bridge_bot_id and msg.actor_id == str(self._bridge_bot_id))
@@ -1395,34 +1458,161 @@ class TaskRegistry:
             await self._post(task, f"⚠ Couldn't deliver the message to the daemon: {safe_error(exc, 'delivery failed')}.")
         return False
 
-    async def _save_attachments(self, task: Task, msg: SlackMessage) -> list[Path]:
+    async def _save_attachments_detailed(
+        self,
+        task: Task,
+        msg: SlackMessage,
+        *,
+        aggregate_used: int = 0,
+        count_used: int = 0,
+        count_limit: int = MAX_ATTACHMENTS_PER_MESSAGE,
+    ) -> tuple[list[Path], list[str], int, int]:
+        """Download bounded files and return paths plus user-visible context notices.
+
+        Notice strings intentionally contain only provider metadata (never file
+        contents or URLs), so a partial/unsafe history never becomes silent.
+        """
         if not msg.files:
-            return []
+            return [], [], aggregate_used, count_used
         directory = ATTACHMENTS_DIR / task.task_id
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         with contextlib.suppress(OSError):
             directory.chmod(0o700)
         saved: list[Path] = []
-        aggregate = 0
+        notices: list[str] = []
+        aggregate = aggregate_used
+        count = count_used
         for index, attachment in enumerate(msg.files[:MAX_ATTACHMENTS_PER_MESSAGE]):
-            declared = int(attachment.size or 0)
-            if aggregate + declared > MAX_ATTACHMENT_AGGREGATE_BYTES:
-                break
-            if not attachment.url or (attachment.size is not None and int(attachment.size) > MAX_ATTACHMENT_BYTES):
-                continue
             name = Path(attachment.filename).name or f"attachment-{index}"
+            if count >= count_limit:
+                notices.append(f"[attachment {name}: skipped (history file-count limit)]")
+                continue
+            try:
+                declared = int(attachment.size or 0)
+            except (TypeError, ValueError):
+                notices.append(f"[attachment {name}: unsupported size metadata]")
+                continue
+            if aggregate + declared > MAX_ATTACHMENT_AGGREGATE_BYTES:
+                notices.append(f"[attachment {name}: skipped (aggregate size limit)]")
+                continue
+            if not attachment.url:
+                notices.append(f"[attachment {name}: unsupported (no authenticated download)]")
+                continue
+            if attachment.size is not None and (declared < 0 or declared > MAX_ATTACHMENT_BYTES):
+                notices.append(f"[attachment {name}: skipped (per-file size limit)]")
+                continue
             destination = directory / f"{msg.message_ts or int(time.time() * 1000)}-{index}-{name}"
             try:
                 await self._require_bot().download_file(attachment.url, destination, MAX_ATTACHMENT_BYTES)
                 size = destination.stat().st_size
-                if size > MAX_ATTACHMENT_BYTES or aggregate + size > MAX_ATTACHMENT_AGGREGATE_BYTES:
+                if size > MAX_ATTACHMENT_BYTES:
                     destination.unlink(missing_ok=True)
+                    notices.append(f"[attachment {name}: skipped (download exceeded per-file size limit)]")
+                    continue
+                if aggregate + size > MAX_ATTACHMENT_AGGREGATE_BYTES:
+                    destination.unlink(missing_ok=True)
+                    notices.append(f"[attachment {name}: skipped (aggregate size limit)]")
                     continue
                 aggregate += size
+                count += 1
                 saved.append(destination)
             except Exception:
-                log.warning("failed to download Slack attachment")
+                with contextlib.suppress(OSError):
+                    destination.unlink()
+                notices.append(f"[attachment {name}: failed to download]")
+        if len(msg.files) > MAX_ATTACHMENTS_PER_MESSAGE:
+            notices.append("[attachments: additional files omitted (per-message count limit)]")
+        return saved, notices, aggregate, count
+
+    async def _save_attachments(self, task: Task, msg: SlackMessage) -> list[Path]:
+        saved, _notices, _aggregate, _count = await self._save_attachments_detailed(task, msg)
         return saved
+
+    @staticmethod
+    def _history_sort_key(message: Mapping[str, Any]) -> tuple[float, str]:
+        raw = str(message.get("ts") or message.get("message_ts") or "")
+        try:
+            return float(raw), raw
+        except ValueError:
+            return float("inf"), raw
+
+    async def _historical_context(self, task: Task) -> str:
+        """Fetch one bounded, oldest-first context snapshot for an existing root."""
+        fetcher = getattr(self._require_bot(), "fetch_thread_replies", None)
+        if not callable(fetcher):
+            return "[historical Slack context unavailable: thread history adapter is not configured]"
+        messages: list[Mapping[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        notices: list[str] = []
+        for _page in range(100):
+            try:
+                result = fetcher(task.channel_id, task.root_ts, cursor=cursor, limit=100)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception:
+                notices.append("[historical Slack context unavailable: thread history fetch failed]")
+                break
+            page = result if isinstance(result, Mapping) else {"messages": result}
+            raw_messages = page.get("messages") or []
+            if isinstance(raw_messages, list):
+                messages.extend(item for item in raw_messages if isinstance(item, Mapping))
+            metadata = page.get("response_metadata") or {}
+            next_cursor = str(page.get("next_cursor") or (metadata.get("next_cursor") if isinstance(metadata, Mapping) else "") or "").strip()
+            has_more = bool(page.get("has_more"))
+            if not has_more and not next_cursor:
+                break
+            if not next_cursor or next_cursor in seen_cursors:
+                notices.append("[historical Slack context truncated: pagination cursor was invalid]")
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            notices.append("[historical Slack context truncated: page limit]")
+
+        unique: dict[str, Mapping[str, Any]] = {}
+        for index, message in enumerate(messages):
+            stable_id = str(message.get("ts") or message.get("message_ts") or message.get("event_id") or message.get("client_msg_id") or f"index-{index}")
+            unique.setdefault(stable_id, message)
+        ordered = sorted(unique.values(), key=self._history_sort_key)
+        lines = ["[historical Slack context: oldest to newest]"]
+        aggregate = 0
+        file_count = 0
+        for message in ordered[:MAX_HISTORICAL_MESSAGES]:
+            source = dict(message)
+            source.setdefault("team_id", task.team_id)
+            source.setdefault("channel_id", task.channel_id)
+            source.setdefault("root_ts", task.root_ts)
+            normalized = normalize_message(source)
+            actor_id = normalized.actor_id
+            if actor_id in {str(self._bridge_user_id or ""), str(self._bridge_bot_id or ""), str(self.app_actor_id or "")}:
+                continue
+            paths, file_notices, aggregate, file_count = await self._save_attachments_detailed(
+                task, normalized, aggregate_used=aggregate, count_used=file_count,
+                count_limit=MAX_HISTORICAL_ATTACHMENTS,
+            )
+            body_parts = [normalized.text.strip()] if normalized.text.strip() else []
+            body_parts.extend(f"@{path}" for path in paths)
+            body_parts.extend(file_notices)
+            body = " ".join(body_parts).strip() or "[message had no text or supported files]"
+            provenance = MessageProvenance(
+                normalized.team_id, normalized.channel_id, normalized.root_ts,
+                normalized.message_ts, normalized.event_id, normalized.actor_id,
+                "app" if normalized.actor.is_app else "human",
+            )
+            record = provenance.wire(body)
+            if sum(len(line) + 1 for line in lines) + len(record) > MAX_HISTORICAL_CONTEXT_CHARS:
+                notices.append("[historical Slack context truncated: text limit]")
+                break
+            lines.append(record)
+        if len(ordered) > MAX_HISTORICAL_MESSAGES:
+            notices.append("[historical Slack context truncated: message-count limit]")
+        lines.extend(notices)
+        context = "\n".join(lines)
+        if len(context) > MAX_HISTORICAL_CONTEXT_CHARS:
+            marker = "[historical Slack context truncated: text limit]"
+            context = context[:max(0, MAX_HISTORICAL_CONTEXT_CHARS - len(marker) - 1)].rstrip() + "\n" + marker
+        return context
 
     # -- participants / promotion -----------------------------------------
 
@@ -1533,6 +1723,9 @@ class TaskRegistry:
             await update_promotion_journal(self._conn, journal_id, new_root_id=new_root, new_binding_id=binding_id, state="cleanup_pending", side_effect="rebind_db", side_effect_state="pending")
             new_key = ConversationKey(task.team_id, new_channel, new_root)
             task.channel_id, task.root_ts, task.mode = new_channel, new_root, "collaborative"
+            # Promotion creates a bridge-owned root, so the opt-in mention gate
+            # applies only to the original arbitrary thread.
+            task.mention_required = False
             task.status = "running"
             task.promotion_state = "active"
             task.binding_id = binding_id
@@ -1881,5 +2074,5 @@ class TaskRegistry:
 __all__ = [
     "Actor", "File", "Message", "MessageProvenance", "PromptEnvelope", "SlackActor", "SlackFile", "SlackMessage",
     "Task", "TaskNotFound", "TaskPrivilegeError", "TaskRegistry", "TaskRestartError", "TaskRoutingError", "TaskSpawnError",
-    "ATTACHMENTS_DIR", "BRIDGE_STATE_DIR", "MAX_ATTACHMENT_BYTES", "MAX_ATTACHMENTS_PER_MESSAGE", "MAX_ATTACHMENT_AGGREGATE_BYTES", "PROVENANCE_VERSION", "normalize_message", "sweep_old_attachments",
+    "ATTACHMENTS_DIR", "BRIDGE_STATE_DIR", "MAX_ATTACHMENT_BYTES", "MAX_ATTACHMENTS_PER_MESSAGE", "MAX_ATTACHMENT_AGGREGATE_BYTES", "MAX_HISTORICAL_MESSAGES", "MAX_HISTORICAL_CONTEXT_CHARS", "MAX_HISTORICAL_ATTACHMENTS", "PROVENANCE_VERSION", "normalize_message", "sweep_old_attachments",
 ]

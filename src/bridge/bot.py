@@ -1077,6 +1077,25 @@ class Bot:
             raise SlackAdapterError("Slack root post returned no timestamp")
         return result[0]
 
+    async def fetch_thread_replies(self, channel_id: str, root_ts: str, *,
+                                   cursor: str | None = None, limit: int = 100) -> Mapping[str, Any]:
+        """Fetch one authenticated page of a thread through the retrying API path."""
+        if not channel_id or not root_ts:
+            raise ValueError("channel_id and root_ts are required")
+        kwargs: dict[str, Any] = {
+            "channel": str(channel_id), "ts": str(root_ts),
+            "limit": max(1, min(int(limit), 100)),
+        }
+        if cursor:
+            kwargs["cursor"] = str(cursor)
+        result = await self._api("conversations_replies", **kwargs)
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("conversations.replies returned malformed data")
+
     async def create_channel(self, name: str, *, private: bool = True,
                              invite_user_id: str | None = None) -> str:
         self._require_ready()

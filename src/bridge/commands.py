@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import shlex
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -170,6 +171,54 @@ def _text_field(values: Mapping[str, Any], *names: str) -> str:
     return ""
 
 
+def _plain_text(value: Any, limit: int = 75) -> str:
+    """Return text safe for Slack's option/button text limits."""
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _static_options(values: Any, current: str = "") -> list[dict[str, Any]]:
+    """Build at most 100 unique Slack select options, retaining the initial value."""
+    raw_values: list[Any] = []
+    if isinstance(values, (list, tuple)):
+        raw_values.extend(values)
+    if current and current not in raw_values:
+        raw_values.insert(0, current)
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        if isinstance(raw, Mapping):
+            value = str(raw.get("value") or raw.get("name") or raw.get("id") or "").strip()
+            label = raw.get("text") or raw.get("label") or value
+            if isinstance(label, Mapping):
+                label = label.get("text") or label.get("value") or value
+        else:
+            value = str(raw or "").strip()
+            label = value
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        options.append({"text": {"type": "plain_text", "text": _plain_text(label)}, "value": value[:2000]})
+        if len(options) >= 100:
+            break
+    return options
+
+
+def _select_element(action_id: str, options: list[dict[str, Any]], current: str, *, placeholder: str) -> dict[str, Any]:
+    element: dict[str, Any] = {
+        "type": "static_select",
+        "action_id": action_id,
+        "options": options,
+        "placeholder": {"type": "plain_text", "text": _plain_text(placeholder)},
+    }
+    initial = next((option for option in options if option.get("value") == current), None)
+    if initial is not None:
+        # Slack requires initial_option to be one of options, not merely equal
+        # by value.  Reuse the exact object to keep that invariant obvious.
+        element["initial_option"] = initial
+    return element
+
+
 def build_task_root_blocks(task_id: str, *, mode: str = "personal") -> list[dict[str, Any]]:
     """Return stable Block Kit controls for a task's root message."""
     value = str(task_id)
@@ -183,9 +232,14 @@ def build_task_root_blocks(task_id: str, *, mode: str = "personal") -> list[dict
     second = [
         ("task.participants", "Participants", None),
         ("task.promote", "Promote", None),
+        ("task.title", "Title", None),
+        ("task.configure", "Configure", None),
+        ("task.activity", "Activity", None),
     ] if mode != "collaborative" else [
         ("task.participants", "Participants", None),
         ("task.title", "Title", None),
+        ("task.configure", "Configure", None),
+        ("task.activity", "Activity", None),
     ]
 
     def button(action_id: str, text: str, style: str | None) -> dict[str, Any]:
@@ -263,7 +317,7 @@ class CommandDispatcher:
         try:
             if kind in {"slash_commands", "slash_command", "command"}:
                 return await self._slash(payload)
-            if kind in {"interactive", "block_actions", "view_submission", "shortcut", "shortcuts"}:
+            if kind in {"interactive", "block_actions", "view_submission", "shortcut", "shortcuts", "message_action"}:
                 return await self._interactive(payload)
             if kind in {"events", "event_callback", "message"} or isinstance(payload.get("event"), Mapping):
                 return await self._event(payload)
@@ -492,15 +546,31 @@ class CommandDispatcher:
             return await self._reply(payload, f"🤝 Promoted `{promoted.task_id[:8]}` to collaborative mode in <#{promoted.channel_id}>.")
         if operation == "participants":
             return await self._open_participants_modal(payload, task)
+        if operation == "configure":
+            state = await self.registry.get_state(task.task_id, actor)
+            if not state:
+                return await self._error(payload, "Could not reach the task daemon; try again shortly.")
+            models = await self.registry.list_models(actor)
+            return await self._open_modal(payload, _configure_modal(task, state, models))
+        if operation in {"activity", "subagents"}:
+            return await self._reply(payload, _format_subagent_activity(task))
         if operation == "title":
             return await self._reply(payload, "Use `/agent title name=<new title>` to rename this task.")
         return await self._error(payload, "Unknown task control. Refresh the task root.")
 
     async def _shortcut(self, payload: Mapping[str, Any]) -> SlackResponse:
         callback = str(payload.get("callback_id") or payload.get("callback") or "agent")
+        actor = _actor_id(payload)
+        if callback == "start_agent_here":
+            self._configured_owner(actor)
+            team = _team_id(payload, self.bot)
+            channel = _channel_id(payload)
+            root = _root_ts(payload)
+            if not team or not channel or not root:
+                return await self._error(payload, "Start agent here needs the selected message's exact thread.")
+            return await self._open_modal(payload, _start_here_modal(team=team, channel=channel, root=root))
         if callback not in {"agent", "bridge.agent", "agent_shortcut", "task_agent", "agent_global"}:
             return await self._error(payload, "Unknown shortcut.")
-        actor = _actor_id(payload)
         task_id = ""
         message = payload.get("message")
         if isinstance(message, Mapping):
@@ -514,6 +584,27 @@ class CommandDispatcher:
         values = _mapping(_mapping(view.get("state")).get("values"))
         metadata = _json_or_mapping(view.get("private_metadata"))
         actor = _actor_id(payload) or str(_mapping(view.get("user")).get("id") or "")
+        if callback in {"bridge.start_agent_here", "start_agent_here_modal"}:
+            self._configured_owner(actor)
+            team = str(metadata.get("team_id") or "")
+            channel = str(metadata.get("channel_id") or "")
+            root = str(metadata.get("root_ts") or "")
+            if not team or not channel or not root or _team_id(payload, self.bot) != team:
+                raise TaskRoutingError("selected Slack thread binding is invalid")
+            requested = _text_field(values, "cwd", "project")
+            prompt = _text_field(values, "initial_prompt", "prompt")
+            selected = next((project for project in self.projects if requested in {
+                str(getattr(project, "name", "")),
+                f"{getattr(project, 'root_label', '')}/{getattr(project, 'name', '')}",
+            }), None)
+            cwd = str(getattr(selected, "path", "")) if selected is not None else str(Path(requested).expanduser())
+            if not requested or not Path(cwd).is_dir():
+                return await self._error(payload, "Choose an existing working directory or configured project.")
+            task = await self.registry.spawn_task(
+                cwd, team_id=team, channel_id=channel, owner_user_id=actor,
+                root_ts=root, prompt=prompt or None, bind_existing_root=True,
+            )
+            return await self._reply(payload, f"✅ Started `{task.task_id[:8]}` in this thread.")
         if callback in {"bridge.agent", "agent_modal", "bridge.command"}:
             command = _text_field(values, "command", "agent_command")
             text = _text_field(values, "text", "agent_text")
@@ -522,6 +613,37 @@ class CommandDispatcher:
                 command = f"{command} {text}"
             return await self._slash({**dict(payload), "type": "slash_commands", "command": "/agent", "text": command, "user_id": actor, **metadata})
         task_id = str(metadata.get("task_id") or _text_field(values, "task_id"))
+        if callback in {"bridge.configure", "configure_modal"}:
+            task = await self._task_from_payload(payload, actor, task_id=task_id, require_owner=True)
+            model = _text_field(values, "configure_model", "model")
+            effort = _text_field(values, "configure_effort", "effort")
+            facet = _text_field(values, "configure_facet", "facet")
+            skill = _text_field(values, "configure_skill", "skill")
+            current_model = str(metadata.get("current_model") or "")
+            current_effort = str(metadata.get("current_effort") or "")
+            current_facet = str(metadata.get("current_facet") or "")
+            current_skill = str(metadata.get("current_skill") or "")
+            changed: list[str] = []
+            model_changed = bool(model and model != current_model)
+            effort_changed = bool(effort and effort != current_effort)
+            if model_changed:
+                await self.registry.set_model(
+                    task.task_id, model, owner_user_id=actor,
+                    reasoning_effort=effort or None,
+                )
+                changed.append("model")
+            elif effort_changed:
+                await self.registry.set_effort(task.task_id, effort, owner_user_id=actor)
+                changed.append("effort")
+            if facet and facet != current_facet:
+                await self.registry.set_facet(task.task_id, facet, owner_user_id=actor)
+                changed.append("facet")
+            if skill and skill != current_skill:
+                await self.registry.invoke_skill(task.task_id, skill, owner_user_id=actor)
+                changed.append("skill")
+            if not changed:
+                return await self._reply(payload, f"No configuration changes for `{task.task_id[:8]}`.")
+            return await self._reply(payload, f"✅ Updated `{task.task_id[:8]}`: {', '.join(changed)}.")
         if callback in {"bridge.participants", "participants_modal"}:
             task = await self._task_from_payload(payload, actor, task_id=task_id, require_owner=True)
             add_ids = _text_field(values, "participants", "participant_ids", "add_participants")
@@ -653,6 +775,26 @@ class CommandDispatcher:
                 "`stats`, `todos`, `pin`, `unpin`. Task controls are also available on each root message.")
 
 
+def _start_here_modal(*, team: str, channel: str, root: str) -> dict[str, Any]:
+    return {
+        "type": "modal", "callback_id": "bridge.start_agent_here",
+        "title": {"type": "plain_text", "text": "Start agent here"},
+        "submit": {"type": "plain_text", "text": "Start"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": json.dumps({"team_id": team, "channel_id": channel, "root_ts": root}, separators=(",", ":")),
+        "blocks": [
+            {"type": "input", "block_id": "start_here_cwd",
+             "label": {"type": "plain_text", "text": "Working directory or project"},
+             "element": {"type": "plain_text_input", "action_id": "cwd",
+                         "placeholder": {"type": "plain_text", "text": "/path/to/project or configured name"}}},
+            {"type": "input", "block_id": "start_here_prompt", "optional": True,
+             "label": {"type": "plain_text", "text": "Initial prompt"},
+             "element": {"type": "plain_text_input", "action_id": "initial_prompt",
+                         "multiline": True}},
+        ],
+    }
+
+
 def _agent_modal(*, task_id: str = "", channel_id: str = "", root_ts: str = "") -> dict[str, Any]:
     return {
         "type": "modal", "callback_id": "bridge.agent", "title": {"type": "plain_text", "text": "Polytoken"},
@@ -663,6 +805,96 @@ def _agent_modal(*, task_id: str = "", channel_id: str = "", root_ts: str = "") 
             {"type": "input", "block_id": "text", "optional": True, "label": {"type": "plain_text", "text": "Arguments"}, "element": {"type": "plain_text_input", "action_id": "text"}},
         ],
     }
+
+
+def _configure_modal(task: Task, state: Mapping[str, Any], models: Any) -> dict[str, Any]:
+    """Build a task-bound configuration view from the daemon's current state."""
+    current_model = str(state.get("active_model") or "").strip()
+    current_effort = str(state.get("active_reasoning_effort") or state.get("reasoning_effort") or "").strip()
+    current_facet = str(state.get("active_facet") or "").strip()
+    current_skill = str(state.get("active_skill") or "").strip()
+    model_options = _static_options(models, current_model)
+    effort_options = _static_options(_EFFORT_LEVELS, current_effort)
+    skill_options = _static_options(state.get("available_skills") or [], current_skill)
+
+    model_element: dict[str, Any]
+    if model_options:
+        model_element = _select_element("model", model_options, current_model, placeholder="Select a model")
+    else:
+        model_element = {
+            "type": "plain_text_input", "action_id": "model",
+            "placeholder": {"type": "plain_text", "text": "model/name"},
+        }
+        if current_model:
+            model_element["initial_value"] = current_model[:3000]
+    skill_element: dict[str, Any]
+    if skill_options:
+        skill_element = _select_element("skill", skill_options, current_skill, placeholder="Select a skill")
+    else:
+        skill_element = {
+            "type": "plain_text_input", "action_id": "skill",
+            "placeholder": {"type": "plain_text", "text": "skill name"},
+        }
+        if current_skill:
+            skill_element["initial_value"] = current_skill[:3000]
+    facet_element: dict[str, Any] = {
+        "type": "plain_text_input", "action_id": "facet",
+        "placeholder": {"type": "plain_text", "text": "Facet name"},
+    }
+    if current_facet:
+        facet_element["initial_value"] = current_facet[:3000]
+
+    metadata = {
+        "task_id": task.task_id,
+        "current_model": current_model,
+        "current_effort": current_effort,
+        "current_facet": current_facet,
+        "current_skill": current_skill,
+    }
+    return {
+        "type": "modal", "callback_id": "bridge.configure",
+        "title": {"type": "plain_text", "text": "Configure task"},
+        "submit": {"type": "plain_text", "text": "Apply"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "private_metadata": json.dumps(metadata, separators=(",", ":")),
+        "blocks": [
+            {"type": "input", "block_id": "configure_model", "optional": True,
+             "label": {"type": "plain_text", "text": "Model"}, "element": model_element},
+            {"type": "input", "block_id": "configure_effort", "optional": True,
+             "label": {"type": "plain_text", "text": "Reasoning effort"},
+             "element": _select_element("effort", effort_options, current_effort, placeholder="Select effort")},
+            {"type": "input", "block_id": "configure_facet", "optional": True,
+             "label": {"type": "plain_text", "text": "Facet"}, "element": facet_element},
+            {"type": "input", "block_id": "configure_skill", "optional": True,
+             "label": {"type": "plain_text", "text": "Skill"}, "element": skill_element},
+        ],
+    }
+
+
+def _format_subagent_activity(task: Any) -> str:
+    """Render bounded, ephemeral activity retained on the live Task runtime."""
+    blocks = list(getattr(task, "subagent_blocks", {}).values())
+    if not blocks:
+        return f"No subagent activity for `{str(task.task_id)[:8]}`."
+    lines = [f"*Subagent activity for `{str(task.task_id)[:8]}`:* "]
+    now = time.time()
+    for block in blocks:
+        finished_at = getattr(block, "finished_at", None)
+        started_at = float(getattr(block, "started_at", now) or now)
+        elapsed = max(0.0, (float(finished_at) if finished_at else now) - started_at)
+        duration = f"{elapsed:.0f}s" if elapsed < 60 else f"{elapsed / 60:.1f}m"
+        status = "completed" if finished_at else "running"
+        actions = list(getattr(block, "actions", []) or [])
+        attribution = str(getattr(block, "attribution", None) or getattr(block, "handle", "subagent"))
+        lines.append(f"• *{_plain_text(attribution, 100)}* · {status} · {len(actions)} actions · {duration}")
+        recent = actions[-2:]
+        if recent:
+            for action in recent:
+                lines.append(f"  ↳ {_plain_text(action, 240)}")
+        result = str(getattr(block, "result_summary", None) or "").strip()
+        if result:
+            lines.append(f"  ↳ result: {_plain_text(result, 240)}")
+    return "\n".join(lines)[:3900]
 
 
 def _participants_modal(task: Task) -> dict[str, Any]:
