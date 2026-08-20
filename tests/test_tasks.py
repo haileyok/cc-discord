@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 import json
 from pathlib import Path
 from typing import Any
@@ -218,6 +219,35 @@ async def test_pending_promotion_absent_daemon_stays_crashed_without_consumer(in
     assert task.task_id not in registry._consumers
 
 
+@pytest.mark.asyncio
+async def test_pending_promotion_live_daemon_restores_running_consumer_and_routing(in_memory_db, monkeypatch):
+    class LiveSupervisor(FakeSupervisor):
+        async def list_sessions(self):
+            return [SimpleNamespace(session_id="live-session", port=41001, project_path="/tmp")]
+
+    bot = FakeBot()
+    registry = TaskRegistry(in_memory_db, None, LiveSupervisor())
+    task = Task("live-journal-task", "T1", "COLD", "R1", "UOWNER", "personal", "/tmp", "running", "live-session", 41001, 1, 1)
+    await registry.attach_task(task)
+    client = FakeClient(port=41001)
+    registry._clients[task.task_id] = client
+    await state.upsert_participant(in_memory_db, task.key, Participant("UHELP", ParticipantKind.HUMAN, "helper"))
+    await state.create_promotion_journal(in_memory_db, "live-j1", task.task_id, task.key, "personal")
+    started: list[str] = []
+    monkeypatch.setattr(registry, "_start_consumer", lambda loaded: started.append(loaded.task_id))
+
+    await registry.load_from_db(reconcile_with_daemons=True)
+    registry.bind_bot(bot)
+    await registry.reconcile_promotion_journals()
+
+    loaded = registry.get_by_task_id(task.task_id)
+    assert loaded is not None and loaded.status == "running"
+    assert (await state.get_runtime(in_memory_db, task.task_id)).status == "running"
+    assert started == [task.task_id]
+    assert await registry.maybe_route_message(SlackMessage("T1", "COLD", "R1", SlackActor("UOWNER"), "after restart", "E-live", "M-live"))
+    assert json.loads(client.prompts[0])["body"] == "after restart"
+
+
 class TestAC2IdentityRouting:
     async def test_owner_only_personal_and_conversation_key_index(self, in_memory_db):
         reg, _ = _registry(in_memory_db)
@@ -307,6 +337,34 @@ class TestAC6PromotionAndMembership:
         assert bot.invites[-1] == {"channel_id": "GNEW", "actor_ids": ["UOTHER"]}
         assert (await state.get_root(in_memory_db, promoted.key)).owner.mode == "collaborative"
         assert (await state.get_active_promotion(in_memory_db, ConversationKey("T1", "CHOME", "1000.008"))) is not None
+
+    async def test_default_promotion_preserves_participant_objects_and_routes_app_message(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.008b")
+        await state.upsert_participant(in_memory_db, task.key, Participant("BAPP", ParticipantKind.APP, "Helper App"))
+        await state.upsert_participant(in_memory_db, task.key, Participant("UOTHER", ParticipantKind.HUMAN, "Other User"))
+
+        promoted = await reg.promote_task(task.task_id, "UOWNER", name="collab")
+        rows = await state.list_participants(in_memory_db, promoted.key)
+        saved = {str(row.participant.actor_id): row.participant for row in rows}
+        assert saved == {
+            "BAPP": Participant("BAPP", ParticipantKind.APP, "Helper App"),
+            "UOTHER": Participant("UOTHER", ParticipantKind.HUMAN, "Other User"),
+        }
+        assert bot.invites[-1]["actor_ids"] == ["BAPP", "UOTHER"]
+        assert await reg.maybe_route_message(SlackMessage(
+            "T1", promoted.channel_id, promoted.root_ts,
+            SlackActor("BAPP", is_app=True, display_name="Helper App"),
+            "post-promotion app message", "E-app", "M-app",
+        ))
+        assert json.loads(client.prompts[-1])["body"] == "post-promotion app message"
+
+    async def test_explicit_b_id_promotion_participant_is_app(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.008c")
+        promoted = await reg.promote_task(task.task_id, "UOWNER", ["BAPP"], name="explicit")
+        rows = await state.list_participants(in_memory_db, promoted.key)
+        assert rows[0].participant == Participant("BAPP", ParticipantKind.APP)
 
     async def test_promotion_failure_cleans_new_channel_and_keeps_old_root(self, in_memory_db):
         reg, bot = _registry(in_memory_db)

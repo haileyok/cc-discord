@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -147,18 +148,33 @@ def write_secrets(secrets: Secrets, path: Path = SECRETS_FILE) -> None:
     path.parent.chmod(0o700)
     payload = json.dumps(values, indent=2, sort_keys=True) + "\n"
 
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Never truncate a pre-existing destination before its permissions are
+    # fixed: an attacker observing the path could read the new credentials
+    # through the old mode.  Write a private temp file, then atomically replace.
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = None
+            fd = -1
             handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
     except BaseException:
-        if fd is not None:
+        if fd >= 0:
             try:
                 os.close(fd)
             except OSError:
                 pass
         raise
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
     path.chmod(0o600)
 
 

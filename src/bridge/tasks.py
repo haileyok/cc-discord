@@ -283,13 +283,17 @@ def _actor(value: Any) -> SlackActor:
     if isinstance(value, str):
         return SlackActor(value)
     nested = _value(value, "actor", None) or _value(value, "user", None)
-    if nested is not None and nested is not value:
+    # Slack's raw ``user`` field is commonly a bare U... string.  Only descend
+    # into structured actor objects; replacing the mapping with that string
+    # would discard normalized actor_id/bot_id fields.
+    if nested is not None and nested is not value and not isinstance(nested, str):
         value = nested
     actor_id = (
         _value(value, "actor_id", None)
         or _value(value, "user_id", None)
         or _value(value, "id", None)
         or _value(value, "bot_id", None)
+        or (_value(value, "user", None) if isinstance(_value(value, "user", None), str) else None)
     )
     is_app = bool(_value(value, "is_app", False) or _value(value, "bot_id", None))
     return SlackActor(str(actor_id or ""), is_app=is_app, display_name=_value(value, "display_name", None))
@@ -308,25 +312,37 @@ def _file(value: Any) -> SlackFile:
 
 
 def normalize_message(value: Any) -> SlackMessage:
-    """Translate a Slack adapter object/dict without retaining provider objects."""
+    """Translate a Slack adapter object/dict without retaining provider objects.
+
+    Socket Mode dispatch receives Bot's authenticated normalized envelope.  Keep
+    the nested provider event as a compatibility source, but let normalized
+    top-level fields win (notably ``actor_id``, ``team_id``, and ``root_ts``).
+    """
     if isinstance(value, SlackMessage):
         return value
-    channel = _value(value, "channel_id", None)
+    source = value
+    nested_event = _value(value, "event", None)
+    if isinstance(nested_event, Mapping):
+        merged = dict(nested_event)
+        if isinstance(value, Mapping):
+            merged.update(value)
+        source = merged
+    channel = _value(source, "channel_id", None)
     if channel is None:
-        channel_obj = _value(value, "channel", None)
+        channel_obj = _value(source, "channel", None)
         channel = _value(channel_obj, "id", channel_obj)
-    team = _value(value, "team_id", None) or _value(value, "team", None)
-    actor = _actor(value)
-    message_ts = _value(value, "message_ts", None) or _value(value, "ts", None)
-    root = _value(value, "root_ts", None) or _value(value, "thread_ts", None) or message_ts
-    files = _value(value, "files", None) or _value(value, "attachments", ()) or ()
+    team = _value(source, "team_id", None) or _value(source, "team", None)
+    actor = _actor(source)
+    message_ts = _value(source, "message_ts", None) or _value(source, "ts", None)
+    root = _value(source, "root_ts", None) or _value(source, "thread_ts", None) or message_ts
+    files = _value(source, "files", None) or _value(source, "attachments", ()) or ()
     return SlackMessage(
         team_id=str(team or ""),
         channel_id=str(channel or ""),
         root_ts=str(root or ""),
         actor=actor,
-        text=str(_value(value, "text", None) or _value(value, "content", "")),
-        event_id=_value(value, "event_id", None) or _value(value, "event", None),
+        text=str(_value(source, "text", None) or _value(source, "content", "")),
+        event_id=_value(source, "event_id", None) or _value(source, "event", None),
         message_ts=str(message_ts) if message_ts is not None else None,
         files=tuple(_file(item) for item in files),
     )
@@ -594,8 +610,17 @@ class TaskRegistry:
             if runtime is not None:
                 # Restore all old-binding fields even when the key already
                 # matches: a crash can leave only status/mode/ownership stale.
+                # A journal records a transient rebinding.  Its recovery
+                # status must come from daemon reconciliation, never from the
+                # transient row status persisted during the side effect.
+                live_daemon = (
+                    self._daemon_presence_known
+                    and bool(runtime.session_id)
+                    and str(runtime.session_id) in self._known_daemon_sessions
+                )
                 restored = await restore_runtime_binding(
                     self._conn, journal.task_id, journal.old_key,
+                    status="running" if live_daemon else "crashed",
                     binding_id=journal.old_binding_id,
                 )
                 task = self.get_by_task_id(journal.task_id)
@@ -610,7 +635,10 @@ class TaskRegistry:
                     task.channel_owned = bool(journal.old_mode == "collaborative" and str(journal.old_key.channel_id) != str(self.home_channel_id or ""))
                     await self._index(task)
                     await self._persist_task(task)
-                    if task.status not in {"running", "spawning"}:
+                    if task.status in {"running", "spawning"}:
+                        self._deferred_consumers.discard(task.task_id)
+                        self._start_consumer(task)
+                    else:
                         self._deferred_consumers.discard(task.task_id)
                         consumer = self._consumers.pop(task.task_id, None)
                         if consumer is not None and not consumer.done():
@@ -1213,9 +1241,16 @@ class TaskRegistry:
         old_key = task.key
         old_channel, old_root, old_mode = task.channel_id, task.root_ts, task.mode
         old_channel_owned = task.channel_owned
+        participant_rows = await list_participants(self._conn, old_key)
         ids = participant_actor_ids
         if ids is None:
-            ids = [str(row.participant.actor_id) for row in await list_participants(self._conn, old_key)]
+            # The default promotion path is a root move, not a participant
+            # re-import. Preserve the complete stored records, including kind
+            # and display name, while still using their stable actor IDs for
+            # Slack membership invites.
+            ids = [str(row.participant.actor_id) for row in participant_rows]
+        else:
+            ids = [str(actor_id).strip() for actor_id in ids if str(actor_id).strip()]
         bot = self._require_bot()
         new_channel: str | None = None
         new_root: str | None = None
@@ -1237,10 +1272,9 @@ class TaskRegistry:
                 (journal_id, task.task_id, old_key.team_id, old_key.channel_id,
                  old_key.root_id, old_mode, task.binding_id, stamp, stamp),
             )
-            await self._conn.execute(
-                "UPDATE task_runtime SET status = 'rebinding', promotion_state = 'preparing', updated_at = ? WHERE task_id = ?",
-                (stamp, task.task_id),
-            )
+            # The journal is the durable in-flight marker.  Do not persist the
+            # transient in-memory ``rebinding`` status: after a crash, daemon
+            # reconciliation must decide whether the old runtime is live.
             await self._conn.commit()
         except BaseException:
             await self._conn.rollback()
@@ -1265,7 +1299,19 @@ class TaskRegistry:
             task.status = "running"
             task.promotion_state = "active"
             task.binding_id = binding_id
-            promoted_participants = [Participant(ActorId(str(actor_id)), ParticipantKind.APP if str(actor_id) == self.app_actor_id else ParticipantKind.HUMAN) for actor_id in ids if str(actor_id) != task.owner_user_id]
+            if participant_actor_ids is None:
+                promoted_participants = [
+                    row.participant for row in participant_rows
+                    if str(row.participant.actor_id) != task.owner_user_id
+                ]
+            else:
+                promoted_participants = [
+                    Participant(
+                        ActorId(actor_id),
+                        ParticipantKind.APP if actor_id.startswith("B") else ParticipantKind.HUMAN,
+                    )
+                    for actor_id in ids if actor_id != task.owner_user_id
+                ]
             await replace_runtime_binding(
                 self._conn, old_key, self._runtime(task), promoted_participants,
                 binding=(binding_id, new_channel, "slack_private_channel", ActorId(task.owner_user_id)),

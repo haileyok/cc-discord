@@ -10,7 +10,9 @@ from typing import Any
 import pytest
 from aiohttp import test_utils
 
-from bridge.server import build_app, make_interaction_dispatcher, make_message_dispatcher
+from bridge.bot import Bot
+from bridge.server import build_app, make_interaction_dispatcher, make_message_dispatcher, make_socket_dispatcher
+from bridge.tasks import normalize_message
 import bridge.server as server_module
 
 
@@ -82,6 +84,76 @@ async def test_message_and_interaction_dispatchers_are_resilient() -> None:
             return "ok"
     interaction = make_interaction_dispatcher(Dispatcher())
     assert await interaction({"envelope_id": "E"}) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_socket_bot_callback_passes_normalized_human_and_bot_messages_to_registry() -> None:
+    class NormalizingRegistry:
+        def __init__(self) -> None:
+            self.raw: list[Any] = []
+            self.messages: list[Any] = []
+
+        async def maybe_route_message(self, payload: Any) -> bool:
+            self.raw.append(payload)
+            self.messages.append(normalize_message(payload))
+            return True
+
+    class Dispatcher:
+        async def dispatch(self, payload: Any) -> None:
+            raise AssertionError(f"message payload reached command dispatcher: {payload!r}")
+
+    registry = NormalizingRegistry()
+    callback = make_socket_dispatcher(Dispatcher(), registry)
+    # Use the strict fake Web API client so this follows the same Bot startup
+    # and Socket Mode callback path without making network requests.
+    from tests.fakes import FakeSlackClient
+    bot = Bot(
+        "xoxb-test", team_id="T1", owner_user_id="UOWNER", home_channel_id="GHOME",
+        client=FakeSlackClient(script=[
+        ("auth_test", {"ok": True, "team_id": "T1", "user_id": "UBOT"}),
+        ("users_info", {"ok": True, "user": {"id": "UOWNER", "name": "owner"}}),
+        ("conversations_info", {"ok": True, "channel": {"id": "GHOME", "is_private": True, "is_member": True}}),
+        ]),
+    )
+    bot._on_dispatch_cb = callback
+    await bot.start()
+    await bot.handle_socket_envelope({
+        "envelope_id": "E-human",
+        "payload": {"team_id": "T1", "event": {"type": "message", "team": "T1", "channel": "GHOME", "user": "UOWNER", "text": "owner prompt", "ts": "3.1"}},
+    })
+    await bot.handle_socket_envelope({
+        "envelope_id": "E-app",
+        "payload": {"team_id": "T1", "event": {"type": "bot_message", "team": "T1", "channel": "GHOME", "bot_id": "BAPP", "username": "helper", "text": "app prompt", "ts": "3.2"}},
+    })
+    assert [message.text for message in registry.messages] == ["owner prompt", "app prompt"]
+    assert registry.messages[0].actor.actor_id == "UOWNER"
+    assert not registry.messages[0].actor.is_app
+    assert registry.messages[1].actor.actor_id == "BAPP"
+    assert registry.messages[1].actor.is_app
+    assert registry.raw[0]["actor_id"] == "UOWNER"
+    assert registry.raw[1]["actor_id"] == "BAPP"
+    assert registry.raw[1] is not registry.raw[1]["event"]
+    direct = normalize_message({"team": "T1", "channel": "GHOME", "user": "UOWNER", "ts": "3.3", "text": "direct"})
+    assert direct.actor.actor_id == "UOWNER" and not direct.actor.is_app
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_socket_dispatcher_logs_and_contains_malformed_registry_mapping(caplog: pytest.LogCaptureFixture) -> None:
+    class StrictRegistry:
+        async def maybe_route_message(self, payload: Any) -> bool:
+            message = normalize_message(payload)
+            if not message.team_id or not message.channel_id or not message.root_ts or not message.actor_id:
+                raise ValueError("malformed normalized message")
+            return True
+
+    class Dispatcher:
+        async def dispatch(self, payload: Any) -> None:
+            raise AssertionError("not a command")
+
+    dispatch = make_socket_dispatcher(Dispatcher(), StrictRegistry())
+    assert await dispatch({"kind": "message", "team_id": "T1"}) is None
+    assert "Slack Socket Mode routing failed" in caplog.text
 
 
 @pytest.mark.asyncio

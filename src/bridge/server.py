@@ -101,7 +101,11 @@ def make_socket_dispatcher(dispatcher: CommandDispatcher, task_registry: TaskReg
         try:
             kind = str(payload.get("kind") or payload.get("type") or "").lower() if isinstance(payload, Mapping) else ""
             if kind in {"message", "app_mention", "bot_message"}:
-                return await task_registry.maybe_route_message(payload.get("event", payload))
+                # Bot.handle_socket_envelope has already authenticated and normalized
+                # the event.  Pass that complete mapping onward so the registry can
+                # consume actor_id/team/channel/root fields without reaching into
+                # provider-specific payload nesting.
+                return await task_registry.maybe_route_message(payload)
             if kind in {"reaction_added", "reaction_removed"}:
                 return None
             return await dispatcher.dispatch(payload)

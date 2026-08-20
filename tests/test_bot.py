@@ -256,6 +256,23 @@ class TestAC9SocketMode:
         assert received == []
 
     @pytest.mark.asyncio
+    async def test_bot_self_echo_uses_auth_test_bot_id_and_bot_message_bot_id(self) -> None:
+        client = FakeSlackClient(script=[
+            ("auth_test", {"ok": True, "team_id": "T1", "user_id": "UBOT", "bot_id": "BSELF"}),
+            ("users_info", {"ok": True, "user": {"id": "UOWNER", "name": "owner"}}),
+            ("conversations_info", {"ok": True, "channel": {"id": "GHOME", "is_private": True, "is_member": True}}),
+        ])
+        received = []
+        bot = _ready_bot(client=client, on_message=received.append)
+        await bot.start()
+        assert bot.bot_id == "BSELF"
+        await bot.handle_socket_envelope({
+            "envelope_id": "E-self",
+            "payload": {"team_id": "T1", "event": {"type": "bot_message", "team": "T1", "channel": "GHOME", "bot_id": "BSELF", "username": "bridge", "text": "echo", "ts": "4"}},
+        })
+        assert received == []
+
+    @pytest.mark.asyncio
     async def test_external_bot_message_uses_b_id_and_invite_kick_use_u_id(self) -> None:
         client = FakeSlackClient(script=_startup_script() + [
             ("bots_info", {"ok": True, "bot": {"id": "BAPP", "user_id": "UAPP"}}),

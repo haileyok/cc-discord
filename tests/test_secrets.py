@@ -1,6 +1,9 @@
 import json
+import os
 import stat
 from pathlib import Path
+
+import bridge.secrets as secrets_module
 
 import pytest
 
@@ -45,6 +48,26 @@ def test_write_creates_private_directory_and_file(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert secrets_file_perms(path) == 0o600
     assert secrets_dir_perms(path.parent) == 0o700
+
+
+def test_overwrite_keeps_old_path_private_until_atomic_replace_and_cleans_temp(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "nested" / "secrets.json"
+    path.parent.mkdir()
+    path.write_text("old-secret")
+    path.chmod(0o644)
+    observed: dict[str, int] = {}
+    real_replace = os.replace
+
+    def checked_replace(source, destination):
+        observed["temporary_mode"] = stat.S_IMODE(Path(source).stat().st_mode)
+        observed["old_mode"] = stat.S_IMODE(Path(destination).stat().st_mode)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(secrets_module.os, "replace", checked_replace)
+    write_secrets(valid_secrets(), path=path)
+    assert observed == {"temporary_mode": 0o600, "old_mode": 0o644}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert list(path.parent.glob(f".{path.name}.*")) == []
 
 
 @pytest.mark.parametrize("missing", REQUIRED_KEYS)
