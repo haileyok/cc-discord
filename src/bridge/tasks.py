@@ -248,6 +248,7 @@ class Task:
     # Runtime-only path from ``polytoken sessions --format json``.  It is not
     # persisted in SQLite; startup reconciliation re-discovers it by session id.
     credential_file_path: str | None = None
+    status_message_ts: str | None = None
 
     @property
     def key(self) -> ConversationKey:
@@ -794,7 +795,7 @@ class TaskRegistry:
             elif isinstance(action, (AskQuestion, Clarification, Confirmation)):
                 await self._post_interrogative(task, action)
             elif isinstance(action, TurnStarted):
-                pass  # Slack has no provider-neutral typing contract.
+                await self._begin_turn(task)
             elif isinstance(action, TurnComplete):
                 await self._end_turn(task)
             elif isinstance(action, TurnCancelled):
@@ -1521,7 +1522,20 @@ class TaskRegistry:
             await self._persist_root(task)
         return task
 
+    async def _begin_turn(self, task: Task) -> None:
+        """Show a lightweight thread status because Slack has no bot typing API."""
+        if task.status_message_ts is not None:
+            return
+        sent = await self._post(task, "⏳ Agent is working…")
+        task.status_message_ts = sent[0] if sent else None
+
     async def _end_turn(self, task: Task) -> None:
+        if task.status_message_ts is not None:
+            with contextlib.suppress(Exception):
+                await self._require_bot().edit_message(
+                    task.channel_id, task.status_message_ts, text="✅ Ready"
+                )
+            task.status_message_ts = None
         # App budget is a turn/exchange budget, not a process-lifetime budget.
         if task.app_exchanges:
             task.app_exchanges = 0

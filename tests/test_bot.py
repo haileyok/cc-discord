@@ -316,6 +316,24 @@ class TestAC9SocketMode:
         with pytest.raises(MalformedSlackFixture):
             await FakeSlackClient(script=[("auth_test", object())]).auth_test()
 
+    def test_interactive_user_object_normalizes_to_stable_actor_id(self) -> None:
+        bot = _ready_bot()
+        bot._team_id = "T1"
+        normalized = bot._normalize_socket_dispatch({
+            "envelope_id": "E-action",
+            "payload": {
+                "type": "block_actions",
+                "team": {"id": "T1"},
+                "user": {"id": "UOWNER", "username": "owner"},
+                "channel": {"id": "GHOME"},
+                "message": {"ts": "100.1"},
+                "actions": [{"action_id": "task.stats", "value": "task-1"}],
+            },
+        })
+        assert normalized is not None
+        assert normalized["actor_id"] == "UOWNER"
+        assert normalized["channel_id"] == "GHOME"
+
     @pytest.mark.asyncio
     async def test_bot_messages_are_not_dispatched(self) -> None:
         received = []

@@ -402,6 +402,21 @@ class TestAC4AttachmentsAndInterrogatives:
         assert any("Continue?" in post["text"] for post in bot.posts if "text" in post)
 
 
+@pytest.mark.asyncio
+async def test_turn_status_is_posted_and_completed_in_task_thread(in_memory_db):
+    reg, bot = _registry(in_memory_db)
+    task, _ = await _task(reg, root="1000.status")
+    await reg._render(task, events.TurnStarted("prompt-1"))
+    assert bot.posts[-1]["text"] == "⏳ Agent is working…"
+    assert bot.posts[-1]["root_ts"] == task.root_ts
+    status_ts = task.status_message_ts
+    assert status_ts is not None
+    await reg._render(task, events.TurnComplete("prompt-1"))
+    assert bot.edits[-1]["message_ts"] == status_ts
+    assert bot.edits[-1]["text"] == "✅ Ready"
+    assert task.status_message_ts is None
+
+
 class TestAC5AppBudget:
     async def test_collaborative_app_exchange_budget_pauses_and_alerts_owner(self, in_memory_db):
         reg, bot = _registry(in_memory_db, budget=1)

@@ -1130,10 +1130,15 @@ class Bot:
         if isinstance(payload.get("channel"), Mapping):
             channel_id = str(payload["channel"].get("id") or channel_id)
         root_ts = str(event.get("thread_ts") or event.get("ts") or payload.get("thread_ts") or payload.get("message_ts") or "")
-        # bot_message events intentionally carry no ``user`` field.  Their
-        # stable authorization identity is the external app's B... bot_id;
-        # channel membership APIs resolve that to a U... user id separately.
-        actor_id = str(event.get("bot_id") or event.get("user") or payload.get("user_id") or "")
+        # Interactive payloads carry ``user`` as an object while message events
+        # carry it as a bare U... string. Extract the stable ID before coercion;
+        # stringifying the object produces an invalid chat.postEphemeral user.
+        user_value = event.get("user") or payload.get("user") or payload.get("user_id")
+        if isinstance(user_value, Mapping):
+            user_value = user_value.get("id") or user_value.get("user_id")
+        # bot_message events intentionally carry no ``user`` field. Their stable
+        # authorization identity is the external app's B... bot_id.
+        actor_id = str(event.get("bot_id") or user_value or "")
         display = str(event.get("text") or payload.get("text") or event.get("username") or event.get("name") or kind)
         # Self-generated bot messages are filtered only when Slack verifies
         # the bot identity; arbitrary bot/app actors are not blanket-dropped.
