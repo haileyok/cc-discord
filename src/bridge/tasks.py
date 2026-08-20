@@ -1465,7 +1465,11 @@ class TaskRegistry:
         except TurnInFlight:
             await self._post(task, "⏳ A turn is already running; wait for it to finish or close the task.")
         except PolytokenClientError as exc:
-            await self._post(task, f"⚠ Couldn't deliver the message to the daemon: {safe_error(exc, 'delivery failed')}.")
+            code = getattr(exc, "code", None)
+            reason = safe_error(exc, "delivery failed")
+            if code:
+                reason = f"{reason}; daemon code `{code}`"
+            await self._post(task, f"⚠ Couldn't deliver the message to the daemon: {reason}.")
         return False
 
     async def _save_attachments_detailed(

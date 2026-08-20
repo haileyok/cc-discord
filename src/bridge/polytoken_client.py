@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import stat
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
@@ -39,12 +40,14 @@ class PolytokenClientError(Exception):
     for transport-level failures (connection refused, reset, timeout).
     """
 
-    def __init__(self, message: str, *, status: int | None = None, body: str | None = None) -> None:
+    def __init__(self, message: str, *, status: int | None = None, body: str | None = None,
+                 code: str | None = None) -> None:
         # Never retain provider response bodies: they may contain prompts,
         # credentials, paths, or upstream diagnostics.
         super().__init__(message)
         self.status = status
         self.body = None
+        self.code = str(code) if code else None
 
 
 class PolytokenCredentialError(PolytokenClientError):
@@ -231,7 +234,18 @@ class PolytokenClient:
         if status == 409 and path == "/prompt":
             raise TurnInFlight("a turn is already in flight", status=status)
         if status == 422 and path == "/prompt":
-            raise PromptDenied("prompt denied by a pre-prompt hook", status=status)
+            code: str | None = None
+            try:
+                payload = json.loads(body)
+                candidate = payload.get("code") if isinstance(payload, dict) else None
+                if not candidate and isinstance(payload, dict):
+                    hook = payload.get("blocked_by_hook")
+                    candidate = f"hook.{hook}" if isinstance(hook, str) else None
+                if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", candidate):
+                    code = candidate
+            except (json.JSONDecodeError, TypeError):
+                pass
+            raise PromptDenied("prompt rejected by the daemon", status=status, code=code)
         raise PolytokenClientError(
             "Polytoken daemon rejected the request", status=status
         )

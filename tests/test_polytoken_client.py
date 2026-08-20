@@ -33,7 +33,7 @@ def _build_stub_app() -> web.Application:
         if mode == "409":
             return web.json_response({"error": "in flight"}, status=409)
         if mode == "422":
-            return web.json_response({"error": "denied"}, status=422)
+            return web.json_response({"prompt_id": "p-denied", "blocked_by_hook": "context-policy", "reason": "sensitive detail"}, status=422)
         return web.json_response(
             {
                 "prompt_id": "p-1",
@@ -156,8 +156,11 @@ class TestPolytokenClient:
 
     async def test_prompt_422_denied(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
-            with pytest.raises(PromptDenied):
+            with pytest.raises(PromptDenied) as caught:
                 await _prompt_with_header(client, "hi", "422")
+        assert caught.value.code == "hook.context-policy"
+        assert caught.value.body is None
+        assert "sensitive detail" not in str(caught.value)
 
     async def test_state(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
