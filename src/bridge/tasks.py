@@ -67,6 +67,7 @@ from bridge.events import (
 from bridge.polytoken_client import PolytokenClient, PolytokenClientError, SseEnvelope, TurnInFlight
 from bridge.redaction import safe_error, safe_log
 from bridge.state import (
+    DEDUP_MAX_RECORDS,
     clear_pending_interrogative,
     consume_pending_interrogative,
     delete_participant,
@@ -88,6 +89,7 @@ from bridge.state import (
     list_participants,
     list_promotion_bindings,
     list_pending_promotion_journals,
+    list_pending_interrogatives,
     create_promotion_journal,
     update_promotion_journal,
     list_text_pins,
@@ -510,7 +512,7 @@ class _ToolSummaryAggregator:
             if getattr(exc, "status", None) == 429:
                 self._slow_mode = True
             self._lines[0:0] = body.splitlines()
-            log.exception("failed to flush Slack tool summary")
+            log.error("failed to flush Slack tool summary: %s", safe_error(exc, "Slack post failed"))
 
 
 class TaskRegistry:
@@ -973,8 +975,11 @@ class TaskRegistry:
                 return
             elif isinstance(action, Reconcile):
                 await self._handle_reconcile(task, action.reason)
-        except Exception:
-            log.exception("failed to render %s for %s", type(action).__name__, task.task_id[:8])
+        except Exception as exc:
+            log.error(
+                "failed to render %s for %s: %s",
+                type(action).__name__, task.task_id[:8], safe_error(exc, "render failed"),
+            )
 
     async def _post(self, task: Task, text: str, *, blocks: list[dict[str, Any]] | None = None) -> list[str]:
         return await self._require_bot().post(text, channel_id=task.channel_id, root_ts=task.root_ts, blocks=blocks)
@@ -1291,8 +1296,8 @@ class TaskRegistry:
             sent = await self._post(task, "", blocks=self._subagent_blocks(block, [], 0, False))
             block.message_ts = sent[0] if sent else None
             block.last_edit_at = time.time()
-        except Exception:
-            log.exception("failed to post subagent block")
+        except Exception as exc:
+            log.error("failed to post subagent block: %s", safe_error(exc, "Slack post failed"))
 
     async def _subagent_activity(self, task: Task, handle: str, line: str) -> None:
         block = task.subagent_blocks.get(handle)
@@ -1356,6 +1361,10 @@ class TaskRegistry:
         binding_id = binding.binding_id if binding is not None else (task.binding_id or "")
         if actor_id != task.owner_user_id and not await self._is_participant(task, actor_id, is_app=False):
             return
+        existing = await get_pending_interrogative(self._conn, task.key, ActorId(actor_id))
+        if existing is not None and existing.interrogative_id == iid:
+            self._pending[(task.key, actor_id)] = existing
+            return
         pending = StoredInterrogative(iid, ActorId(actor_id), payload, now + 86400, now)
         await put_pending_interrogative(self._conn, task.key, pending, binding_id=binding_id, target_kind=ParticipantKind.APP if actor_id == self.app_actor_id else ParticipantKind.HUMAN)
         self._pending[(task.key, actor_id)] = pending
@@ -1379,9 +1388,9 @@ class TaskRegistry:
             response = self._clarification_response(options, text)
         else:
             response = self._ask_question_response(pending.payload, text)
+        binding = await get_active_promotion(self._conn, task.key)
+        binding_id = binding.binding_id if binding is not None else (task.binding_id or "")
         try:
-            binding = await get_active_promotion(self._conn, task.key)
-            binding_id = binding.binding_id if binding is not None else (task.binding_id or "")
             claimed = await consume_pending_interrogative(
                 self._conn, task.key, pending.actor_id,
                 interrogative_id=pending.interrogative_id, binding_id=binding_id,
@@ -1392,7 +1401,14 @@ class TaskRegistry:
             await self._client_for(task).respond_interrogative(pending.interrogative_id, response)
             self._pending.pop((task.key, str(pending.actor_id)), None)
         except PolytokenClientError:
-            await self._post(task, "⚠ Failed to deliver your answer to the daemon.")
+            # Delivery failed after the atomic claim. Restore the durable row so
+            # the targeted actor can retry instead of losing the question.
+            await put_pending_interrogative(
+                self._conn, task.key, pending, binding_id=binding_id,
+                target_kind=ParticipantKind.APP if pending.actor_id.startswith("B") else ParticipantKind.HUMAN,
+            )
+            self._pending[(task.key, str(pending.actor_id))] = pending
+            await self._post(task, "⚠ Failed to deliver your answer to the daemon; please retry.")
 
     @staticmethod
     def _clarification_response(options: list[dict[str, Any]], text: str) -> dict[str, Any]:
@@ -1541,6 +1557,10 @@ class TaskRegistry:
         await self._prompt(task, prompt)
 
     async def _dedup_message(self, msg: SlackMessage) -> bool:
+        if len(self._message_seen) >= DEDUP_MAX_RECORDS:
+            # SQLite remains the source of truth and is bounded to the same
+            # retention size; this cache is only a fast path.
+            self._message_seen.clear()
         identifiers: list[str] = []
         if msg.event_id:
             identifiers.append(f"event:{msg.event_id}")
@@ -1894,6 +1914,13 @@ class TaskRegistry:
         old_key = task.key
         old_channel, old_root, old_mode = task.channel_id, task.root_ts, task.mode
         old_channel_owned = task.channel_owned
+        old_mention_required = task.mention_required
+        old_binding_id = task.binding_id
+        old_status = task.status
+        old_promotion_state = task.promotion_state
+        old_cleanup_pending = task.cleanup_pending
+        if await list_pending_interrogatives(self._conn, old_key):
+            raise TaskRoutingError("answer or dismiss the pending agent question before promoting this task")
         participant_rows = await list_participants(self._conn, old_key)
         ids = participant_actor_ids
         if ids is None:
@@ -1980,15 +2007,17 @@ class TaskRegistry:
         except Exception as exc:
             task.channel_id, task.root_ts, task.mode = old_channel, old_root, old_mode
             task.channel_owned = old_channel_owned
-            task.status = "running"
-            task.promotion_state = "failed"
+            task.mention_required = old_mention_required
+            task.binding_id = old_binding_id
+            task.status = old_status
+            task.promotion_state = old_promotion_state
+            task.cleanup_pending = old_cleanup_pending
             if journal_id:
                 with contextlib.suppress(Exception):
                     await update_promotion_journal(self._conn, journal_id, state="cleanup_pending" if new_channel else "failed", side_effect_state="failed", error_code=type(exc).__name__)
             with contextlib.suppress(Exception):
                 await self._persist_task(task)
             if new_channel is not None:
-                task.channel_owned = True
                 try:
                     await update_promotion_journal(self._conn, journal_id, state="cleanup_pending", side_effect="archive_channel", side_effect_state="started")
                     await bot.archive_channel(new_channel)
@@ -2220,6 +2249,8 @@ class TaskRegistry:
                         task.progress_stream_started_at = None
                     except Exception as exc:
                         task.progress_stream_disabled = True
+                        task.progress_stream_ts = None
+                        task.progress_stream_started_at = None
                         code = slack_error_code(exc)
                         log.warning(
                             "native Slack stream stop failed%s: %s",

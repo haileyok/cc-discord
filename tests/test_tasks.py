@@ -522,6 +522,29 @@ class TestAC4AttachmentsAndInterrogatives:
 
 
 @pytest.mark.asyncio
+async def test_failed_interrogative_delivery_restores_pending_for_retry(in_memory_db):
+    reg, _ = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.interrogative-retry")
+    await reg._render(task, events.Confirmation("I-retry", None, "Continue?"))
+    original = client.respond_interrogative
+    calls = 0
+
+    async def fail_once(interrogative_id, response):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PolytokenClientError("temporary")
+        await original(interrogative_id, response)
+
+    client.respond_interrogative = fail_once
+    answer = SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "yes")
+    assert await reg.maybe_route_message(answer)
+    assert await state.get_pending_interrogative(in_memory_db, task.key, "UOWNER") is not None
+    assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "yes"))
+    assert client.interrogative_responses[-1]["id"] == "I-retry"
+
+
+@pytest.mark.asyncio
 async def test_turn_status_fallback_is_one_editable_block_and_no_legacy_working_message(in_memory_db):
     reg, bot = _registry(in_memory_db)
     task, _ = await _task(reg, root="1000.status")
@@ -720,6 +743,35 @@ class TestAC6PromotionAndMembership:
         promoted = await reg.promote_task(task.task_id, "UOWNER", ["BAPP"], name="explicit")
         rows = await state.list_participants(in_memory_db, promoted.key)
         assert rows[0].participant == Participant("BAPP", ParticipantKind.APP)
+
+    async def test_promotion_db_failure_restores_mention_gate_and_binding(self, in_memory_db, monkeypatch):
+        reg, _ = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.rollback")
+        task.mention_required = True
+        task.binding_id = "old-binding"
+        await reg._persist_root(task)
+
+        async def fail_replace(*args, **kwargs):
+            raise RuntimeError("injected rebind failure")
+
+        monkeypatch.setattr("bridge.tasks.replace_runtime_binding", fail_replace)
+        with pytest.raises(TaskRoutingError, match="promotion failed"):
+            await reg.promote_task(task.task_id, "UOWNER")
+        assert task.key == ConversationKey("T1", "CHOME", "1000.rollback")
+        assert task.mention_required is True
+        assert task.binding_id == "old-binding"
+        runtime = await state.get_runtime(in_memory_db, task.task_id)
+        assert runtime is not None and runtime.mention_required is True
+        assert runtime.binding_id == "old-binding"
+
+    async def test_promotion_refuses_to_orphan_pending_interrogative(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, _ = await _task(reg, root="1000.pending-promotion")
+        await reg._render(task, events.Confirmation("I-promote", None, "Continue?"))
+        with pytest.raises(TaskRoutingError, match="pending agent question"):
+            await reg.promote_task(task.task_id, "UOWNER")
+        assert task.key == ConversationKey("T1", "CHOME", "1000.pending-promotion")
+        assert bot.private_channels == []
 
     async def test_promotion_failure_cleans_new_channel_and_keeps_old_root(self, in_memory_db):
         reg, bot = _registry(in_memory_db)

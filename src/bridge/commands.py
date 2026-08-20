@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from bridge import skills, usage
 from bridge.domain import ConversationKey
-from bridge.redaction import safe_error, safe_log
+from bridge.redaction import safe_error
 from bridge.tasks import (
     Task,
     TaskNotFound,
@@ -364,7 +364,7 @@ class CommandDispatcher:
         except (TaskNotFound, TaskSpawnError, TaskRestartError, TaskRoutingError, ValueError) as exc:
             return await self._error(payload, safe_error(exc, "Could not complete that request"))
         except Exception as exc:  # interaction handlers must not crash Socket Mode
-            log.exception("Slack interaction failed: %s", safe_log(type(exc).__name__))
+            log.error("Slack interaction failed: %s", safe_error(exc, "interaction failed"))
             return await self._error(payload, "Unexpected bridge error. Try again or check the task status.")
 
     async def handle_interaction(self, payload: Any) -> SlackResponse:

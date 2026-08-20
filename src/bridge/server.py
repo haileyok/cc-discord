@@ -18,6 +18,7 @@ from bridge.bot import Bot
 from bridge.commands import CommandDispatcher, build_dispatcher
 from bridge.daemon_supervisor import DaemonSupervisor
 from bridge.secrets import Secrets
+from bridge.redaction import safe_error
 from bridge.tasks import TaskRegistry
 
 log = logging.getLogger(__name__)
@@ -88,10 +89,10 @@ def make_message_dispatcher(task_registry: TaskRegistry) -> Callable[[Any], Any]
             await task_registry.maybe_route_message(message)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # Socket Mode callbacks should not take down the gateway.  Detailed
-            # failures remain in logs; users get task-level errors where possible.
-            log.exception("Slack message routing failed")
+        except Exception as exc:
+            # Socket Mode callbacks should not take down the gateway. Avoid raw
+            # SDK tracebacks because SlackApiError includes response bodies.
+            log.error("Slack message routing failed: %s", safe_error(exc, "routing failed"))
     return dispatch
 
 
@@ -111,8 +112,8 @@ def make_socket_dispatcher(dispatcher: CommandDispatcher, task_registry: TaskReg
             return await dispatcher.dispatch(payload)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception("Slack Socket Mode routing failed")
+        except Exception as exc:
+            log.error("Slack Socket Mode routing failed: %s", safe_error(exc, "routing failed"))
             return None
     return dispatch
 
@@ -124,8 +125,8 @@ def make_interaction_dispatcher(dispatcher: CommandDispatcher) -> Callable[[Any]
             return await dispatcher.handle_socket_envelope(payload)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception("Slack interaction routing failed")
+        except Exception as exc:
+            log.error("Slack interaction routing failed: %s", safe_error(exc, "interaction routing failed"))
             return None
     return dispatch
 

@@ -114,15 +114,24 @@ class DaemonSupervisor:
                 f"could not parse session id/port from `polytoken new` output: {out.strip()[:500]!r}"
             )
         session_id = match.group("sid")
-        info = await self.find_session(session_id)
-        if info is None:
-            raise DaemonSupervisorError(
-                f"new daemon {session_id!r} was not found in `polytoken sessions --format json`"
-            )
-        if not info.credential_file_path:
-            raise DaemonSupervisorError(
-                f"new daemon {session_id!r} has no credential file in the session registry"
-            )
+        try:
+            info = await self.find_session(session_id)
+            if info is None:
+                raise DaemonSupervisorError(
+                    f"new daemon {session_id!r} was not found in `polytoken sessions --format json`"
+                )
+            if not info.credential_file_path:
+                raise DaemonSupervisorError(
+                    f"new daemon {session_id!r} has no credential file in the session registry"
+                )
+        except Exception:
+            # The daemon already exists once spawn output is parsed. Credential
+            # discovery failures must not leave an unreachable process behind.
+            try:
+                await self.terminate(session_id)
+            except Exception as cleanup_exc:
+                log.warning("failed to clean up partially discovered daemon %s: %s", session_id, type(cleanup_exc).__name__)
+            raise
         return SpawnResult(
             session_id=session_id,
             port=int(match.group("port")),
