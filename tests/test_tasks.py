@@ -500,7 +500,11 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert start["recipient_team_id"] == task.team_id
     assert start["task_display_mode"] == "timeline"
     assert [chunk["type"] for chunk in start["chunks"]] == ["plan_update", "task_update"]
-    assert any(call["markdown_text"] == "final answer" for call in rich_bot.stream_appends)
+    assert any(
+        call["chunks"] == [{"type": "markdown_text", "text": "final answer"}]
+        and call["markdown_text"] is None
+        for call in rich_bot.stream_appends
+    )
     task_chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call["chunks"]]
     assert any(chunk["type"] == "task_update" and "Bash: pwd" in chunk["title"] for chunk in task_chunks)
     assert any(chunk["type"] == "task_update" and chunk["id"] == "subagent-h1" for chunk in task_chunks)

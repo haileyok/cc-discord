@@ -1045,7 +1045,12 @@ class TaskRegistry:
             task.progress_answer = (task.progress_answer + cleaned)[-12000:]
         chunks = self._progress_chunk_text(cleaned)
         for chunk in chunks:
-            if not await self._append_progress(task, markdown_text=chunk):
+            # This stream starts in structured chunks mode for plan/task UI.
+            # Slack rejects mixing the separate markdown_text parameter with
+            # that mode (streaming_mode_mismatch), so text is a chunk too.
+            if not await self._append_progress(
+                task, chunks=[{"type": "markdown_text", "text": chunk}],
+            ):
                 break
         if task.progress_fallback_ts is not None:
             # The fallback card is the turn surface: keep answer text inside it
