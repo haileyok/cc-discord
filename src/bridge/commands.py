@@ -159,10 +159,12 @@ def _text_field(values: Mapping[str, Any], *names: str) -> str:
     for block in values.values():
         if not isinstance(block, Mapping):
             continue
-        for action in block.values():
+        for action_key, action in block.items():
             if not isinstance(action, Mapping):
                 continue
-            action_id = str(action.get("action_id") or "")
+            # Real view_submission payloads key actions by action_id and do
+            # not necessarily repeat action_id inside the action object.
+            action_id = str(action.get("action_id") or action_key or "")
             if action_id in names or any(name in action_id for name in names):
                 value = action.get("value")
                 if value is None:

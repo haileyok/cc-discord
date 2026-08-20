@@ -364,7 +364,7 @@ async def test_start_agent_here_shortcut_binds_selected_thread_without_editing_r
     submitted = await dispatcher.dispatch({
         "type": "view_submission", "team_id": "T1", "user_id": "UOWNER",
         "view": {"callback_id": "bridge.start_agent_here", "private_metadata": shortcut.modal["private_metadata"],
-                 "state": {"values": {"start_here_cwd": {"cwd": {"action_id": "cwd", "value": str(tmp_path)}}}}},
+                 "state": {"values": {"start_here_cwd": {"cwd": {"type": "plain_text_input", "value": str(tmp_path)}}}}},
     })
     assert "Started" in submitted.text
     call = next(call for call in registry.calls if call[0] == "spawn_task")
