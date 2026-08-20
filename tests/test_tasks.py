@@ -195,7 +195,7 @@ class RichFakeBot(FakeBot):
             "markdown_text": markdown_text,
         }
         self.stream_starts.append(call)
-        return "stream-1"
+        return f"stream-{len(self.stream_starts)}"
 
     async def append_stream(self, channel_id, stream_ts, *, markdown_text=None, chunks=None):
         self.stream_appends.append({
@@ -562,6 +562,27 @@ async def test_long_fallback_answer_uses_small_update_and_threaded_continuations
 
 
 @pytest.mark.asyncio
+async def test_native_progress_rotation_replaces_and_deletes_old_stream(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.rotate")
+    await reg._render(task, events.TurnStarted("prompt-rotate"))
+    task.progress_lines.append("✓ Bash: checking services")
+    task.progress_answer = "partial answer"
+
+    assert await reg._rotate_progress_stream(task)
+    assert task.progress_stream_ts == "stream-2"
+    assert len(bot.stream_starts) == 2
+    replacement = bot.stream_starts[-1]["chunks"]
+    assert any(chunk.get("id") == "activity" for chunk in replacement)
+    assert any(chunk.get("type") == "markdown_text" and chunk.get("text") == "partial answer" for chunk in replacement)
+    assert bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
+    assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": "stream-1"}]
+    await reg._render(task, events.TurnComplete("prompt-rotate"))
+    assert task.progress_keepalive is None
+
+
+@pytest.mark.asyncio
 async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memory_db):
     rich_bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
@@ -627,7 +648,7 @@ async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db
     assert task.progress_stream_disabled is False
     await reg._render(task, events.TurnStarted("prompt-retry"))
     assert len(bot.stream_starts) == 2
-    assert task.progress_stream_ts == "stream-1"
+    assert task.progress_stream_ts == "stream-2"
 
 
 class TestAC5AppBudget:

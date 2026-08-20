@@ -262,6 +262,7 @@ class Task:
     # separate "Agent is working" message.
     status_message_ts: str | None = None
     progress_stream_ts: str | None = None
+    progress_stream_started_at: float | None = None
     progress_fallback_ts: str | None = None
     progress_stream_disabled: bool = False
     progress_started: bool = False
@@ -269,6 +270,7 @@ class Task:
     progress_sequence: int = 0
     progress_answer: str = ""
     progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
+    progress_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
 
@@ -1038,6 +1040,7 @@ class TaskRegistry:
                 await bot.edit_message(task.channel_id, stream_ts, text=fallback, blocks=blocks)
                 task.progress_fallback_ts = stream_ts
                 task.progress_stream_ts = None
+                task.progress_stream_started_at = None
                 return
             except Exception as exc:
                 log.warning("native Slack stream fallback conversion failed: %s", safe_error(exc, "progress fallback failed"))
@@ -1060,6 +1063,13 @@ class TaskRegistry:
 
     async def _append_progress(self, task: Task, *, markdown_text: str | None = None,
                                chunks: list[dict[str, Any]] | None = None) -> bool:
+        async with task.progress_io_lock:
+            return await self._append_progress_locked(
+                task, markdown_text=markdown_text, chunks=chunks,
+            )
+
+    async def _append_progress_locked(self, task: Task, *, markdown_text: str | None = None,
+                                      chunks: list[dict[str, Any]] | None = None) -> bool:
         if not task.progress_started:
             return False
         if task.progress_stream_ts is not None and not task.progress_stream_disabled:
@@ -1096,13 +1106,75 @@ class TaskRegistry:
             await self._update_fallback_progress(task)
         return False
 
+    def _native_progress_chunks(self, task: Task) -> list[dict[str, Any]]:
+        title = task.progress_lines[-1][:240] if task.progress_lines else "Starting agent turn…"
+        chunks: list[dict[str, Any]] = [
+            {"type": "plan_update", "title": "Agent working"},
+            {"type": "task_update", "id": "activity", "title": title, "status": "in_progress"},
+        ]
+        chunks.extend(
+            {"type": "markdown_text", "text": text}
+            for text in self._progress_chunk_text(task.progress_answer)
+        )
+        return chunks
+
+    async def _rotate_progress_stream(self, task: Task) -> bool:
+        """Replace a native stream before Slack's hard server-side lifetime."""
+        async with task.progress_io_lock:
+            old_ts = task.progress_stream_ts
+            if not task.progress_started or old_ts is None or task.progress_stream_disabled:
+                return False
+            starter = getattr(self._require_bot(), "start_stream", None)
+            if not callable(starter):
+                return False
+            try:
+                replacement = starter(
+                    task.channel_id, task.root_ts,
+                    recipient_user_id=task.owner_user_id,
+                    recipient_team_id=task.team_id,
+                    chunks=self._native_progress_chunks(task),
+                    task_display_mode="timeline",
+                )
+                if inspect.isawaitable(replacement):
+                    replacement = await replacement
+                if not replacement:
+                    raise RuntimeError("Slack stream rotation omitted message timestamp")
+            except Exception as exc:
+                code = slack_error_code(exc)
+                log.warning(
+                    "native Slack stream rotation failed%s: %s",
+                    f" ({code})" if code else "",
+                    safe_error(exc, "stream rotation failed"),
+                )
+                return False
+            task.progress_stream_ts = str(replacement)
+            task.progress_stream_started_at = time.monotonic()
+            stopper = getattr(self._require_bot(), "stop_stream", None)
+            if callable(stopper):
+                with contextlib.suppress(Exception):
+                    result = stopper(task.channel_id, old_ts)
+                    if inspect.isawaitable(result):
+                        await result
+            deleter = getattr(self._require_bot(), "delete_message", None)
+            if callable(deleter):
+                with contextlib.suppress(Exception):
+                    result = deleter(task.channel_id, old_ts)
+                    if inspect.isawaitable(result):
+                        await result
+            return True
+
     async def _stream_keepalive(self, task: Task) -> None:
-        """Keep Slack's undocumented short-lived native stream active."""
+        """Keep native progress active and rotate before Slack's hard TTL."""
         try:
             while task.progress_started and task.progress_stream_ts is not None:
                 await asyncio.sleep(20)
                 if not task.progress_started or task.progress_stream_ts is None:
                     return
+                started = task.progress_stream_started_at or time.monotonic()
+                if time.monotonic() - started >= 240:
+                    if not await self._rotate_progress_stream(task):
+                        return
+                    continue
                 title = task.progress_lines[-1][:240] if task.progress_lines else "Agent working"
                 if not await self._append_progress(task, chunks=[{
                     "type": "task_update", "id": "activity",
@@ -2097,6 +2169,7 @@ class TaskRegistry:
                 if not stream_ts:
                     raise RuntimeError("Slack stream start omitted message timestamp")
                 task.progress_stream_ts = str(stream_ts)
+                task.progress_stream_started_at = time.monotonic()
                 task.progress_keepalive = asyncio.create_task(self._stream_keepalive(task))
             except Exception as exc:
                 task.progress_stream_disabled = True
@@ -2136,6 +2209,7 @@ class TaskRegistry:
                         if inspect.isawaitable(result):
                             await result
                         task.progress_stream_ts = None
+                        task.progress_stream_started_at = None
                     except Exception as exc:
                         task.progress_stream_disabled = True
                         code = slack_error_code(exc)
