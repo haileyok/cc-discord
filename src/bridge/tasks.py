@@ -2091,15 +2091,30 @@ class TaskRegistry:
             if task.progress_fallback_ts is not None:
                 if outcome == "complete":
                     if task.progress_answer:
-                        # Transform the one working card into the final answer.
-                        answer_blocks = [
-                            {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
-                            for chunk in self._progress_chunk_text(task.progress_answer, 2900)
-                        ][:50]
-                        await self._require_bot().edit_message(
-                            task.channel_id, task.progress_fallback_ts,
-                            text=task.progress_answer[:4000], blocks=answer_blocks,
-                        )
+                        # Converted stream messages have a lower practical
+                        # chat.update payload ceiling than ordinary messages.
+                        # Keep the edited card small and continue long answers
+                        # as normal threaded replies instead of losing TurnComplete.
+                        answer_chunks = self._progress_chunk_text(task.progress_answer, 2800)
+                        first = answer_chunks[0]
+                        edited = False
+                        try:
+                            await self._require_bot().edit_message(
+                                task.channel_id, task.progress_fallback_ts,
+                                text=first,
+                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": first}}],
+                            )
+                            edited = True
+                        except Exception as exc:
+                            code = slack_error_code(exc)
+                            log.warning(
+                                "final fallback update failed%s: %s",
+                                f" ({code})" if code else "",
+                                safe_error(exc, "final answer update failed"),
+                            )
+                        for chunk in answer_chunks[1 if edited else 0:]:
+                            with contextlib.suppress(Exception):
+                                await self._post(task, chunk)
                     else:
                         deleter = getattr(self._require_bot(), "delete_message", None)
                         if callable(deleter):

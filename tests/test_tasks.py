@@ -530,6 +530,24 @@ async def test_turn_status_fallback_is_one_editable_block_and_no_legacy_working_
 
 
 @pytest.mark.asyncio
+async def test_long_fallback_answer_uses_small_update_and_threaded_continuations(in_memory_db):
+    reg, bot = _registry(in_memory_db)
+    task, _ = await _task(reg, root="1000.long-fallback")
+    answer = "x" * 7000
+    await reg._render(task, events.TurnStarted("prompt-long"))
+    working_ts = task.progress_fallback_ts
+    await reg._render(task, events.AssistantText(answer))
+    await reg._render(task, events.TurnComplete("prompt-long"))
+
+    final_edit = [edit for edit in bot.edits if edit["message_ts"] == working_ts and edit.get("blocks")][-1]
+    assert len(final_edit["blocks"]) == 1
+    assert len(final_edit["text"]) <= 2800
+    continuations = [post["text"] for post in bot.posts[1:]]
+    assert "".join([final_edit["text"], *continuations]) == answer
+    assert task.progress_started is False and task.progress_fallback_ts is None
+
+
+@pytest.mark.asyncio
 async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memory_db):
     rich_bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
