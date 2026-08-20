@@ -583,7 +583,12 @@ class CommandDispatcher:
         callback = str(view.get("callback_id") or payload.get("callback_id") or "")
         values = _mapping(_mapping(view.get("state")).get("values"))
         metadata = _json_or_mapping(view.get("private_metadata"))
-        actor = _actor_id(payload) or str(_mapping(view.get("user")).get("id") or "")
+        actor = _actor_id(payload) or str(_mapping(payload.get("user")).get("id") or _mapping(view.get("user")).get("id") or "")
+        # View submissions omit top-level conversation context. Restore the
+        # channel captured when the modal was opened so confirmations/errors
+        # can be delivered ephemerally without recursive response failures.
+        if metadata.get("channel_id"):
+            payload = {**dict(payload), "channel_id": str(metadata["channel_id"]), "actor_id": actor}
         if callback in {"bridge.start_agent_here", "start_agent_here_modal"}:
             self._configured_owner(actor)
             team = str(metadata.get("team_id") or "")
@@ -599,7 +604,11 @@ class CommandDispatcher:
             }), None)
             cwd = str(getattr(selected, "path", "")) if selected is not None else str(Path(requested).expanduser())
             if not requested or not Path(cwd).is_dir():
-                return await self._error(payload, "Choose an existing working directory or configured project.")
+                project_hint = (
+                    "No projects were loaded; enter an absolute path or set BRIDGE_PROJECT_ROOTS and restart."
+                    if not self.projects else "Choose an existing working directory or one of the configured projects."
+                )
+                return await self._error(payload, project_hint)
             task = await self.registry.spawn_task(
                 cwd, team_id=team, channel_id=channel, owner_user_id=actor,
                 root_ts=root, prompt=prompt or None, bind_existing_root=True,
@@ -846,6 +855,7 @@ def _configure_modal(task: Task, state: Mapping[str, Any], models: Any) -> dict[
 
     metadata = {
         "task_id": task.task_id,
+        "channel_id": task.channel_id,
         "current_model": current_model,
         "current_effort": current_effort,
         "current_facet": current_facet,
@@ -902,7 +912,7 @@ def _participants_modal(task: Task) -> dict[str, Any]:
         "type": "modal", "callback_id": "bridge.participants",
         "title": {"type": "plain_text", "text": "Participants"},
         "submit": {"type": "plain_text", "text": "Save"}, "close": {"type": "plain_text", "text": "Cancel"},
-        "private_metadata": json.dumps({"task_id": task.task_id}),
+        "private_metadata": json.dumps({"task_id": task.task_id, "channel_id": task.channel_id}),
         "blocks": [{"type": "input", "block_id": "participants", "optional": True,
                      "label": {"type": "plain_text", "text": "Slack user IDs"},
                      "element": {"type": "plain_text_input", "action_id": "participant_ids", "placeholder": {"type": "plain_text", "text": "U0123, U0456"}}}],
