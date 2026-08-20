@@ -267,6 +267,7 @@ class Task:
     progress_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
     progress_answer: str = ""
+    progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
 
@@ -1047,6 +1048,31 @@ class TaskRegistry:
         else:
             await self._update_fallback_progress(task)
         return False
+
+    async def _stream_keepalive(self, task: Task) -> None:
+        """Keep Slack's undocumented short-lived native stream active."""
+        try:
+            while task.progress_started and task.progress_stream_ts is not None:
+                await asyncio.sleep(20)
+                if not task.progress_started or task.progress_stream_ts is None:
+                    return
+                title = task.progress_lines[-1][:240] if task.progress_lines else "Agent working"
+                if not await self._append_progress(task, chunks=[{
+                    "type": "task_update", "id": "activity",
+                    "title": title, "status": "in_progress",
+                }]):
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _stop_stream_keepalive(self, task: Task) -> None:
+        keepalive = task.progress_keepalive
+        task.progress_keepalive = None
+        if keepalive is None:
+            return
+        keepalive.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await keepalive
 
     async def _progress_line(self, task: Task, line: str) -> None:
         if not task.progress_started:
@@ -2011,6 +2037,7 @@ class TaskRegistry:
                 if not stream_ts:
                     raise RuntimeError("Slack stream start omitted message timestamp")
                 task.progress_stream_ts = str(stream_ts)
+                task.progress_keepalive = asyncio.create_task(self._stream_keepalive(task))
             except Exception as exc:
                 task.progress_stream_disabled = True
                 code = slack_error_code(exc)
@@ -2025,6 +2052,7 @@ class TaskRegistry:
 
     async def _end_turn(self, task: Task, *, outcome: str = "complete") -> None:
         if task.progress_started:
+            await self._stop_stream_keepalive(task)
             final_title = {
                 "complete": "Agent working",
                 "cancelled": "Agent cancelled",

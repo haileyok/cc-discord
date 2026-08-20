@@ -535,6 +535,7 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
     task, _ = await _task(reg, root="1000.rich")
     await reg._render(task, events.TurnStarted("prompt-rich"))
+    assert task.progress_keepalive is not None and not task.progress_keepalive.done()
     await reg._render(task, events.ToolLine("✓ Bash: pwd"))
     await reg._render(task, events.ToolLine("✓ Read: pyproject.toml"))
     await reg._render(task, events.AssistantText("final answer"))
@@ -566,6 +567,7 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     ]
     assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
     assert task.progress_stream_ts is None and task.progress_started is False
+    assert task.progress_keepalive is None
 
 
 @pytest.mark.asyncio
