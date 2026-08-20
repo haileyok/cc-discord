@@ -1367,6 +1367,7 @@ class TaskRegistry:
         mode = str(mode).strip().lower()
         if mode not in {"personal", "collaborative"}:
             raise TaskSpawnError("mode must be personal or collaborative")
+        reusable: Task | None = None
         if bind_existing_root:
             root_ts = str(root_ts or "").strip()
             if not root_ts:
@@ -1374,11 +1375,13 @@ class TaskRegistry:
             existing = self.get_by_conversation(team_id, channel_id, root_ts)
             if existing is not None and existing.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
                 raise TaskRoutingError("that Slack thread already has an active task")
+            if existing is not None:
+                reusable = existing
             if existing is None:
                 restored = await self.restore_by_conversation(team_id, channel_id, root_ts)
                 if restored is not None and restored.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
                     return restored
-        task_id = str(uuid.uuid4())
+        task_id = reusable.task_id if reusable is not None else str(uuid.uuid4())
         created = int(time.time())
         if root_ts is None:
             from bridge.commands import build_task_root_blocks
@@ -1389,6 +1392,8 @@ class TaskRegistry:
             root_ts = str(roots)
         channel_owned = bool(mode == "collaborative" and channel_id != self.home_channel_id and channel_id in getattr(bot, "_owned_channel_ids", set()))
         task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned, mention_required=bind_existing_root)
+        if reusable is not None:
+            self._torn_down.discard(task_id)
         if bind_existing_root:
             # Reserve the exact key synchronously before the first await so two
             # simultaneous message-shortcut submissions cannot both bind it.
@@ -1485,8 +1490,6 @@ class TaskRegistry:
             return False
         if task.status in {"rebinding", "promoting"} or task.promotion_state in {"preparing"}:
             return False
-        if task.status not in {"running", "spawning"}:
-            return True
         if task.mention_required:
             cleaned = _strip_verified_mention(msg.text, self._bridge_user_id)
             if cleaned is not None:
@@ -1504,6 +1507,12 @@ class TaskRegistry:
         if not await self._authorized_message(task, msg.actor):
             return False
         if not await self._dedup_message(msg):
+            return True
+        if task.status not in {"running", "spawning"}:
+            await self._post(
+                task,
+                f"⏹️ Task `{task.task_id[:8]}` is {task.status} and cannot accept prompts. Use *Start agent here* to create a new session in this thread.",
+            )
             return True
         pending = await self._pending_for(task, msg.actor_id)
         paths = await self._save_attachments(task, msg)

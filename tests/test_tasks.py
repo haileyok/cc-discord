@@ -434,6 +434,20 @@ class TestAC2IdentityRouting:
         assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE> verified", "E4", "M4", (attachment,)))
         assert json.loads(client.prompts[0])["body"] == "verified @" + str(bot.downloads[0]["path"])
 
+    async def test_stopped_existing_thread_mention_gets_visible_restart_notice(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.stopped")
+        task.mention_required = True
+        task.status = "stopped"
+        await reg._persist_root(task)
+        assert await reg.maybe_route_message(SlackMessage(
+            "T1", "CHOME", task.root_ts, SlackActor("UOWNER"),
+            "<@UBRIDGE> investigate", "E-stopped", "M-stopped",
+        ))
+        assert client.prompts == []
+        assert "is stopped" in bot.posts[-1]["text"]
+        assert "Start agent here" in bot.posts[-1]["text"]
+
     async def test_existing_thread_trusts_authenticated_app_mention_without_literal_token(self, in_memory_db):
         reg, _ = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.004mention")
@@ -785,6 +799,26 @@ class TestAC10DedupAndDaemonErrors:
         with pytest.raises(TaskSpawnError):
             await reg.spawn_task(str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER")
         assert any("failed to spawn" in post.get("text", "") for post in bot.posts)
+
+
+@pytest.mark.asyncio
+async def test_start_agent_here_reuses_terminal_binding_without_unique_conflict(in_memory_db, tmp_path):
+    reg, _ = _registry(in_memory_db)
+    original, _ = await _task(reg, root="1000.terminal")
+    original.status = "stopped"
+    await reg._persist_root(original)
+
+    restarted = await reg.spawn_task(
+        str(tmp_path), team_id="T1", channel_id="CHOME", owner_user_id="UOWNER",
+        root_ts=original.root_ts, bind_existing_root=True,
+    )
+    assert restarted.task_id == original.task_id
+    assert restarted.status == "running"
+    assert restarted.polytoken_session_id == "sess-1"
+    runtime = await state.get_runtime(in_memory_db, original.task_id)
+    assert runtime is not None and runtime.status == "running"
+    assert runtime.key == original.key
+    await reg.shutdown()
 
 
 @pytest.mark.asyncio
