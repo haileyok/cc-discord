@@ -562,6 +562,20 @@ async def test_long_fallback_answer_uses_small_update_and_threaded_continuations
 
 
 @pytest.mark.asyncio
+async def test_background_job_notification_updates_timeline_without_owner_ping(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.notification")
+    await reg._render(task, events.TurnStarted("prompt-notification"))
+    await reg._render(task, events.AttentionPing("job shell_exec:validate completed (exit 1)"))
+
+    chunks = [call["chunks"][0] for call in bot.stream_appends if call.get("chunks")]
+    assert any(chunk.get("id") == "background-job" for chunk in chunks)
+    assert not any(f"<@{task.owner_user_id}>" in str(post.get("text")) for post in bot.posts)
+    await reg._render(task, events.TurnComplete("prompt-notification"))
+
+
+@pytest.mark.asyncio
 async def test_native_progress_rotation_replaces_and_deletes_old_stream(in_memory_db):
     bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())

@@ -958,7 +958,15 @@ class TaskRegistry:
             elif isinstance(action, StatusNote):
                 await self._post(task, action.text)
             elif isinstance(action, AttentionPing):
-                await self._post(task, f"<@{task.owner_user_id}> 🔔 {action.summary}")
+                summary = str(action.summary).strip()[:240] or "Background job completed"
+                if task.progress_started:
+                    await self._progress_task_update(
+                        task, f"🔔 {summary}", task_id="background-job", status="complete",
+                    )
+                else:
+                    # Notifications outside a turn remain visible, but routine
+                    # background completions must never @-mention the owner.
+                    await self._post(task, f"🔔 {summary}")
             elif isinstance(action, ImageResolved):
                 log.info("image reference resolved for %s", task.task_id[:8])
             elif isinstance(action, StateRefresh):
