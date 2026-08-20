@@ -434,6 +434,41 @@ class TestAC2IdentityRouting:
         assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE> verified", "E4", "M4", (attachment,)))
         assert json.loads(client.prompts[0])["body"] == "verified @" + str(bot.downloads[0]["path"])
 
+    async def test_existing_thread_routes_block_only_rich_text_mention(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.004c")
+        task.mention_required = True
+        event = {
+            "team_id": "T1", "channel_id": "CHOME", "root_ts": task.root_ts,
+            "actor_id": "UOWNER", "message_ts": "M-rich", "id": "E-rich",
+            "text": "", "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "user", "user_id": "UBRIDGE"},
+                    {"type": "text", "text": " summarize this thread"},
+                ]},
+            ]}],
+        }
+        assert await reg.maybe_route_message(event)
+        assert json.loads(client.prompts[0])["body"] == "summarize this thread"
+        assert not bot.posts
+
+    async def test_existing_thread_empty_block_mention_gets_visible_guidance(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.004d")
+        task.mention_required = True
+        event = {
+            "team_id": "T1", "channel_id": "CHOME", "root_ts": task.root_ts,
+            "actor_id": "UOWNER", "message_ts": "M-empty", "id": "E-empty",
+            "text": "", "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "user", "user_id": "UBRIDGE"},
+                ]},
+            ]}],
+        }
+        assert await reg.maybe_route_message(event)
+        assert client.prompts == []
+        assert "supplied no request text" in bot.posts[-1]["text"]
+
 
 class TestAC4AttachmentsAndInterrogatives:
     async def test_authenticated_bounded_attachment_becomes_reference(self, in_memory_db):

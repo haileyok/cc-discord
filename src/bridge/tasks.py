@@ -334,6 +334,37 @@ def _file(value: Any) -> SlackFile:
     )
 
 
+def _slack_blocks_text(blocks: Any) -> str:
+    """Recover message text from Slack rich-text blocks when ``text`` is empty."""
+    if not isinstance(blocks, (list, tuple)):
+        return ""
+    parts: list[str] = []
+
+    def visit(elements: Any) -> None:
+        if not isinstance(elements, (list, tuple)):
+            return
+        for element in elements:
+            if not isinstance(element, Mapping):
+                continue
+            kind = str(element.get("type") or "")
+            if kind == "text":
+                parts.append(str(element.get("text") or ""))
+            elif kind == "user":
+                user_id = str(element.get("user_id") or "")
+                if user_id:
+                    parts.append(f"<@{user_id}>")
+            elif kind in {"broadcast", "channel", "emoji", "link"}:
+                value = element.get("range") or element.get("channel_id") or element.get("name") or element.get("text") or element.get("url")
+                if value:
+                    parts.append(str(value))
+            visit(element.get("elements"))
+
+    for block in blocks:
+        if isinstance(block, Mapping):
+            visit(block.get("elements"))
+    return "".join(parts).strip()
+
+
 def normalize_message(value: Any) -> SlackMessage:
     """Translate a Slack adapter object/dict without retaining provider objects.
 
@@ -368,7 +399,11 @@ def normalize_message(value: Any) -> SlackMessage:
         channel_id=str(channel or ""),
         root_ts=str(root or ""),
         actor=actor,
-        text=str(_value(source, "text", None) or _value(source, "content", "")),
+        text=str(
+            _value(source, "text", None)
+            or _value(source, "content", None)
+            or _slack_blocks_text(_value(source, "blocks", ()))
+        ),
         event_id=event_id,
         message_ts=str(message_ts) if message_ts is not None else None,
         files=tuple(_file(item) for item in files),
@@ -1402,6 +1437,8 @@ class TaskRegistry:
         body_parts.extend(voice_parts)
         body_parts.extend(f"@{path}" for path in other_paths)
         if not body_parts:
+            if task.mention_required:
+                await self._post(task, "👋 I saw the mention, but Slack supplied no request text. Mention me with what you want the agent to do.")
             return True
         if msg.actor.is_app:
             if task.mode != "collaborative" or not await self._is_participant(task, msg.actor_id, is_app=True):
