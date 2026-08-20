@@ -604,6 +604,19 @@ async def test_long_fallback_answer_uses_small_update_and_threaded_continuations
 
 
 @pytest.mark.asyncio
+async def test_idle_background_notification_does_not_open_progress_stream(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.idle-notification")
+    await reg._render(task, events.AttentionPing("background job completed"))
+    assert task.progress_started is False
+    assert task.progress_keepalive is None
+    assert bot.stream_starts == []
+    assert len(bot.posts) == 1
+    assert "<@UOWNER>" not in bot.posts[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_resumed_activity_reconstructs_one_native_progress_surface(in_memory_db):
     bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
@@ -774,6 +787,9 @@ class TestAC6PromotionAndMembership:
     async def test_promote_is_create_invite_root_then_atomic_swap(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
         task, _ = await _task(reg, root="1000.008")
+        task.mention_required = True
+        task.control_message_ts = "old-controls"
+        await reg._persist_root(task)
         promoted = await reg.promote_task(task.task_id, "UOWNER", ["UOTHER"], name="collab")
         assert promoted.mode == "collaborative"
         assert promoted.channel_id == "GNEW"
@@ -783,6 +799,10 @@ class TestAC6PromotionAndMembership:
         assert bot.invites[-1] == {"channel_id": "GNEW", "actor_ids": ["UOTHER"]}
         assert (await state.get_root(in_memory_db, promoted.key)).owner.mode == "collaborative"
         assert (await state.get_active_promotion(in_memory_db, ConversationKey("T1", "CHOME", "1000.008"))) is not None
+        runtime = await state.get_runtime(in_memory_db, promoted.task_id)
+        assert runtime is not None
+        assert runtime.control_message_ts == promoted.root_ts
+        assert runtime.mention_required is False
 
     async def test_default_promotion_preserves_participant_objects_and_routes_app_message(self, in_memory_db):
         reg, bot = _registry(in_memory_db)

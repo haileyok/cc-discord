@@ -878,6 +878,9 @@ class TaskRegistry:
         except asyncio.CancelledError:
             return
 
+    async def refresh_task_header(self, task: Task) -> None:
+        await self._refresh_task_header(task)
+
     async def _refresh_task_header(self, task: Task, state: Mapping[str, Any] | None = None) -> None:
         target_ts = task.control_message_ts
         if not target_ts or self._bot is None:
@@ -961,7 +964,7 @@ class TaskRegistry:
             # before rendering resumed activity instead of posting each event.
             if not task.progress_started and isinstance(action, (
                 AssistantText, AssistantThinking, ToolLine, ToolDiff, ToolFailure,
-                SubagentStarted, SubagentActivity, SubagentCompleted, AttentionPing,
+                SubagentStarted, SubagentActivity, SubagentCompleted,
             )):
                 await self._begin_turn(task)
             if isinstance(action, AssistantText):

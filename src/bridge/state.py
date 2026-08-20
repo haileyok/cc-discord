@@ -617,12 +617,12 @@ async def replace_runtime_binding(
         for participant in participants:
             await _participant_sql(conn, runtime.key, participant, stamp)
         await conn.execute(
-            "UPDATE task_runtime SET team_id=?, channel_id=?, root_id=?, status=?, cwd=?, session_id=?, port=?, owner_id=?, owner_kind=?, mode=?, last_activity=?, app_exchange_budget=?, app_exchanges=?, owner_alerted=?, promotion_state=?, binding_id=?, cleanup_pending=?, channel_owned=?, updated_at=? WHERE task_id=?",
+            "UPDATE task_runtime SET team_id=?, channel_id=?, root_id=?, status=?, cwd=?, session_id=?, port=?, owner_id=?, owner_kind=?, mode=?, last_activity=?, app_exchange_budget=?, app_exchanges=?, owner_alerted=?, promotion_state=?, binding_id=?, cleanup_pending=?, channel_owned=?, mention_required=?, control_message_ts=?, updated_at=? WHERE task_id=?",
             (runtime.key.team_id, runtime.key.channel_id, runtime.key.root_id, runtime.status,
              runtime.cwd, runtime.session_id, runtime.port, runtime.owner.actor_id, runtime.owner.kind.value,
              runtime.owner.mode, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges,
              int(runtime.owner_alerted), runtime.promotion_state, runtime.binding_id, int(runtime.cleanup_pending), int(runtime.channel_owned),
-             stamp, runtime.task_id),
+             int(runtime.mention_required), runtime.control_message_ts, stamp, runtime.task_id),
         )
         await conn.commit()
     except BaseException:

@@ -811,6 +811,12 @@ class CommandDispatcher:
         return await self._open_modal(payload, _participants_modal(task))
 
     async def _decorate_root(self, task: Task) -> None:
+        refresher = getattr(self.registry, "refresh_task_header", None)
+        if callable(refresher):
+            result = refresher(task)
+            if inspect.isawaitable(result):
+                await result
+            return
         editor = getattr(self.bot, "edit_message", None)
         if not callable(editor):
             return
