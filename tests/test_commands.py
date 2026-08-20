@@ -211,6 +211,15 @@ async def test_agent_commands_cover_model_facet_effort_title_stats_todos_and_pin
     assert any(edit["channel_id"] == "GHOME" and edit["message_ts"] == "100.1" and edit["text"] == "New title" for edit in bot.edits)
 
 
+def test_view_submission_normalization_restores_private_channel_context() -> None:
+    normalized = normalize_socket_payload({
+        "type": "view_submission", "user": {"id": "UOWNER"},
+        "view": {"private_metadata": json.dumps({"channel_id": "COTHER"})},
+    })
+    assert normalized["channel_id"] == "COTHER"
+    assert normalized["actor_id"] == "UOWNER"
+
+
 def test_working_directory_resolution_accepts_quotes_case_and_aliases(tmp_path: Path) -> None:
     project = SimpleNamespace(name="attie", root_label="bluesky", path=tmp_path)
     assert _resolve_working_directory("Attie", [project])[0] == str(tmp_path.resolve())
@@ -350,8 +359,24 @@ async def test_start_agent_here_requires_bot_channel_membership() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_agent_here_shortcut_binds_selected_thread_without_editing_root(tmp_path: Path) -> None:
+async def test_start_agent_here_submission_returns_existing_active_task() -> None:
     registry = LocalRegistry()
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    response = await dispatcher.dispatch({
+        "type": "view_submission", "team_id": "T1", "user": {"id": "UOWNER"},
+        "view": {
+            "callback_id": "bridge.start_agent_here",
+            "private_metadata": json.dumps({"team_id": "T1", "channel_id": "GHOME", "root_ts": "100.1"}),
+            "state": {"values": {}},
+        },
+    })
+    assert "already has active task" in response.text
+    assert not any(call[0] == "spawn_task" for call in registry.calls)
+
+
+@pytest.mark.asyncio
+async def test_start_agent_here_shortcut_binds_selected_thread_without_editing_root(tmp_path: Path) -> None:
+    registry = LocalRegistry(LocalTask(root_ts="different-root"))
     bot = LocalBot()
     dispatcher = CommandDispatcher(bot, registry)
     shortcut = await dispatcher.dispatch({

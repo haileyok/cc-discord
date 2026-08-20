@@ -147,6 +147,14 @@ def normalize_socket_payload(envelope: Any) -> dict[str, Any]:
     elif envelope_type in {"events_api", "event_callback", "events"} or isinstance(event, Mapping):
         normalized.setdefault("type", "events")
     normalized.setdefault("envelope_id", raw.get("envelope_id"))
+    if str(normalized.get("type") or "") == "view_submission":
+        view = _mapping(normalized.get("view"))
+        metadata = _json_or_mapping(view.get("private_metadata"))
+        if metadata.get("channel_id") and not normalized.get("channel_id"):
+            normalized["channel_id"] = str(metadata["channel_id"])
+        user = normalized.get("user")
+        if isinstance(user, Mapping) and user.get("id"):
+            normalized.setdefault("actor_id", str(user["id"]))
     for key in ("ack", "respond", "response_url", "trigger_id"):
         if key in raw and key not in normalized:
             normalized[key] = raw[key]
@@ -628,6 +636,12 @@ class CommandDispatcher:
             root = str(metadata.get("root_ts") or "")
             if not team or not channel or not root or _team_id(payload, self.bot) != team:
                 raise TaskRoutingError("selected Slack thread binding is invalid")
+            existing = self.registry.get_by_conversation(team, channel, root)
+            if existing is not None and existing.status in {"spawning", "running", "paused", "rebinding", "promoting"}:
+                return await self._reply(
+                    payload,
+                    f"✅ This thread already has active task `{existing.task_id[:8]}`.",
+                )
             requested = _text_field(values, "cwd", "project")
             prompt = _text_field(values, "initial_prompt", "prompt")
             cwd, normalized = _resolve_working_directory(requested, self.projects)
