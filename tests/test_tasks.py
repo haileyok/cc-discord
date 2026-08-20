@@ -604,6 +604,55 @@ async def test_long_fallback_answer_uses_small_update_and_threaded_continuations
 
 
 @pytest.mark.asyncio
+async def test_resumed_activity_reconstructs_one_native_progress_surface(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.resumed")
+    assert task.progress_started is False
+
+    await reg._render(task, events.AssistantText("review is still running"))
+    await reg._render(task, events.ToolLine("✓ job_block"))
+    await reg._render(task, events.AttentionPing("review completed"))
+
+    assert len(bot.stream_starts) == 1
+    assert not bot.posts
+    task_chunks = [call["chunks"][0] for call in bot.stream_appends if call.get("chunks")]
+    assert any(chunk.get("type") == "markdown_text" for chunk in task_chunks)
+    assert any(chunk.get("id") == "activity" for chunk in task_chunks)
+    assert any(chunk.get("id") == "background-job" for chunk in task_chunks)
+    await reg._render(task, events.TurnComplete("resumed"))
+
+
+@pytest.mark.asyncio
+async def test_live_control_header_shows_title_context_and_todos(in_memory_db):
+    reg, bot = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.header")
+    task.control_message_ts = "controls-1"
+    await reg._persist_root(task)
+    client.state_payload.update({
+        "session_title": "Investigate Attie migration",
+        "active_model": "anthropic/claude-opus-4-8",
+        "active_reasoning_effort": "high",
+        "active_facet": "orchestrate",
+        "context_usage": {"used_tokens": 42100, "limit_tokens": 200000},
+        "todos": [
+            {"title": "Compare error windows", "status": "in_progress"},
+            {"title": "Check deploy configuration", "status": "pending"},
+        ],
+    })
+    await reg._refresh_task_header(task)
+    edit = bot.edits[-1]
+    assert edit["message_ts"] == "controls-1"
+    rendered = str(edit["blocks"])
+    assert "Investigate Attie migration" in rendered
+    assert "42.1k / 200.0k (21.1%)" in rendered
+    assert "Compare error windows" in rendered
+    assert "Check deploy configuration" in rendered
+    runtime = await state.get_runtime(in_memory_db, task.task_id)
+    assert runtime is not None and runtime.control_message_ts == "controls-1"
+
+
+@pytest.mark.asyncio
 async def test_background_job_notification_updates_timeline_without_owner_ping(in_memory_db):
     bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
@@ -871,8 +920,8 @@ class TestAC8DaemonRendering:
         await reg._render(task, events.SubagentActivity("h1", "reading"))
         await reg._render(task, events.SubagentCompleted("h1", "success", None, "ok"))
         assert task.subagent_blocks["h1"].result_summary == "ok"
-        assert any(post.get("text") == "done" for post in bot.posts)
-        assert any("Bash: ls" in post.get("text", "") for post in bot.posts)
+        assert any("done" in edit.get("text", "") for edit in bot.edits)
+        assert any("Bash: ls" in edit.get("text", "") for edit in bot.edits)
         assert any(post.get("blocks") for post in bot.posts)
         assert bot.edits and bot.edits[-1]["blocks"]
 

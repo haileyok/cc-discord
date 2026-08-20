@@ -24,7 +24,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 
 import aiosqlite
 
-from bridge import voice
+from bridge import usage, voice
 from bridge.bot import slack_error_code
 from bridge.daemon_supervisor import DaemonSupervisor, DaemonSupervisorError
 from bridge.domain import (
@@ -276,6 +276,7 @@ class Task:
     progress_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
+    control_message_ts: str | None = None
 
     @property
     def key(self) -> ConversationKey:
@@ -559,6 +560,7 @@ class TaskRegistry:
         self._message_seen: set[tuple[str, str]] = set()
         self._startup_notices: list[tuple[Task, str]] = []
         self._deferred_consumers: set[str] = set()
+        self._header_refreshers: dict[str, asyncio.Task[None]] = {}
 
     def bind_bot(self, bot: "Bot") -> None:
         self._bot = bot
@@ -620,6 +622,7 @@ class TaskRegistry:
                     runtime.owner_alerted, runtime.promotion_state,
                     runtime.binding_id, runtime.cleanup_pending,
                     runtime.channel_owned, runtime.mention_required,
+                    runtime.control_message_ts,
                 )
         task = Task(
             runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id),
@@ -630,6 +633,7 @@ class TaskRegistry:
             runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned,
             credential_file_path=credential_file_path,
             mention_required=runtime.mention_required,
+            control_message_ts=runtime.control_message_ts,
         )
         self._disabled_roots.discard(task.key)
         await self._index(task)
@@ -664,6 +668,7 @@ class TaskRegistry:
             owner_alerted=task.owner_alerted, promotion_state=task.promotion_state,
             binding_id=task.binding_id, cleanup_pending=task.cleanup_pending,
             channel_owned=task.channel_owned, mention_required=task.mention_required,
+            control_message_ts=task.control_message_ts,
         )
 
     async def _persist_root(self, task: Task, *, now: int | None = None) -> None:
@@ -707,13 +712,13 @@ class TaskRegistry:
                 if runtime.session_id and info is None and status in {"spawning", "running", "paused", "rebinding"}:
                     status = "crashed"
                     await update_runtime(self._conn, runtime.task_id, status=status, promotion_state="failed", now=int(time.time()))
-                    self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=None, mention_required=runtime.mention_required), "💥 The session daemon was not found; task is crashed."))
+                    self._startup_notices.append((Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=None, mention_required=runtime.mention_required, control_message_ts=runtime.control_message_ts), "💥 The session daemon was not found; task is crashed."))
                 elif info is not None:
                     credential_file_path = getattr(info, "credential_file_path", None)
                     if runtime.port != info.port or runtime.cwd != info.project_path:
                         await update_runtime(self._conn, runtime.task_id, port=info.port, cwd=info.project_path)
-                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, runtime.mention_required)
-            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path, mention_required=runtime.mention_required)
+                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, runtime.mention_required, runtime.control_message_ts)
+            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path, mention_required=runtime.mention_required, control_message_ts=runtime.control_message_ts)
             if task.channel_owned and self._bot is not None:
                 remember = getattr(self._bot, "remember_owned_channel", None)
                 if callable(remember):
@@ -763,6 +768,7 @@ class TaskRegistry:
                     task.status = restored.status
                     task.promotion_state = restored.promotion_state
                     task.binding_id = journal.old_binding_id
+                    task.control_message_ts = restored.control_message_ts
                     task.channel_owned = bool(journal.old_mode == "collaborative" and str(journal.old_key.channel_id) != str(self.home_channel_id or ""))
                     await self._index(task)
                     await self._persist_task(task)
@@ -828,6 +834,12 @@ class TaskRegistry:
                 with contextlib.suppress(asyncio.CancelledError):
                     await consumer
         self._consumers.clear()
+        for refresher in list(self._header_refreshers.values()):
+            if not refresher.done():
+                refresher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await refresher
+        self._header_refreshers.clear()
         for client in list(self._clients.values()):
             with contextlib.suppress(Exception):
                 await client.aclose()
@@ -850,7 +862,55 @@ class TaskRegistry:
             self._clients[task.task_id] = client
         return client
 
+    def _start_header_refresher(self, task: Task) -> None:
+        previous = self._header_refreshers.get(task.task_id)
+        if previous is None or previous.done():
+            self._header_refreshers[task.task_id] = asyncio.create_task(self._header_refresh_loop(task.task_id))
+
+    async def _header_refresh_loop(self, task_id: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(60)
+                task = self.get_by_task_id(task_id)
+                if task is None or task.status not in {"running", "spawning", "paused"}:
+                    return
+                await self._refresh_task_header(task)
+        except asyncio.CancelledError:
+            return
+
+    async def _refresh_task_header(self, task: Task, state: Mapping[str, Any] | None = None) -> None:
+        target_ts = task.control_message_ts
+        if not target_ts or self._bot is None:
+            return
+        try:
+            snapshot = dict(state) if state is not None else await self._client_for(task).state()
+            title = str(snapshot.get("session_title") or Path(task.cwd).name or "Agent task").strip()[:150]
+            stats = usage.format_state_summary(snapshot)
+            todos = snapshot.get("todos") or []
+            todo_lines: list[str] = []
+            for item in todos[:8] if isinstance(todos, list) else []:
+                if not isinstance(item, Mapping):
+                    continue
+                status = str(item.get("status") or "pending")
+                marker = "✓" if status in {"done", "completed"} else "→" if status in {"in_progress", "active"} else "○"
+                label = str(item.get("title") or item.get("subject") or item.get("content") or "Task").strip()
+                todo_lines.append(f"{marker} {label[:180]}")
+            from bridge.commands import build_task_root_blocks
+            blocks: list[dict[str, Any]] = [
+                {"type": "header", "text": {"type": "plain_text", "text": title or "Agent task"}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": stats[:2900]}]},
+            ]
+            if todo_lines:
+                suffix = f"\n_…and {len(todos) - 8} more_" if len(todos) > 8 else ""
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Todos*\n" + "\n".join(todo_lines) + suffix}})
+            blocks.extend(build_task_root_blocks(task.task_id, mode=task.mode))
+            text = f"{title}\n{stats}" + ("\nTodos:\n" + "\n".join(todo_lines) if todo_lines else "")
+            await self._require_bot().edit_message(task.channel_id, target_ts, text=text[:3900], blocks=blocks)
+        except Exception as exc:
+            log.warning("task header refresh failed for %s: %s", task.task_id[:8], safe_error(exc, "refresh failed"))
+
     def _start_consumer(self, task: Task) -> None:
+        self._start_header_refresher(task)
         previous = self._consumers.get(task.task_id)
         if previous is not None and not previous.done():
             return
@@ -896,6 +956,14 @@ class TaskRegistry:
 
     async def _render(self, task: Task, action: Any) -> None:
         try:
+            # A bridge restart can resume a live daemon stream after its
+            # TurnStarted frame. Reconstruct the one native progress surface
+            # before rendering resumed activity instead of posting each event.
+            if not task.progress_started and isinstance(action, (
+                AssistantText, AssistantThinking, ToolLine, ToolDiff, ToolFailure,
+                SubagentStarted, SubagentActivity, SubagentCompleted, AttentionPing,
+            )):
+                await self._begin_turn(task)
             if isinstance(action, AssistantText):
                 if action.subagent_handle:
                     line = f"• 💬 {action.text[:140]}"
@@ -950,6 +1018,7 @@ class TaskRegistry:
                 await self._begin_turn(task)
             elif isinstance(action, TurnComplete):
                 await self._end_turn(task, outcome="complete")
+                await self._refresh_task_header(task)
             elif isinstance(action, TurnCancelled):
                 await self._end_turn(task, outcome="cancelled")
                 await self._post(task, f"🛑 Turn cancelled ({action.reason})")
@@ -957,7 +1026,10 @@ class TaskRegistry:
                 await self._end_turn(task, outcome="error")
                 await self._post(task, "⚠ Model error: the daemon could not complete this request.")
             elif isinstance(action, TitleChange):
-                await self._post(task, f"*{action.title.strip()[:200]}*")
+                snapshot = await self._state_snapshot(task)
+                if action.title.strip():
+                    snapshot["session_title"] = action.title.strip()
+                await self._refresh_task_header(task, snapshot)
             elif isinstance(action, StatusNote):
                 await self._post(task, action.text)
             elif isinstance(action, AttentionPing):
@@ -973,7 +1045,7 @@ class TaskRegistry:
             elif isinstance(action, ImageResolved):
                 log.info("image reference resolved for %s", task.task_id[:8])
             elif isinstance(action, StateRefresh):
-                return
+                await self._refresh_task_header(task)
             elif isinstance(action, Reconcile):
                 await self._handle_reconcile(task, action.reason)
         except Exception as exc:
@@ -1493,7 +1565,7 @@ class TaskRegistry:
             )
             root_ts = str(roots)
         channel_owned = bool(mode == "collaborative" and channel_id != self.home_channel_id and channel_id in getattr(bot, "_owned_channel_ids", set()))
-        task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned, mention_required=bind_existing_root)
+        task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned, mention_required=bind_existing_root, control_message_ts=None if bind_existing_root else str(root_ts))
         if reusable is not None:
             self._torn_down.discard(task_id)
         if bind_existing_root:
@@ -1538,12 +1610,15 @@ class TaskRegistry:
             # The selected message belongs to a human.  Keep it untouched and
             # make the task controls a bot-authored reply in its thread.
             from bridge.commands import build_task_root_blocks
-            await self._post(
+            controls = await self._post(
                 task,
                 f"🤖 *Agent task* `{task.task_id[:8]}` · `{Path(task.cwd).name}`\n"
                 "Reply in this thread to work with the agent.",
                 blocks=build_task_root_blocks(task.task_id, mode=task.mode),
             )
+            task.control_message_ts = controls[0] if controls else None
+            await update_runtime(self._conn, task.task_id, control_message_ts=task.control_message_ts)
+        await self._refresh_task_header(task)
         initial_body = prompt
         if bind_existing_root:
             try:
@@ -1925,6 +2000,7 @@ class TaskRegistry:
         old_status = task.status
         old_promotion_state = task.promotion_state
         old_cleanup_pending = task.cleanup_pending
+        old_control_message_ts = task.control_message_ts
         if await list_pending_interrogatives(self._conn, old_key):
             raise TaskRoutingError("answer or dismiss the pending agent question before promoting this task")
         participant_rows = await list_participants(self._conn, old_key)
@@ -1988,6 +2064,7 @@ class TaskRegistry:
             task.status = "running"
             task.promotion_state = "active"
             task.binding_id = binding_id
+            task.control_message_ts = new_root
             if participant_actor_ids is None:
                 promoted_participants = [
                     row.participant for row in participant_rows
@@ -2018,6 +2095,7 @@ class TaskRegistry:
             task.status = old_status
             task.promotion_state = old_promotion_state
             task.cleanup_pending = old_cleanup_pending
+            task.control_message_ts = old_control_message_ts
             if journal_id:
                 with contextlib.suppress(Exception):
                     await update_promotion_journal(self._conn, journal_id, state="cleanup_pending" if new_channel else "failed", side_effect_state="failed", error_code=type(exc).__name__)
@@ -2340,6 +2418,11 @@ class TaskRegistry:
             with contextlib.suppress(asyncio.CancelledError):
                 await consumer
         self._translators.pop(task.task_id, None)
+        refresher = self._header_refreshers.pop(task.task_id, None)
+        if refresher is not None and not refresher.done():
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
         aggregator = self._aggregators.pop(task.task_id, None)
         if aggregator is not None:
             await aggregator.flush_now()
