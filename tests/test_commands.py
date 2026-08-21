@@ -360,6 +360,30 @@ async def test_interrogative_block_action_answers_targeted_question() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plan_handoff_button_click_resolves_task_and_decision_from_json_value() -> None:
+    """Regression: plan_handoff buttons encode task_id/interrogative_id/
+    decision as a JSON string in the button's own value (there is no
+    top-level payload.task_id on a real Slack block_actions payload). This
+    must not be confused with the generic task_id heuristic in
+    _block_action, which previously treated any bare-string button value
+    (like a free-text "yes" answer) as a task id."""
+    registry = LocalRegistry()
+    registry.pending = type("Pending", (), {"interrogative_id": "ph-1"})()
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    response = await dispatcher.dispatch({
+        "type": "block_actions", "team_id": "T1", "user_id": "UOWNER",
+        "channel_id": "GHOME", "message": {"ts": "200.2", "thread_ts": "100.1"},
+        "actions": [{
+            "action_id": "interrogative.plan_handoff",
+            "value": json.dumps({"task_id": "task-12345678", "interrogative_id": "ph-1", "decision": "cancel"}),
+        }],
+    })
+    assert "Answer sent" in response.text
+    call = next(call for call in registry.calls if call[0] == "answer")
+    assert call[1] == ("task-12345678", "ph-1", "cancel")
+
+
+@pytest.mark.asyncio
 async def test_configure_button_resolves_exact_task_and_opens_views_modal() -> None:
     registry = LocalRegistry()
     bot = LocalBot()

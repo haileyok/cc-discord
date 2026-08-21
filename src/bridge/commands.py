@@ -626,7 +626,12 @@ class CommandDispatcher:
         task_id = str(value.get("task_id") or payload.get("task_id") or (action.get("value") if isinstance(action.get("value"), str) and not value else ""))
         actor = _actor_id(payload)
         if action_id.startswith("interrogative") or payload.get("interrogative_id"):
-            return await self._answer_from_interaction(payload, action, actor)
+            # Do not pass the generic `task_id` computed above: its fallback
+            # treats any plain-string button value as a task id, which is
+            # wrong here when the value is a free-text answer (e.g. "yes").
+            # Structured values (plan_handoff) carry task_id inside `value`
+            # itself; anything else falls back to conversation-based lookup.
+            return await self._answer_from_interaction(payload, action, actor, value=value)
         task = await self._task_from_payload(payload, actor, task_id=task_id or None, require_owner=True)
         operation = action_id.rsplit(".", 1)[-1].rsplit(":", 1)[-1].lower()
         if operation == "feedback":
@@ -802,10 +807,27 @@ class CommandDispatcher:
             return await self._reply(payload, f"✅ Updated participants for `{task.task_id[:8]}`.")
         return await self._error(payload, "Unknown modal submission; close it and try again.")
 
-    async def _answer_from_interaction(self, payload: Mapping[str, Any], action: Mapping[str, Any], actor: str) -> SlackResponse:
-        task = await self._task_from_payload(payload, actor, task_id=str(payload.get("task_id") or "") or None, require_owner=False)
-        answer = str(action.get("value") or payload.get("answer") or payload.get("text") or "").strip()
-        await self._answer(task, actor, answer, str(payload.get("interrogative_id") or ""))
+    async def _answer_from_interaction(
+        self, payload: Mapping[str, Any], action: Mapping[str, Any], actor: str,
+        *, value: Mapping[str, Any] | None = None,
+    ) -> SlackResponse:
+        # Button values that carry structured routing info (task_id,
+        # interrogative_id, decision) arrive as a JSON string in
+        # action["value"]; `value` is that already-parsed mapping when the
+        # caller has it (see _block_action), otherwise parse it here so this
+        # method also works when called directly (e.g. from tests). A plain
+        # (non-JSON) value, such as a free-text answer, parses to {} and
+        # falls through to payload/conversation-based task resolution.
+        parsed = dict(value) if value else _json_or_mapping(action.get("value"))
+        resolved_task_id = str(parsed.get("task_id") or payload.get("task_id") or "") or None
+        task = await self._task_from_payload(payload, actor, task_id=resolved_task_id, require_owner=False)
+        interrogative_id = str(parsed.get("interrogative_id") or payload.get("interrogative_id") or "")
+        decision = parsed.get("decision")
+        if isinstance(decision, str) and decision:
+            answer = decision
+        else:
+            answer = str(action.get("value") or payload.get("answer") or payload.get("text") or "").strip()
+        await self._answer(task, actor, answer, interrogative_id)
         return await self._reply(payload, "✅ Answer sent.")
 
     async def _answer(self, task: Task, actor: str, text: str, interrogative_id: str = "") -> None:

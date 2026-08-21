@@ -87,6 +87,28 @@ class SubagentActivity(Action):
 
 
 @dataclass(frozen=True)
+class PlanHandoff(Action):
+    """A `plan_handoff` interrogative: the plan facet asking the operator to
+    approve, reject, or refuse-with-feedback a plan before implementation.
+
+    Mirrors the daemon's `PlanHandoffContext` (see `polytoken openapi`):
+    ``plan_text`` is the full plan document, ``action_labels`` carries the
+    daemon's own presentation strings for each decision so non-TUI clients
+    can render the same options without hardcoding copy.
+    """
+
+    interrogative_id: str
+    prompt_id: str | None
+    plan_text: str
+    plan_path: str
+    display_path: str
+    target_facet: str
+    title: str
+    action_labels: dict[str, str]
+    subagent_handle: str | None = None
+
+
+@dataclass(frozen=True)
 class SubagentCompleted(Action):
     handle: str
     outcome_kind: str
@@ -481,7 +503,23 @@ class Translator:
             return [Clarification(interrogative_id=iid, prompt_id=pid, question=question, options=options)]
         if itype == "confirmation":
             return [Confirmation(interrogative_id=iid, prompt_id=pid, question=question)]
-        # capability / plan_handoff: surface as a clarification-less note for now.
+        if itype == "plan_handoff":
+            ph = e.get("plan_handoff") if isinstance(e.get("plan_handoff"), dict) else {}
+            labels = ph.get("action_labels")
+            return [
+                PlanHandoff(
+                    interrogative_id=iid,
+                    prompt_id=pid,
+                    plan_text=str(ph.get("plan_text", "")),
+                    plan_path=str(ph.get("plan_path", "")),
+                    display_path=str(ph.get("display_path", "")),
+                    target_facet=str(ph.get("target_facet", "")),
+                    title=str(ph.get("title") or question or "Approve plan?"),
+                    action_labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+                    subagent_handle=e.get("subagent_handle"),
+                )
+            ]
+        # capability: surface as a clarification-less note for now.
         return [StatusNote(text=f"❓ {question}")] if question else []
 
     # -- session / lifecycle ---------------------------------------------

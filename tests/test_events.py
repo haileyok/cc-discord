@@ -12,6 +12,7 @@ from bridge.events import (
     Confirmation,
     ContextCleared,
     ModelError,
+    PlanHandoff,
     Reconcile,
     StateRefresh,
     StatusNote,
@@ -166,6 +167,38 @@ class TestInterrogatives:
         out = f.send({"type": "interrogative", "prompt_id": "p", "interrogative_id": "i3",
                       "question": "sure?", "interrogative_type": "confirmation"})
         assert _types(out) == [Confirmation]
+
+    def test_plan_handoff(self) -> None:
+        """Schema captured live from a real daemon (`polytoken openapi` /
+        `PlanHandoffContext`): interrogative_type `plan_handoff` carries a
+        nested `plan_handoff` object with plan text, target facet, and the
+        daemon's own action_labels copy. This must produce a real,
+        actionable PlanHandoff -- not the generic StatusNote fallback."""
+        f = _Feed()
+        out = f.send({
+            "type": "interrogative", "prompt_id": "p", "interrogative_id": "i1",
+            "question": "Approve plan?", "interrogative_type": "plan_handoff",
+            "plan_handoff": {
+                "plan_path": "/sessions/s/plan-001.md",
+                "display_path": "/sessions/s/plan-001.md",
+                "plan_text": "### Goal\nDo the thing.",
+                "target_facet": "execute",
+                "title": "Approve plan?",
+                "action_labels": {
+                    "implement_new_context": "Implement plan with a new context",
+                    "implement_current_context": "Implement plan within current context",
+                    "cancel": "Refuse (Tab to add feedback)",
+                    "refuse": "Feedback (Shift+Enter/Alt+Enter newline, Ctrl+Up to exit):",
+                },
+            },
+        })
+        assert _types(out) == [PlanHandoff]
+        action = out[0]
+        assert action.interrogative_id == "i1"
+        assert action.plan_text == "### Goal\nDo the thing."
+        assert action.target_facet == "execute"
+        assert action.display_path == "/sessions/s/plan-001.md"
+        assert action.action_labels["implement_new_context"] == "Implement plan with a new context"
 
     def test_permission_suppressed_under_bypass(self) -> None:
         f = _Feed()

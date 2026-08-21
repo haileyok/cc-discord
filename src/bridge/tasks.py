@@ -53,6 +53,7 @@ from bridge.events import (
     ContextCleared,
     ImageResolved,
     ModelError,
+    PlanHandoff,
     Reconcile,
     StateRefresh,
     StatusNote,
@@ -1097,7 +1098,7 @@ class TaskRegistry:
                     task_id=f"subagent-{action.handle}", status="complete",
                     output=action.result_summary,
                 )
-            elif isinstance(action, (AskQuestion, Clarification, Confirmation)):
+            elif isinstance(action, (AskQuestion, Clarification, Confirmation, PlanHandoff)):
                 await self._post_interrogative(task, action)
             elif isinstance(action, TurnStarted):
                 await self._begin_turn(task)
@@ -1629,6 +1630,7 @@ class TaskRegistry:
     async def _post_interrogative(self, task: Task, action: Any) -> None:
         actor_id = self._action_target(action, task)
         iid = str(action.interrogative_id)
+        blocks: list[dict[str, Any]] | None = None
         if isinstance(action, Confirmation):
             payload = {"kind": "confirmation", "question": action.question}
             text = f"<@{actor_id}> ❓ {action.question}\nReply *yes* or *no*."
@@ -1637,6 +1639,9 @@ class TaskRegistry:
             lines = [f"<@{actor_id}> ❓ {action.question}"] + [f"{i}. {opt.get('label') or opt.get('key')}" for i, opt in enumerate(action.options, 1)]
             lines.append("_Reply with a number, option text, or free text._")
             text = "\n".join(lines)
+        elif isinstance(action, PlanHandoff):
+            payload = {"kind": "plan_handoff", "target_facet": action.target_facet, "action_labels": action.action_labels}
+            text, blocks = self._plan_handoff_blocks(task, actor_id, iid, action)
         else:
             payload = dict(action.payload)
             payload.setdefault("kind", "ask_user_question")
@@ -1660,8 +1665,60 @@ class TaskRegistry:
         pending = StoredInterrogative(iid, ActorId(actor_id), payload, now + 86400, now)
         await put_pending_interrogative(self._conn, task.key, pending, binding_id=binding_id, target_kind=ParticipantKind.APP if actor_id == self.app_actor_id else ParticipantKind.HUMAN)
         self._pending[(task.key, actor_id)] = pending
-        await self._post(task, text[:3900])
+        await self._post(task, text[:3900], blocks=blocks)
         await self._set_agent_status(task, "suspended")
+
+    @staticmethod
+    def _plan_handoff_blocks(task: Task, actor_id: str, interrogative_id: str, action: PlanHandoff) -> tuple[str, list[dict[str, Any]]]:
+        """Render a `plan_handoff` interrogative as plan text plus Approve/
+        Reject buttons, using the daemon's own presentation strings
+        (`action_labels`) so button copy matches the TUI's own review UI."""
+        labels = action.action_labels or {}
+        title = action.title or "Approve plan?"
+        plan_text = action.plan_text or "_(no plan text provided)_"
+        # Block Kit carries the full plan below; keep the fallback text short
+        # (it is only used for notifications/accessibility and for Bot.post's
+        # own chunk fallback) so a long plan does not also get re-posted as
+        # separate plain-text message chunks alongside the button message.
+        fallback = f"📋 {title} (see plan below)"[:3900]
+
+        def _value(decision: str) -> str:
+            return json.dumps({"task_id": task.task_id, "interrogative_id": interrogative_id, "decision": decision})
+
+        blocks: list[dict[str, Any]] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"<@{actor_id}> 📋 *{title}*"}},
+        ]
+        # Cap at 10 plan-text blocks (~29,000 chars) plus the heading/context/
+        # actions blocks, comfortably under Slack's 50-block-per-message limit.
+        max_chunks = 10
+        for index, chunk_start in enumerate(range(0, max(len(plan_text), 1), 2900)):
+            if index >= max_chunks:
+                blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "_Plan truncated for Slack; see the full text at the path below._"}]})
+                break
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": plan_text[chunk_start:chunk_start + 2900] or "_(empty)_"}})
+        if action.display_path:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Full plan: `{action.display_path}`"}]})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button", "action_id": "interrogative.plan_handoff", "style": "primary",
+                    "text": {"type": "plain_text", "text": labels.get("implement_new_context", "Implement (new context)")[:75]},
+                    "value": _value("implement_new_context"),
+                },
+                {
+                    "type": "button", "action_id": "interrogative.plan_handoff",
+                    "text": {"type": "plain_text", "text": labels.get("implement_current_context", "Implement (current context)")[:75]},
+                    "value": _value("implement_current_context"),
+                },
+                {
+                    "type": "button", "action_id": "interrogative.plan_handoff", "style": "danger",
+                    "text": {"type": "plain_text", "text": "Reject"},
+                    "value": _value("cancel"),
+                },
+            ],
+        })
+        return fallback, blocks
 
     async def _pending_for(self, task: Task, actor_id: str) -> StoredInterrogative | None:
         cached = self._pending.get((task.key, actor_id))
@@ -1679,6 +1736,8 @@ class TaskRegistry:
         elif kind == "clarification":
             options = pending.payload.get("options") or []
             response = self._clarification_response(options, text)
+        elif kind == "plan_handoff":
+            response = self._plan_handoff_response(text)
         else:
             response = self._ask_question_response(pending.payload, text)
         binding = await get_active_promotion(self._conn, task.key)
@@ -1718,6 +1777,26 @@ class TaskRegistry:
             if lowered in {str(option.get("label", "")).lower(), str(option.get("key", "")).lower()}:
                 return {"kind": "clarification_choice", "choice": option.get("key", "")}
         return {"kind": "clarification_text", "text": text}
+
+    @staticmethod
+    def _plan_handoff_response(text: str) -> dict[str, Any]:
+        """Map a plan_handoff answer (button value or free-text thread reply)
+        to a `PlanHandoffDecision` per the daemon's OpenAPI schema: one of the
+        three bare-string decisions, or ``{"refuse": {"feedback": "..."}}``
+        for anything else, mirroring the TUI's "Tab to add feedback" flow."""
+        normalized = text.strip()
+        lowered = normalized.lower()
+        decisions = {"implement_new_context", "implement_current_context", "cancel"}
+        if lowered in decisions:
+            return {"kind": "plan_handoff_answer", "decision": lowered}
+        aliases = {
+            "1": "implement_new_context", "new": "implement_new_context", "new context": "implement_new_context",
+            "2": "implement_current_context", "current": "implement_current_context", "current context": "implement_current_context", "continue": "implement_current_context",
+            "3": "cancel", "no": "cancel", "n": "cancel", "reject": "cancel", "deny": "cancel", "refuse": "cancel",
+        }
+        if lowered in aliases:
+            return {"kind": "plan_handoff_answer", "decision": aliases[lowered]}
+        return {"kind": "plan_handoff_answer", "decision": {"refuse": {"feedback": normalized[:4000]}}}
 
     @staticmethod
     def _ask_question_response(payload: Mapping[str, Any], text: str) -> dict[str, Any]:

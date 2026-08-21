@@ -1052,6 +1052,85 @@ async def test_interrogative_suspends_agent_session_and_answer_resumes_processin
 
 
 @pytest.mark.asyncio
+async def test_plan_handoff_renders_buttons_and_answers_map_to_daemon_decisions(in_memory_db):
+    """Regression: plan_handoff interrogatives previously fell through to a
+    plain-text StatusNote with no way to respond. They must now render real
+    Slack buttons (using the daemon's own action_labels copy) and accept
+    both button clicks and free-text thread replies, mapped to the exact
+    PlanHandoffDecision shape the daemon's OpenAPI schema requires."""
+    reg, bot = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.plan-handoff")
+    action = events.PlanHandoff(
+        interrogative_id="ph-1", prompt_id="prompt-1",
+        plan_text="### Goal\nDo the thing.",
+        plan_path="/sessions/s/plan-001.md", display_path="/sessions/s/plan-001.md",
+        target_facet="execute", title="Approve plan?",
+        action_labels={
+            "implement_new_context": "Implement plan with a new context",
+            "implement_current_context": "Implement plan within current context",
+            "cancel": "Refuse (Tab to add feedback)",
+        },
+    )
+    await reg._render(task, action)
+
+    post = bot.posts[-1]
+    assert post["blocks"] is not None
+    button_texts = [
+        el["text"]["text"]
+        for block in post["blocks"] if block.get("type") == "actions"
+        for el in block["elements"]
+    ]
+    assert "Implement plan with a new context" in button_texts
+    assert "Implement plan within current context" in button_texts
+    assert "Reject" in button_texts
+    action_ids = {el["action_id"] for block in post["blocks"] if block.get("type") == "actions" for el in block["elements"]}
+    assert action_ids == {"interrogative.plan_handoff"}
+    assert "Do the thing." in str(post["blocks"])
+
+    pending = await reg._pending_for(task, task.owner_user_id)
+    assert pending is not None and pending.payload["kind"] == "plan_handoff"
+
+    # A button click's value decodes straight to the bare decision string.
+    await reg._answer_interrogative(task, pending, "implement_new_context")
+    assert client.interrogative_responses[-1] == {
+        "id": "ph-1", "response": {"kind": "plan_handoff_answer", "decision": "implement_new_context"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_handoff_free_text_reply_becomes_refuse_with_feedback(in_memory_db):
+    reg, _ = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.plan-handoff-refuse")
+    action = events.PlanHandoff(
+        interrogative_id="ph-2", prompt_id=None, plan_text="plan",
+        plan_path="p", display_path="p", target_facet="execute",
+        title="Approve plan?", action_labels={},
+    )
+    await reg._render(task, action)
+    pending = await reg._pending_for(task, task.owner_user_id)
+    await reg._answer_interrogative(task, pending, "please add a test phase first")
+    assert client.interrogative_responses[-1]["response"] == {
+        "kind": "plan_handoff_answer",
+        "decision": {"refuse": {"feedback": "please add a test phase first"}},
+    }
+
+
+def test_plan_handoff_response_aliases_map_to_daemon_decisions() -> None:
+    resp = TaskRegistry._plan_handoff_response
+    assert resp("implement_new_context") == {"kind": "plan_handoff_answer", "decision": "implement_new_context"}
+    assert resp("1") == {"kind": "plan_handoff_answer", "decision": "implement_new_context"}
+    assert resp("new context") == {"kind": "plan_handoff_answer", "decision": "implement_new_context"}
+    assert resp("2") == {"kind": "plan_handoff_answer", "decision": "implement_current_context"}
+    assert resp("continue") == {"kind": "plan_handoff_answer", "decision": "implement_current_context"}
+    assert resp("3") == {"kind": "plan_handoff_answer", "decision": "cancel"}
+    assert resp("no") == {"kind": "plan_handoff_answer", "decision": "cancel"}
+    assert resp("reject") == {"kind": "plan_handoff_answer", "decision": "cancel"}
+    assert resp("please rescope AC.2") == {
+        "kind": "plan_handoff_answer", "decision": {"refuse": {"feedback": "please rescope AC.2"}},
+    }
+
+
+@pytest.mark.asyncio
 async def test_tool_activity_keeps_only_five_most_recent_calls(in_memory_db):
     rich_bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
