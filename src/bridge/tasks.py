@@ -130,6 +130,10 @@ MAX_HISTORICAL_ATTACHMENTS = int(os.environ.get("BRIDGE_MAX_HISTORICAL_ATTACHMEN
 PROVENANCE_VERSION = 1
 SUBAGENT_BLOCK_MAX_ACTIONS = 5
 SUBAGENT_EDIT_THROTTLE_SECS = 1.5
+# Native Slack streams retain every appended task_update internally, even when
+# later updates reuse the same ID. Bursty subagents can otherwise exhaust the
+# stream payload and force a msg_too_long fallback within seconds.
+SUBAGENT_PROGRESS_THROTTLE_SECS = 5.0
 MAX_ATTACHMENTS_PER_POST = 10
 DEFAULT_APP_EXCHANGE_BUDGET = int(os.environ.get("BRIDGE_APP_EXCHANGE_BUDGET", "20"))
 DEFAULT_AD_HOC_CWD = os.environ.get("BRIDGE_AD_HOC_CWD", "/home/hailey/bluesky")
@@ -244,6 +248,7 @@ class SubagentBlock:
     message_ts: str | None = None
     finished_at: float | None = None
     last_edit_at: float = 0.0
+    last_progress_update_at: float = 0.0
     actions: list[str] = field(default_factory=list)
     # Runtime-only completion detail used by the task-root Activity control.
     result_summary: str | None = None
@@ -1087,12 +1092,21 @@ class TaskRegistry:
                     task, f"{action.subagent_type or action.handle} started",
                     task_id=f"subagent-{action.handle}", status="in_progress",
                 )
+                block = task.subagent_blocks.get(action.handle)
+                if block is not None:
+                    block.last_progress_update_at = time.monotonic()
             elif isinstance(action, SubagentActivity):
                 await self._subagent_activity(task, action.handle, action.line)
-                await self._progress_task_update(
-                    task, f"{action.handle}: {action.line}",
-                    task_id=f"subagent-{action.handle}", status="in_progress",
-                )
+                block = task.subagent_blocks.get(action.handle)
+                now = time.monotonic()
+                if block is not None and (
+                    now - block.last_progress_update_at >= SUBAGENT_PROGRESS_THROTTLE_SECS
+                ):
+                    block.last_progress_update_at = now
+                    await self._progress_task_update(
+                        task, f"{action.handle}: {action.line}",
+                        task_id=f"subagent-{action.handle}", status="in_progress",
+                    )
             elif isinstance(action, SubagentCompleted):
                 fingerprint = _summary_fingerprint(action.result_summary)
                 if fingerprint:
@@ -1242,14 +1256,21 @@ class TaskRegistry:
         fallback = f"{heading}\n{body}"
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body[:2900]}"}},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"{state} · {len(task.progress_lines)} updates"}]},
         ]
         if task.progress_answer:
+            # Keep prose above the compact status footer. Slack renders adjacent
+            # context→section blocks with almost no visual gap, which produced
+            # the literal-looking "100 updatesI’m resuming…" failure whenever a
+            # native stream degraded to this fallback card.
             blocks.append({
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": task.progress_answer[-2900:]},
             })
             fallback = f"{fallback}\n\n{task.progress_answer}"[:2900]
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"{state} · {len(task.progress_lines)} updates"}],
+        })
         return fallback[:2900], blocks
 
     @staticmethod

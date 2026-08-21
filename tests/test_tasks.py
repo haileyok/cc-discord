@@ -1016,6 +1016,48 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
 
 
 @pytest.mark.asyncio
+async def test_subagent_activity_burst_is_coalesced_before_native_stream_exhaustion(in_memory_db):
+    """A chatty subagent must not append one retained Slack chunk per event.
+
+    Slack counts repeated task_update IDs toward its stream payload ceiling; the
+    old behavior reliably degraded near 100 updates with msg_too_long.
+    """
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.subagent-burst")
+    await reg._render(task, events.TurnStarted("prompt-subagent-burst"))
+    await reg._render(task, events.SubagentStarted("h1", "general-purpose", "model"))
+    appends_after_start = len(rich_bot.stream_appends)
+
+    for index in range(100):
+        await reg._render(task, events.SubagentActivity("h1", f"activity {index}"))
+
+    assert len(rich_bot.stream_appends) == appends_after_start
+    assert len(task.subagent_blocks["h1"].actions) == 100
+
+    await reg._render(task, events.SubagentCompleted("h1", "success", None, "done"))
+    assert len(rich_bot.stream_appends) == appends_after_start + 1
+    assert rich_bot.stream_appends[-1]["chunks"][0]["status"] == "complete"
+    await reg._render(task, events.TurnComplete("prompt-subagent-burst"))
+
+
+@pytest.mark.asyncio
+async def test_fallback_progress_places_answer_before_status_footer(in_memory_db):
+    task = Task(
+        task_id="fallback-order", team_id="T1", channel_id="C1", cwd="/tmp",
+        root_ts="1000.fallback-order", owner_user_id="UOWNER", mode="thread",
+    )
+    task.progress_lines.extend(["general-purpose started", "activity"])
+    task.progress_answer = "I’m resuming the implementation."
+
+    _, blocks = TaskRegistry._progress_blocks(task)
+
+    assert [block["type"] for block in blocks] == ["section", "section", "context"]
+    assert blocks[1]["text"]["text"] == task.progress_answer
+    assert "2 updates" in blocks[2]["elements"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_assistant_text_gets_paragraph_break_after_prior_activity(in_memory_db):
     """Regression: subagent/tool activity followed by assistant text (or a
     second text block) must not render glued onto the preceding content, e.g.
