@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -259,6 +260,7 @@ class Task:
     cleanup_pending: bool = False
     channel_owned: bool = False
     subagent_blocks: dict[str, SubagentBlock] = field(default_factory=dict)
+    recent_subagent_summary_hashes: list[str] = field(default_factory=list)
     last_envelope: PromptEnvelope | None = None
     # Runtime-only path from ``polytoken sessions --format json``.  It is not
     # persisted in SQLite; startup reconciliation re-discovers it by session id.
@@ -435,6 +437,13 @@ def _strip_verified_mention(text: str, bot_user_id: str | None) -> str | None:
     if token.search(str(text)) is None:
         return None
     return token.sub("", str(text)).strip()
+
+
+def _summary_fingerprint(text: str | None) -> str | None:
+    normalized = "\n".join(line.rstrip() for line in str(text or "").strip().splitlines())
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
@@ -1013,6 +1022,10 @@ class TaskRegistry:
                     task_id=f"subagent-{action.handle}", status="in_progress",
                 )
             elif isinstance(action, SubagentCompleted):
+                fingerprint = _summary_fingerprint(action.result_summary)
+                if fingerprint:
+                    task.recent_subagent_summary_hashes.append(fingerprint)
+                    del task.recent_subagent_summary_hashes[:-20]
                 await self._subagent_completed(task, action)
                 await self._progress_task_update(
                     task, f"{action.handle}: {action.result_summary or 'completed'}",
@@ -1065,6 +1078,13 @@ class TaskRegistry:
             elif isinstance(action, StatusNote):
                 await self._post(task, action.text)
             elif isinstance(action, AttentionPing):
+                fingerprint = _summary_fingerprint(action.summary)
+                if fingerprint and fingerprint in task.recent_subagent_summary_hashes:
+                    # Polytoken emits both subagent_complete and a notification
+                    # carrying the same result_summary. The subagent surface has
+                    # already rendered it; posting the notification would chunk
+                    # a long review report into several glitchy bell messages.
+                    return
                 summary = str(action.summary).strip()[:240] or "Background job completed"
                 if task.progress_started:
                     await self._progress_task_update(

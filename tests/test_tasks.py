@@ -739,6 +739,22 @@ async def test_live_control_header_shows_title_context_and_todos(in_memory_db):
 
 
 @pytest.mark.asyncio
+async def test_duplicate_subagent_summary_notification_is_suppressed(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.review-summary")
+    summary = "summary: |-\n  ## Re-Review\n\n  No actionable findings remain."
+    await reg._render(task, events.TurnStarted("prompt-review"))
+    await reg._render(task, events.SubagentStarted("reviewer-1", "general-purpose", "model"))
+    await reg._render(task, events.SubagentCompleted("reviewer-1", "success", None, summary))
+    calls_before = len(bot.stream_appends)
+    await reg._render(task, events.AttentionPing(summary))
+    assert len(bot.stream_appends) == calls_before
+    assert not any("🔔" in str(post.get("text", "")) for post in bot.posts)
+    await reg._render(task, events.TurnComplete("prompt-review"))
+
+
+@pytest.mark.asyncio
 async def test_background_job_notification_updates_timeline_without_owner_ping(in_memory_db):
     bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
