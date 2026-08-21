@@ -118,6 +118,8 @@ class TestAC1StartupAndHealth:
         assert "- agent_session_stopped" in manifest
         assert "agent_view:" in manifest
         assert "agent_description:" in manifest
+        assert "messages_tab_enabled: true" in manifest
+        assert "messages_tab_read_only_enabled: false" in manifest
         assert "- message.im" in manifest
         assert "- app_home_opened" in manifest
         assert "- app_context_changed" in manifest

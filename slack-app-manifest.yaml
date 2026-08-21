@@ -3,6 +3,11 @@ display_information:
   description: Drive trusted Polytoken agent sessions from a private Slack workspace.
   background_color: "#1f2937"
 features:
+  app_home:
+    # The DM composer is gated by these flags even under agent_view; without
+    # them Slack shows "Sending messages to this app has been turned off".
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   # Irreversible migration: agent_view converts the app's Messages tab into
   # Slack's agent experience. Channel-thread operation is unaffected.
   agent_view:
