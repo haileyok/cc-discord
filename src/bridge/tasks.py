@@ -1733,8 +1733,10 @@ class TaskRegistry:
             return False
         if task.status in {"rebinding", "promoting"} or task.promotion_state in {"preparing"}:
             return False
+        mention_text = _strip_verified_mention(msg.text, self._bridge_user_id)
+        explicitly_mentioned = msg.verified_mention or mention_text is not None
         if task.mention_required:
-            cleaned = _strip_verified_mention(msg.text, self._bridge_user_id)
+            cleaned = mention_text
             if cleaned is not None:
                 msg = replace(msg, text=cleaned)
             elif not msg.verified_mention:
@@ -1756,6 +1758,22 @@ class TaskRegistry:
                 task,
                 f"⏹️ Task `{task.task_id[:8]}` is {task.status} and cannot accept prompts. Use *Start agent here* to create a new session in this thread.",
             )
+            return True
+        command_text = (mention_text if mention_text is not None else msg.text).strip().lower()
+        if (
+            explicitly_mentioned
+            and msg.actor_id == task.owner_user_id
+            and not msg.actor.is_app
+            and not msg.files
+            and command_text in {"reload", "reload daemon", "daemon reload", "/reload", "/daemon-reload"}
+        ):
+            result = await self.reload_daemon(task.task_id, owner_user_id=msg.actor_id)
+            failed = result.get("failed") if isinstance(result, Mapping) else None
+            if failed:
+                names = ", ".join(str(item) for item in failed)
+                await self._post(task, f"⚠️ Reloaded daemon configuration with failures: {names}.")
+            else:
+                await self._post(task, "♻️ Reloaded this session's daemon configuration from disk.")
             return True
         pending = await self._pending_for(task, msg.actor_id)
         paths = await self._save_attachments(task, msg)

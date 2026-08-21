@@ -511,6 +511,19 @@ class TestAC2IdentityRouting:
         assert await reg.maybe_route_message(event)
         assert json.loads(client.prompts[0])["body"] == "summarize this thread"
 
+    async def test_owner_mention_reload_targets_existing_thread_daemon(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.reload")
+        task.mention_required = True
+        assert await reg.maybe_route_message({
+            "kind": "app_mention", "team_id": "T1", "channel_id": "CHOME",
+            "root_ts": task.root_ts, "actor_id": "UOWNER",
+            "message_ts": "M-reload", "id": "E-reload", "text": "reload",
+        })
+        assert client.reload_calls == 1
+        assert client.prompts == []
+        assert "Reloaded this session's daemon" in bot.posts[-1]["text"]
+
     async def test_existing_thread_routes_block_only_rich_text_mention(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.004c")
