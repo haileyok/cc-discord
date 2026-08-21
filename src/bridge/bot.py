@@ -119,6 +119,27 @@ def slack_error_code(exc: BaseException) -> str | None:
     return value or None
 
 
+def slack_error_detail(exc: BaseException, *, limit: int = 300) -> str | None:
+    """Return Slack's own structural validation messages, when present.
+
+    For errors like ``invalid_blocks``, Slack's ``response_metadata.messages``
+    pinpoints the exact offending field/limit (e.g. "must be less than 3000
+    characters"). This is schema/structure diagnostic text, not user content,
+    tokens, or paths -- safe to log verbatim (bounded defensively anyway).
+    """
+    if not isinstance(exc, SlackApiError):
+        return None
+    metadata = _response_value(_exception_response(exc), "response_metadata", None)
+    messages = None
+    if isinstance(metadata, Mapping):
+        messages = metadata.get("messages")
+    if not messages:
+        return None
+    text = "; ".join(str(m) for m in messages if m)
+    text = " ".join(text.split())
+    return text[:limit] if text else None
+
+
 def _is_retryable_exception(exc: BaseException) -> bool:
     if isinstance(exc, SlackAdapterError):
         return exc.status == 429 or (exc.status is not None and 500 <= exc.status < 600) or exc.error in {

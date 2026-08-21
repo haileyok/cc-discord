@@ -1298,6 +1298,39 @@ async def test_goal_proposal_blocks_post_failure_falls_back_to_plain_text(in_mem
     assert pending is not None and pending.payload["kind"] == "goal_proposal"
 
 
+def test_goal_proposal_blocks_truncates_long_title_to_avoid_invalid_blocks() -> None:
+    """Regression: live failure `interrogative post with blocks failed
+    (invalid_blocks)`. `title` can fall back to the daemon's raw
+    natural-language `question` (events.py truncates only to 4000 chars).
+    Embedded unbounded into a single section's mrkdwn text, that can exceed
+    Slack's 3000-char section text limit and get the whole message rejected."""
+    task = Task("t1", "T1", "CHOME", "1000.long", "UOWNER", "personal", "/tmp", "running", "sess-1", 41001, 1, 1)
+    long_title = "x" * 4000
+    action = events.GoalProposal(
+        interrogative_id="gp-long", prompt_id="p-1", title=long_title,
+        proposed_summary="short summary", proposed_file_path=None, action_labels={},
+    )
+    _, blocks = TaskRegistry._goal_proposal_blocks(task, "UOWNER", "gp-long", action)
+    header = blocks[0]["text"]["text"]
+    assert len(header) < 3000
+    assert header.count("x") <= 400
+
+
+def test_plan_handoff_blocks_truncates_long_title_to_avoid_invalid_blocks() -> None:
+    task = Task("t1", "T1", "CHOME", "1000.long", "UOWNER", "personal", "/tmp", "running", "sess-1", 41001, 1, 1)
+    long_title = "y" * 4000
+    action = events.PlanHandoff(
+        interrogative_id="ph-long", prompt_id="p-1", plan_text="short plan",
+        plan_path="", display_path="z" * 4000, target_facet="plan",
+        title=long_title, action_labels={},
+    )
+    _, blocks = TaskRegistry._plan_handoff_blocks(task, "UOWNER", "ph-long", action)
+    header = blocks[0]["text"]["text"]
+    assert len(header) < 3000
+    display_path_block = next(b for b in blocks if b.get("type") == "context")
+    assert len(display_path_block["elements"][0]["text"]) < 3000
+
+
 def test_goal_proposal_response_maps_free_text_to_accepted_bool() -> None:
     resp = TaskRegistry._goal_proposal_response
     assert resp("accept")["accepted"] is True

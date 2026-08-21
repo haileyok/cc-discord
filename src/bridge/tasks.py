@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import aiosqlite
 
 from bridge import usage, voice
-from bridge.bot import slack_error_code
+from bridge.bot import slack_error_code, slack_error_detail
 from bridge.daemon_supervisor import DaemonSupervisor, DaemonSupervisorError
 from bridge.domain import (
     ActorId,
@@ -1738,9 +1738,11 @@ class TaskRegistry:
             # way to see or answer. Free-text answers (yes/no/a number) still
             # work without buttons, so degrade to a plain-text post instead.
             code = slack_error_code(exc)
+            detail = slack_error_detail(exc)
             log.warning(
-                "interrogative post with blocks failed%s; falling back to plain text: %s",
-                f" ({code})" if code else "", safe_error(exc, "interrogative post failed"),
+                "interrogative post with blocks failed%s%s; falling back to plain text: %s",
+                f" ({code})" if code else "", f" [{detail}]" if detail else "",
+                safe_error(exc, "interrogative post failed"),
             )
             await self._post(task, (plain_fallback or text)[:3900])
         await self._set_agent_status(task, "suspended")
@@ -1751,7 +1753,12 @@ class TaskRegistry:
         Reject buttons, using the daemon's own presentation strings
         (`action_labels`) so button copy matches the TUI's own review UI."""
         labels = action.action_labels or {}
-        title = action.title or "Approve plan?"
+        # `title` can fall back to the daemon's raw natural-language `question`
+        # (up to 4000 chars, see events.py _on_interrogative). Embedded
+        # unbounded into a single section's mrkdwn text alongside other
+        # characters, that can exceed Slack's 3000-char section text limit
+        # and get the whole post rejected with invalid_blocks.
+        title = (action.title or "Approve plan?").strip()[:400]
         plan_text = action.plan_text or "_(no plan text provided)_"
         # Block Kit carries the full plan below; keep the fallback text short
         # (it is only used for notifications/accessibility and for Bot.post's
@@ -1774,7 +1781,7 @@ class TaskRegistry:
                 break
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": plan_text[chunk_start:chunk_start + 2900] or "_(empty)_"}})
         if action.display_path:
-            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Full plan: `{action.display_path}`"}]})
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Full plan: `{str(action.display_path)[:400]}`"}]})
         blocks.append({
             "type": "actions",
             "elements": [
@@ -1802,7 +1809,9 @@ class TaskRegistry:
         """Render a `goal_proposal` interrogative as summary text plus
         Accept/Reject buttons, using the daemon's own action_labels copy."""
         labels = action.action_labels or {}
-        title = action.title or "Accept this goal?"
+        # See the matching comment in _plan_handoff_blocks: title can fall
+        # back to a raw, unbounded (up to 4000 chars) daemon `question`.
+        title = (action.title or "Accept this goal?").strip()[:400]
         summary = action.proposed_summary or "_(no summary provided)_"
         fallback = f"📌 {title} (see summary below)"[:3900]
 
@@ -1814,7 +1823,7 @@ class TaskRegistry:
             {"type": "section", "text": {"type": "mrkdwn", "text": summary[:2900]}},
         ]
         if action.proposed_file_path:
-            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Goal file: `{action.proposed_file_path}`"}]})
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Goal file: `{str(action.proposed_file_path)[:400]}`"}]})
         blocks.append({
             "type": "actions",
             "elements": [

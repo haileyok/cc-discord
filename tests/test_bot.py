@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from slack_sdk.errors import SlackApiError
+
 from bridge.bot import (
     MAX_CHUNK,
     Bot,
@@ -20,6 +22,7 @@ from bridge.bot import (
     _chunk,
     _with_retry,
     sanitize_channel_name,
+    slack_error_detail,
     unique_channel_name,
 )
 from tests.fakes import (
@@ -385,6 +388,33 @@ class TestAC4DownloadAtomicity:
         assert raised.value is sentinel
         assert not output.exists()
         assert not output.with_name(output.name + ".partial").exists()
+
+
+class TestSlackErrorDetail:
+    """slack_error_detail surfaces Slack's own structural validation messages
+    (e.g. for invalid_blocks) so a bare error code isn't the only diagnostic
+    signal in logs. This is schema/structure text, not user content."""
+
+    def test_extracts_response_metadata_messages(self) -> None:
+        response = ScriptedSlackResponse(data={
+            "ok": False,
+            "error": "invalid_blocks",
+            "response_metadata": {
+                "messages": ["[ERROR] failed to match all allowed schemas",
+                             "must be less than 3000 characters"],
+            },
+        })
+        exc = SlackApiError("invalid_blocks", response)
+        detail = slack_error_detail(exc)
+        assert detail is not None
+        assert "3000 characters" in detail
+
+    def test_returns_none_without_metadata(self) -> None:
+        response = ScriptedSlackResponse(data={"ok": False, "error": "channel_not_found"})
+        assert slack_error_detail(SlackApiError("channel_not_found", response)) is None
+
+    def test_returns_none_for_non_slack_exceptions(self) -> None:
+        assert slack_error_detail(RuntimeError("boom")) is None
 
 
 class TestAC9SocketMode:
