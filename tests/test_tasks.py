@@ -1198,6 +1198,41 @@ async def test_goal_proposal_renders_accept_reject_buttons_and_answers(in_memory
     }
 
 
+@pytest.mark.asyncio
+async def test_goal_proposal_blocks_post_failure_falls_back_to_plain_text(in_memory_db):
+    """If Slack rejects the Block Kit post (invalid_blocks, or any other
+    failure), the pending interrogative is already durably recorded -- so the
+    user must not be left with an invisible question. The fallback must carry
+    the real content (title + summary), not the block-only "see below" stub."""
+    class FailingBlocksBot(FakeBot):
+        async def post(self, text: str, channel_id: str, root_ts=None, blocks=None):
+            if blocks is not None:
+                raise RuntimeError("invalid_blocks")
+            return await super().post(text, channel_id, root_ts=root_ts, blocks=blocks)
+
+    bot = FailingBlocksBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.goal-proposal-fallback")
+    action = events.GoalProposal(
+        interrogative_id="gp-2", prompt_id="prompt-2",
+        title="Accept this goal?",
+        proposed_summary="Trace agentgateway auth paths and add the narrowest access-control change",
+        proposed_file_path=None,
+        action_labels={"accept": "Accept goal", "reject": "Reject goal"},
+    )
+    await reg._render(task, action)
+
+    assert not any(p.get("blocks") for p in bot.posts)
+    post = bot.posts[-1]
+    assert "Accept this goal?" in post["text"]
+    assert "Trace agentgateway auth paths" in post["text"]
+    assert "yes/accept" in post["text"]
+
+    # The pending interrogative was still recorded, so a plain-text reply works.
+    pending = await reg._pending_for(task, task.owner_user_id)
+    assert pending is not None and pending.payload["kind"] == "goal_proposal"
+
+
 def test_goal_proposal_response_maps_free_text_to_accepted_bool() -> None:
     resp = TaskRegistry._goal_proposal_response
     assert resp("accept")["accepted"] is True

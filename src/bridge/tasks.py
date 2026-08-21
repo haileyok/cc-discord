@@ -1194,9 +1194,14 @@ class TaskRegistry:
             elif isinstance(action, Reconcile):
                 await self._handle_reconcile(task, action.reason)
         except Exception as exc:
+            # Exception class name and Slack's own machine error code are
+            # non-sensitive (no user content, tokens, or paths) and are the
+            # difference between a diagnosable log line and a dead end.
+            code = slack_error_code(exc)
             log.error(
-                "failed to render %s for %s: %s",
-                type(action).__name__, task.task_id[:8], safe_error(exc, "render failed"),
+                "failed to render %s for %s (%s%s): %s",
+                type(action).__name__, task.task_id[:8], type(exc).__name__,
+                f"/{code}" if code else "", safe_error(exc, "render failed"),
             )
 
     async def _post(self, task: Task, text: str, *, blocks: list[dict[str, Any]] | None = None) -> list[str]:
@@ -1647,6 +1652,7 @@ class TaskRegistry:
         actor_id = self._action_target(action, task)
         iid = str(action.interrogative_id)
         blocks: list[dict[str, Any]] | None = None
+        plain_fallback: str | None = None
         if isinstance(action, Confirmation):
             payload = {"kind": "confirmation", "question": action.question}
             text = f"<@{actor_id}> ❓ {action.question}\nReply *yes* or *no*."
@@ -1658,9 +1664,23 @@ class TaskRegistry:
         elif isinstance(action, PlanHandoff):
             payload = {"kind": "plan_handoff", "target_facet": action.target_facet, "action_labels": action.action_labels}
             text, blocks = self._plan_handoff_blocks(task, actor_id, iid, action)
+            # `text` above is a short stub ("see plan below") that only makes
+            # sense alongside `blocks`. If the blocks post fails, fall back to
+            # this instead so the actual plan content isn't lost.
+            plain_fallback = (
+                f"<@{actor_id}> 📋 *{action.title or 'Approve plan?'}*\n\n"
+                f"{(action.plan_text or '_(no plan text provided)_')[:3500]}\n\n"
+                "_Reply 1=implement (new context), 2=implement (current context), "
+                "3=reject, or free text feedback._"
+            )
         elif isinstance(action, GoalProposal):
             payload = {"kind": "goal_proposal"}
             text, blocks = self._goal_proposal_blocks(task, actor_id, iid, action)
+            plain_fallback = (
+                f"<@{actor_id}> 📌 *{action.title or 'Accept this goal?'}*\n\n"
+                f"{(action.proposed_summary or '_(no summary provided)_')[:3500]}\n\n"
+                "_Reply yes/accept or no/reject._"
+            )
         else:
             payload = dict(action.payload)
             payload.setdefault("kind", "ask_user_question")
@@ -1684,7 +1704,22 @@ class TaskRegistry:
         pending = StoredInterrogative(iid, ActorId(actor_id), payload, now + 86400, now)
         await put_pending_interrogative(self._conn, task.key, pending, binding_id=binding_id, target_kind=ParticipantKind.APP if actor_id == self.app_actor_id else ParticipantKind.HUMAN)
         self._pending[(task.key, actor_id)] = pending
-        await self._post(task, text[:3900], blocks=blocks)
+        try:
+            await self._post(task, text[:3900], blocks=blocks)
+        except Exception as exc:
+            if blocks is None:
+                raise
+            # The pending interrogative is already durably recorded above, so
+            # a rejected/failed Block Kit post (e.g. invalid_blocks) must not
+            # leave the user stranded with an invisible question they have no
+            # way to see or answer. Free-text answers (yes/no/a number) still
+            # work without buttons, so degrade to a plain-text post instead.
+            code = slack_error_code(exc)
+            log.warning(
+                "interrogative post with blocks failed%s; falling back to plain text: %s",
+                f" ({code})" if code else "", safe_error(exc, "interrogative post failed"),
+            )
+            await self._post(task, (plain_fallback or text)[:3900])
         await self._set_agent_status(task, "suspended")
 
     @staticmethod
