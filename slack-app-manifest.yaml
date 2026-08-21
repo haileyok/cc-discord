@@ -1,5 +1,5 @@
 display_information:
-  name: claude-slack-bridge
+  name: "Hailey's Robot"
   description: Drive trusted Polytoken agent sessions from a private Slack workspace.
   background_color: "#1f2937"
 features:
@@ -18,7 +18,7 @@ features:
       - title: "List tasks"
         message: "/agent list"
   bot_user:
-    display_name: claude-slack-bridge
+    display_name: "Hailey's Robot"
     always_online: true
   slash_commands:
     - command: /agent
