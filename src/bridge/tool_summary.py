@@ -11,7 +11,10 @@ _EMOJI_BASH = "✓"
 _EMOJI_SEARCH = "🔍"
 _EMOJI_WEB = "🌐"
 _EMOJI_TASK = "🤖"
-_EMOJI_OTHER = "•"
+# NOT "•": the fallback progress-line renderer always prepends its own "• "
+# bullet to every line, so an "other" emoji identical to that bullet renders
+# as a visually doubled "• • Foo" — use a distinct glyph instead.
+_EMOJI_OTHER = "🔧"
 
 
 def is_failure(tool_response: dict[str, Any] | None, tool_name: str) -> bool:
@@ -137,6 +140,15 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
     if tool_name == "ExitWorktree":
         emoji = _EMOJI_FAIL if failed else "🌿"
         return f"{emoji} ExitWorktree"
+
+    if tool_name == "pushd":
+        path = tool_input.get("path", "?")
+        emoji = _EMOJI_FAIL if failed else "📂"
+        return f"{emoji} pushd: {_truncate(str(path), 80)}"
+
+    if tool_name == "popd":
+        emoji = _EMOJI_FAIL if failed else "📂"
+        return f"{emoji} popd"
 
     # Generic fallback
     emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER

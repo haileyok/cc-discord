@@ -137,10 +137,25 @@ class TestToolSummary:
         assert "subagent" in result
 
     async def test_unknown_tool_success(self) -> None:
-        """Unknown tool type."""
+        """Unknown tool type. The generic emoji must not be a bare bullet
+        ("•"): the fallback progress card always prepends its own "• " to
+        every line, so a "•" emoji here renders as a doubled "• • Foo"."""
         result = summarize("UnknownTool", {}, None)
-        assert "•" in result
+        assert "•" not in result
         assert "UnknownTool" in result
+
+    async def test_pushd_success(self) -> None:
+        """pushd surfaces the target path distinctly from the generic fallback."""
+        result = summarize("pushd", {"path": "src/bridge"}, None)
+        assert "📂" in result
+        assert "src/bridge" in result
+        assert "•" not in result
+
+    async def test_popd_success(self) -> None:
+        """popd has no path argument."""
+        result = summarize("popd", {}, None)
+        assert "📂" in result
+        assert "popd" in result
 
     async def test_unknown_tool_failure(self) -> None:
         """Unknown tool with failure marker."""
