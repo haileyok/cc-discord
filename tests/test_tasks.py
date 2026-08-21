@@ -985,8 +985,10 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert start["task_display_mode"] == "timeline"
     # Native agent-session status supplies the working state and Stop button.
     assert start["chunks"] is None
+    # Prior tool activity already streamed this turn, so the text block gets a
+    # leading paragraph break to avoid rendering glued onto that activity.
     assert any(
-        call["chunks"] == [{"type": "markdown_text", "text": "final answer"}]
+        call["chunks"] == [{"type": "markdown_text", "text": "\n\nfinal answer"}]
         and call["markdown_text"] is None
         for call in rich_bot.stream_appends
     )
@@ -1011,6 +1013,54 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
     assert task.progress_stream_ts is None and task.progress_started is False
     assert task.progress_keepalive is None
+
+
+@pytest.mark.asyncio
+async def test_assistant_text_gets_paragraph_break_after_prior_activity(in_memory_db):
+    """Regression: subagent/tool activity followed by assistant text (or a
+    second text block) must not render glued onto the preceding content, e.g.
+    "70 updatesGoal persistence..." or "worktree.The worktree...".
+    """
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.glue")
+    await reg._render(task, events.TurnStarted("prompt-glue"))
+    await reg._render(task, events.SubagentStarted("h1", "general-purpose", "model"))
+    await reg._render(task, events.SubagentActivity("h1", "✗ Write: space/uri.go"))
+    # First assistant text block after activity-only progress: must be
+    # separated from the preceding activity, not appended raw.
+    await reg._render(task, events.AssistantText("Goal persistence was not enabled."))
+    # A second, independent text block (e.g. after further tool calls) must
+    # also be separated from the first, not glued sentence-to-sentence.
+    await reg._render(task, events.AssistantText("The worktree is ready."))
+    await reg._render(task, events.TurnComplete("prompt-glue"))
+
+    assert task.progress_answer == (
+        "\n\nGoal persistence was not enabled.\n\nThe worktree is ready."
+    )
+    text_chunks = [
+        call["chunks"][0]["text"]
+        for call in rich_bot.stream_appends
+        if call["chunks"] and call["chunks"][0]["type"] == "markdown_text"
+    ]
+    assert text_chunks == [
+        "\n\nGoal persistence was not enabled.",
+        "\n\nThe worktree is ready.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_assistant_text_first_block_has_no_leading_separator(in_memory_db):
+    """No prior activity this turn: the very first text block must not carry
+    a leading blank paragraph."""
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.no-glue")
+    await reg._render(task, events.TurnStarted("prompt-no-glue"))
+    await reg._render(task, events.AssistantText("Hello there."))
+    await reg._render(task, events.TurnComplete("prompt-no-glue"))
+
+    assert task.progress_answer == "Hello there."
 
 
 @pytest.mark.asyncio

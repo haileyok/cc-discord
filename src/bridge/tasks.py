@@ -291,6 +291,11 @@ class Task:
     recent_tool_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
     progress_answer: str = ""
+    # True once any progress content (tool/task activity line, or a prior
+    # assistant text block) has been appended to the native stream this turn.
+    # Used to insert a paragraph break before the next text block so it never
+    # renders glued directly onto a preceding task_update badge or sentence.
+    progress_any_content: bool = False
     progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
     progress_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # ``pending`` means requested while a turn is draining but not yet accepted.
@@ -1489,6 +1494,7 @@ class TaskRegistry:
         if cleaned:
             task.progress_lines.append(cleaned[:300])
             del task.progress_lines[:-100]
+            task.progress_any_content = True
         if task.progress_stream_ts is None:
             await self._update_fallback_progress(task)
 
@@ -1535,7 +1541,16 @@ class TaskRegistry:
             await self._post_assistant_text(task, text)
             return
         if cleaned:
+            if task.progress_any_content:
+                # A previous activity line (task_update badge) or an earlier
+                # assistant text block already rendered in this stream. Slack
+                # concatenates chunks with no implicit whitespace, so without
+                # this separator the new text glues directly onto whatever
+                # came before it (e.g. "70 updatesGoal persistence..." or
+                # "worktree.The worktree...").
+                cleaned = "\n\n" + cleaned
             task.progress_answer = (task.progress_answer + cleaned)[-12000:]
+            task.progress_any_content = True
         chunks = self._progress_chunk_text(cleaned)
         for chunk in chunks:
             # This stream starts in structured chunks mode for plan/task UI.
@@ -2990,6 +3005,7 @@ class TaskRegistry:
         task.recent_tool_lines.clear()
         task.progress_sequence = 0
         task.progress_answer = ""
+        task.progress_any_content = False
         bot = self._require_bot()
         starter = getattr(bot, "start_stream", None)
         if callable(starter) and not task.progress_stream_disabled:
