@@ -109,6 +109,21 @@ class PlanHandoff(Action):
 
 
 @dataclass(frozen=True)
+class GoalProposal(Action):
+    """A `goal_proposal` interrogative: the daemon asking the operator to
+    accept or reject tracking a saved-session goal (see `GoalProposalContext`
+    in `polytoken openapi`). Approval is binary (`accepted`/`rejected`)."""
+
+    interrogative_id: str
+    prompt_id: str | None
+    title: str
+    proposed_summary: str
+    proposed_file_path: str | None
+    action_labels: dict[str, str]
+    subagent_handle: str | None = None
+
+
+@dataclass(frozen=True)
 class SubagentCompleted(Action):
     handle: str
     outcome_kind: str
@@ -515,6 +530,20 @@ class Translator:
                     display_path=str(ph.get("display_path", "")),
                     target_facet=str(ph.get("target_facet", "")),
                     title=str(ph.get("title") or question or "Approve plan?"),
+                    action_labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+                    subagent_handle=e.get("subagent_handle"),
+                )
+            ]
+        if itype == "goal_proposal":
+            gp = e.get("goal_proposal") if isinstance(e.get("goal_proposal"), dict) else {}
+            labels = gp.get("action_labels")
+            return [
+                GoalProposal(
+                    interrogative_id=iid,
+                    prompt_id=pid,
+                    title=str(gp.get("title") or question or "Accept this goal?"),
+                    proposed_summary=str(gp.get("proposed_summary", "")),
+                    proposed_file_path=gp.get("proposed_file_path") if isinstance(gp.get("proposed_file_path"), str) else None,
                     action_labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
                     subagent_handle=e.get("subagent_handle"),
                 )

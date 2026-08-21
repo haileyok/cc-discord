@@ -1115,6 +1115,48 @@ async def test_plan_handoff_free_text_reply_becomes_refuse_with_feedback(in_memo
     }
 
 
+@pytest.mark.asyncio
+async def test_goal_proposal_renders_accept_reject_buttons_and_answers(in_memory_db):
+    """Regression: goal_proposal interrogatives (from the propose_goal tool)
+    previously fell through to a plain-text StatusNote with no way to
+    respond -- verified live: an "Accept this goal?" message with no
+    buttons and no tracked pending interrogative at all."""
+    reg, bot = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.goal-proposal")
+    action = events.GoalProposal(
+        interrogative_id="gp-1", prompt_id="prompt-1",
+        title="Accept this goal?",
+        proposed_summary="Throwaway test goal for interrogative schema verification",
+        proposed_file_path=None,
+        action_labels={"accept": "Accept goal", "reject": "Reject goal"},
+    )
+    await reg._render(task, action)
+
+    post = bot.posts[-1]
+    assert post["blocks"] is not None
+    buttons = [el for block in post["blocks"] if block.get("type") == "actions" for el in block["elements"]]
+    assert {b["text"]["text"] for b in buttons} == {"Accept goal", "Reject goal"}
+    assert {b["action_id"] for b in buttons} == {"interrogative.goal_proposal"}
+    assert "Throwaway test goal" in str(post["blocks"])
+
+    pending = await reg._pending_for(task, task.owner_user_id)
+    assert pending is not None and pending.payload["kind"] == "goal_proposal"
+
+    await reg._answer_interrogative(task, pending, "accept")
+    assert client.interrogative_responses[-1] == {
+        "id": "gp-1", "response": {"kind": "goal_proposal_answer", "accepted": True},
+    }
+
+
+def test_goal_proposal_response_maps_free_text_to_accepted_bool() -> None:
+    resp = TaskRegistry._goal_proposal_response
+    assert resp("accept")["accepted"] is True
+    assert resp("yes")["accepted"] is True
+    assert resp("reject")["accepted"] is False
+    assert resp("anything else")["accepted"] is False
+    assert resp("accept") == {"kind": "goal_proposal_answer", "accepted": True}
+
+
 def test_plan_handoff_response_aliases_map_to_daemon_decisions() -> None:
     resp = TaskRegistry._plan_handoff_response
     assert resp("implement_new_context") == {"kind": "plan_handoff_answer", "decision": "implement_new_context"}

@@ -51,6 +51,7 @@ from bridge.events import (
     CompactionUpdate,
     Confirmation,
     ContextCleared,
+    GoalProposal,
     ImageResolved,
     ModelError,
     PlanHandoff,
@@ -1098,7 +1099,7 @@ class TaskRegistry:
                     task_id=f"subagent-{action.handle}", status="complete",
                     output=action.result_summary,
                 )
-            elif isinstance(action, (AskQuestion, Clarification, Confirmation, PlanHandoff)):
+            elif isinstance(action, (AskQuestion, Clarification, Confirmation, PlanHandoff, GoalProposal)):
                 await self._post_interrogative(task, action)
             elif isinstance(action, TurnStarted):
                 await self._begin_turn(task)
@@ -1642,6 +1643,9 @@ class TaskRegistry:
         elif isinstance(action, PlanHandoff):
             payload = {"kind": "plan_handoff", "target_facet": action.target_facet, "action_labels": action.action_labels}
             text, blocks = self._plan_handoff_blocks(task, actor_id, iid, action)
+        elif isinstance(action, GoalProposal):
+            payload = {"kind": "goal_proposal"}
+            text, blocks = self._goal_proposal_blocks(task, actor_id, iid, action)
         else:
             payload = dict(action.payload)
             payload.setdefault("kind", "ask_user_question")
@@ -1720,6 +1724,41 @@ class TaskRegistry:
         })
         return fallback, blocks
 
+    @staticmethod
+    def _goal_proposal_blocks(task: Task, actor_id: str, interrogative_id: str, action: GoalProposal) -> tuple[str, list[dict[str, Any]]]:
+        """Render a `goal_proposal` interrogative as summary text plus
+        Accept/Reject buttons, using the daemon's own action_labels copy."""
+        labels = action.action_labels or {}
+        title = action.title or "Accept this goal?"
+        summary = action.proposed_summary or "_(no summary provided)_"
+        fallback = f"📌 {title} (see summary below)"[:3900]
+
+        def _value(accepted: bool) -> str:
+            return json.dumps({"task_id": task.task_id, "interrogative_id": interrogative_id, "decision": "accept" if accepted else "reject"})
+
+        blocks: list[dict[str, Any]] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"<@{actor_id}> 📌 *{title}*"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": summary[:2900]}},
+        ]
+        if action.proposed_file_path:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Goal file: `{action.proposed_file_path}`"}]})
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button", "action_id": "interrogative.goal_proposal", "style": "primary",
+                    "text": {"type": "plain_text", "text": labels.get("accept", "Accept")[:75]},
+                    "value": _value(True),
+                },
+                {
+                    "type": "button", "action_id": "interrogative.goal_proposal", "style": "danger",
+                    "text": {"type": "plain_text", "text": labels.get("reject", "Reject")[:75]},
+                    "value": _value(False),
+                },
+            ],
+        })
+        return fallback, blocks
+
     async def _pending_for(self, task: Task, actor_id: str) -> StoredInterrogative | None:
         cached = self._pending.get((task.key, actor_id))
         if cached is not None:
@@ -1738,6 +1777,8 @@ class TaskRegistry:
             response = self._clarification_response(options, text)
         elif kind == "plan_handoff":
             response = self._plan_handoff_response(text)
+        elif kind == "goal_proposal":
+            response = self._goal_proposal_response(text)
         else:
             response = self._ask_question_response(pending.payload, text)
         binding = await get_active_promotion(self._conn, task.key)
@@ -1797,6 +1838,17 @@ class TaskRegistry:
         if lowered in aliases:
             return {"kind": "plan_handoff_answer", "decision": aliases[lowered]}
         return {"kind": "plan_handoff_answer", "decision": {"refuse": {"feedback": normalized[:4000]}}}
+
+    @staticmethod
+    def _goal_proposal_response(text: str) -> dict[str, Any]:
+        """Map a goal_proposal answer (button value or free-text thread
+        reply) to `{"kind": "goal_proposal_answer", "accepted": bool}` per
+        the daemon's OpenAPI schema. Approval is binary."""
+        lowered = text.strip().lower()
+        accepted = lowered in {
+            "accept", "accepted", "y", "yes", "ok", "confirm", "true", "1", "👍",
+        }
+        return {"kind": "goal_proposal_answer", "accepted": accepted}
 
     @staticmethod
     def _ask_question_response(payload: Mapping[str, Any], text: str) -> dict[str, Any]:
