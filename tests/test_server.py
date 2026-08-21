@@ -162,19 +162,32 @@ async def test_socket_dispatcher_routes_native_agent_stop_to_task_registry() -> 
 @pytest.mark.asyncio
 async def test_socket_dispatcher_absorbs_agent_view_lifecycle_events() -> None:
     class Registry:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
         async def maybe_route_message(self, payload: Any) -> bool:
             raise AssertionError("lifecycle event reached message routing")
 
         async def handle_agent_session_stopped(self, payload: Any) -> bool:
             raise AssertionError("lifecycle event reached stop handling")
 
+        async def handle_app_home_opened(self, payload: Any) -> bool:
+            self.events.append("app_home_opened")
+            return True
+
+        async def handle_app_context_changed(self, payload: Any) -> bool:
+            self.events.append("app_context_changed")
+            return True
+
     class Dispatcher:
         async def dispatch(self, payload: Any) -> None:
             raise AssertionError("lifecycle event reached command dispatcher")
 
-    dispatch = make_socket_dispatcher(Dispatcher(), Registry())
+    registry = Registry()
+    dispatch = make_socket_dispatcher(Dispatcher(), registry)
     for kind in ("app_home_opened", "app_context_changed"):
-        assert await dispatch({"kind": kind, "team_id": "T1", "actor_id": "UOWNER"}) is None
+        assert await dispatch({"kind": kind, "team_id": "T1", "actor_id": "UOWNER"}) is True
+    assert registry.events == ["app_home_opened", "app_context_changed"]
 
 
 @pytest.mark.asyncio

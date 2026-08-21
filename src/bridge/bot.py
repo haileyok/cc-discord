@@ -1132,6 +1132,24 @@ class Bot:
             raise SlackAdapterError("Slack root post returned no timestamp")
         return result[0]
 
+    async def set_suggested_prompts(self, channel_id: str, *, title: str, prompts: list[dict[str, str]]) -> Any:
+        """Pin up to four prompts at the top of an Agent View Messages tab."""
+        self._require_ready()
+        return await self._api(
+            "assistant_threads_setSuggestedPrompts",
+            channel_id=self._channel_for(channel_id),
+            title=str(title)[:75],
+            prompts=[dict(prompt) for prompt in prompts[:4]],
+        )
+
+    async def conversation_info(self, channel_id: str) -> Mapping[str, Any]:
+        """Fetch authenticated conversation metadata for a Slack context entity."""
+        result = await self._api("conversations_info", channel=self._channel_for(channel_id))
+        channel = _response_value(result, "channel", {}) or {}
+        if not isinstance(channel, Mapping):
+            raise SlackAdapterError("conversations.info returned malformed channel data")
+        return channel
+
     async def fetch_thread_replies(self, channel_id: str, root_ts: str, *,
                                    cursor: str | None = None, limit: int = 100) -> Mapping[str, Any]:
         """Fetch one authenticated page of a thread through the retrying API path."""
@@ -1346,7 +1364,26 @@ class Bot:
         channel_id = str(event.get("channel") or payload.get("channel_id") or "")
         if isinstance(payload.get("channel"), Mapping):
             channel_id = str(payload["channel"].get("id") or channel_id)
-        root_ts = str(event.get("thread_ts") or event.get("ts") or payload.get("thread_ts") or payload.get("message_ts") or "")
+        # Slash/events payloads carry timestamps at the top level, but Slack's
+        # block_actions payloads nest them under "message" (and sometimes
+        # "container"), e.g. task root button clicks. Without this fallback,
+        # root_ts silently comes out empty for every button interaction and
+        # replies would post to the channel instead of the task's thread.
+        message = event.get("message") if isinstance(event.get("message"), Mapping) else None
+        if message is None and isinstance(payload.get("message"), Mapping):
+            message = payload["message"]
+        container = payload.get("container") if isinstance(payload.get("container"), Mapping) else None
+        root_ts = str(
+            event.get("thread_ts")
+            or event.get("ts")
+            or payload.get("thread_ts")
+            or payload.get("message_ts")
+            or (message.get("thread_ts") if message else None)
+            or (message.get("ts") if message else None)
+            or (container.get("thread_ts") if container else None)
+            or (container.get("message_ts") if container else None)
+            or ""
+        )
         # Interactive payloads carry ``user`` as an object while message events
         # carry it as a bare U... string. Extract the stable ID before coercion;
         # stringifying the object produces an invalid chat.postEphemeral user.

@@ -32,7 +32,7 @@
 
 The manifest enables public-channel history for an observable home channel and private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) for private homes and promoted collaboration channels. Review scopes against your workspace policy before installing.
 
-The manifest enables Slack's `features.agent_view` (an irreversible migration for the app): the bot's Messages tab becomes the native agent experience, and a DM from the owner starts an ad-hoc task from `BRIDGE_AD_HOC_CWD` — no mention needed, threaded replies continue the session. Channel threads remain the canonical personal and collaborative task surface; agent view only adds the DM surface. `app_home_opened` and `app_context_changed` events are subscribed but require no bridge action today.
+The manifest enables Slack's `features.agent_view` (an irreversible migration for the app): the bot's Messages tab becomes the native agent experience, and a DM from the owner starts an ad-hoc task from `BRIDGE_AD_HOC_CWD` — no mention needed, threaded replies continue the session. Channel threads remain the canonical personal and collaborative task surface. Opening Messages installs four runtime suggested prompts without posting welcome-message spam. Slack's ordered `app_context_changed` entity references are access-checked, resolved where possible, and consumed by the owner's next DM; stale context is not silently reused. Attached Slack files carry their original name, IDs, type, uploader/sharer, timestamp, permalink, and authenticated local reference into the prompt. Final answers with URLs receive a compact native Sources context block.
 
 ## Install and configure
 

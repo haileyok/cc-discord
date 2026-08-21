@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from bridge import skills, usage
 from bridge.domain import ConversationKey
-from bridge.redaction import safe_error
+from bridge.redaction import redact, safe_error
 from bridge.tasks import (
     Task,
     TaskNotFound,
@@ -180,6 +180,40 @@ def _text_field(values: Mapping[str, Any], *names: str) -> str:
                     value = selected.get("value") if isinstance(selected, Mapping) else ""
                 return str(value or "").strip()
     return ""
+
+
+def _resolve_model_name(requested: str, available: list[str]) -> tuple[str | None, list[str]]:
+    """Resolve a free-text `/agent model <name>` argument against the daemon's
+    real model registry (e.g. ``router/gpt-5.6-sol:api``).
+
+    Users naturally type short names like ``sol`` rather than the full
+    router id. Passing that straight to the daemon fails outright (the
+    daemon rejects unknown model ids), so without resolution the switch
+    silently does nothing useful. Returns ``(resolved_id, candidates)``:
+    on success ``candidates`` is empty; on failure ``resolved_id`` is
+    ``None`` and ``candidates`` lists near matches for the error hint.
+    """
+    query = str(requested or "").strip()
+    if not query:
+        return None, []
+    if not available:
+        # The model registry could not be fetched; trust the caller's input
+        # rather than blocking every model switch on a transient listing
+        # failure.
+        return query, []
+    for candidate in available:
+        if candidate == query:
+            return candidate, []
+    lowered = query.lower()
+    for candidate in available:
+        if candidate.lower() == lowered:
+            return candidate, []
+    substring_matches = [c for c in available if lowered in c.lower()]
+    if len(substring_matches) == 1:
+        return substring_matches[0], []
+    if substring_matches:
+        return None, sorted(substring_matches)
+    return None, []
 
 
 def _resolve_working_directory(value: str, projects: list[Any]) -> tuple[str | None, str]:
@@ -361,7 +395,15 @@ class CommandDispatcher:
         except (TaskPrivilegeError, PermissionError) as exc:
             return await self._error(payload, "Not allowed. Only the task owner may use this control.")
         except (TaskNotFound, TaskSpawnError, TaskRestartError, TaskRoutingError, ValueError) as exc:
-            return await self._error(payload, safe_error(exc, "Could not complete that request"))
+            # These exception types are raised exclusively by the bridge's own
+            # code with already-deliberate, human-readable reasons (e.g.
+            # "daemon rejected model change", "Unknown model `sol`..."). Using
+            # safe_error() here discarded that specific reason every time and
+            # showed the same unhelpful generic text regardless of what
+            # actually happened. redact() keeps the message but still strips
+            # any accidental token/URL/path (e.g. a raw cwd in a spawn error).
+            message = redact(str(exc)).strip() or "Could not complete that request"
+            return await self._error(payload, message)
         except Exception as exc:  # interaction handlers must not crash Socket Mode
             log.error("Slack interaction failed: %s", safe_error(exc, "interaction failed"))
             return await self._error(payload, "Unexpected bridge error. Try again or check the task status.")
@@ -465,6 +507,16 @@ class CommandDispatcher:
 
     async def _session_command(self, payload: Mapping[str, Any], name: str, args: dict[str, str], tokens: list[str], actor: str) -> SlackResponse:
         task = await self._task_from_payload(payload, actor, require_owner=True)
+        # Slash-command payloads carry no message/thread context, so the
+        # Socket Mode adapter cannot populate root_ts for them. Now that a
+        # task is resolved, thread every reply below into its root message
+        # so confirmations/errors are visible in the agent-view Messages tab
+        # (which silently drops ephemeral replies) instead of vanishing.
+        payload = {
+            **dict(payload),
+            "root_ts": task.control_message_ts or task.root_ts,
+            "channel_id": task.channel_id,
+        }
         if name == "stop":
             ok = await self.registry.stop_task(task.task_id, actor)
             return await self._reply(payload, f"✅ Stopped `{task.task_id[:8]}`" if ok else f"⚠️ Could not terminate `{task.task_id[:8]}`; it remains active.")
@@ -491,9 +543,17 @@ class CommandDispatcher:
             await self.registry.invoke_skill(task.task_id, skill_name, skill_args, owner_user_id=actor)
             return await self._reply(payload, f"✅ Sent `@{skill_name}` to `{task.task_id[:8]}`.")
         if name == "model":
-            model = args.get("name") or args.get("_positional", "")
-            if not model:
+            requested = args.get("name") or args.get("_positional", "")
+            if not requested:
                 return await self._error(payload, "`model` needs a model name.")
+            available = await self.registry.list_models(actor)
+            model, candidates = _resolve_model_name(requested, available)
+            if model is None:
+                if candidates:
+                    hint = f" Did you mean: {', '.join(f'`{c}`' for c in candidates[:5])}?"
+                else:
+                    hint = ""
+                return await self._error(payload, f"Unknown model `{requested}`.{hint}")
             await self.registry.set_model(task.task_id, model, owner_user_id=actor, reasoning_effort=args.get("effort"))
             return await self._reply(payload, f"🔧 Switched `{task.task_id[:8]}` to `{model}`.")
         if name == "facet":
@@ -646,8 +706,13 @@ class CommandDispatcher:
         # View submissions omit top-level conversation context. Restore the
         # channel captured when the modal was opened so confirmations/errors
         # can be delivered ephemerally without recursive response failures.
-        if metadata.get("channel_id"):
-            payload = {**dict(payload), "channel_id": str(metadata["channel_id"]), "actor_id": actor}
+        if metadata.get("channel_id") or metadata.get("root_ts"):
+            payload = {
+                **dict(payload),
+                "channel_id": str(metadata.get("channel_id") or payload.get("channel_id") or ""),
+                "root_ts": str(metadata.get("root_ts") or payload.get("root_ts") or ""),
+                "actor_id": actor,
+            }
         if callback in {"bridge.start_agent_here", "start_agent_here_modal"}:
             self._configured_owner(actor)
             team = str(metadata.get("team_id") or "")
@@ -796,7 +861,20 @@ class CommandDispatcher:
         routed = await self.registry.maybe_route_message(normalize_message(event))
         return SlackResponse("" if routed else "Message ignored.", ephemeral=True)
 
-    async def _reply(self, payload: Mapping[str, Any], text: str, *, blocks: list[dict[str, Any]] | None = None, ephemeral: bool = True) -> SlackResponse:
+    async def _reply(self, payload: Mapping[str, Any], text: str, *, blocks: list[dict[str, Any]] | None = None, ephemeral: bool | None = None) -> SlackResponse:
+        """Reply to a Slack interaction.
+
+        ``ephemeral=None`` (the default) auto-selects visibility: Slack's
+        agent-view Messages tab (DMs) does not render ``chat.postEphemeral``
+        messages at all — they are silently swallowed, which previously made
+        command confirmations and errors (model/facet switches, Configure
+        submissions, etc.) look like nothing happened. When a task/thread is
+        known (``payload["root_ts"]`` is set), post visibly into that thread
+        instead. Only fall back to a true ephemeral message when no thread is
+        known to post into (e.g. a generic "unknown command" reply).
+        """
+        if ephemeral is None:
+            ephemeral = not bool(payload.get("root_ts"))
         response = SlackResponse(text=text, blocks=blocks, ephemeral=ephemeral)
         responder = payload.get("respond") or payload.get("response")
         if callable(responder):
@@ -810,7 +888,7 @@ class CommandDispatcher:
         return response
 
     async def _error(self, payload: Mapping[str, Any], text: str) -> SlackResponse:
-        return await self._reply(payload, f"❌ {text}", ephemeral=True)
+        return await self._reply(payload, f"❌ {text}")
 
     async def _open_modal(self, payload: Mapping[str, Any], view: dict[str, Any]) -> SlackResponse:
         opener = getattr(self.bot, "open_modal", None) or getattr(self.bot, "views_open", None)
@@ -945,6 +1023,7 @@ def _configure_modal(task: Task, state: Mapping[str, Any], models: Any) -> dict[
     metadata = {
         "task_id": task.task_id,
         "channel_id": task.channel_id,
+        "root_ts": task.control_message_ts or task.root_ts,
         "current_model": current_model,
         "current_effort": current_effort,
         "current_facet": current_facet,
@@ -1001,7 +1080,11 @@ def _participants_modal(task: Task) -> dict[str, Any]:
         "type": "modal", "callback_id": "bridge.participants",
         "title": {"type": "plain_text", "text": "Participants"},
         "submit": {"type": "plain_text", "text": "Save"}, "close": {"type": "plain_text", "text": "Cancel"},
-        "private_metadata": json.dumps({"task_id": task.task_id, "channel_id": task.channel_id}),
+        "private_metadata": json.dumps({
+            "task_id": task.task_id,
+            "channel_id": task.channel_id,
+            "root_ts": task.control_message_ts or task.root_ts,
+        }),
         "blocks": [{"type": "input", "block_id": "participants", "optional": True,
                      "label": {"type": "plain_text", "text": "Slack user IDs"},
                      "element": {"type": "plain_text_input", "action_id": "participant_ids", "placeholder": {"type": "plain_text", "text": "U0123, U0456"}}}],

@@ -15,6 +15,7 @@ from bridge.commands import (
     SlackResponse,
     build_task_root_blocks,
     normalize_socket_payload,
+    _resolve_model_name,
     _resolve_working_directory,
 )
 from bridge.domain import ConversationKey
@@ -52,6 +53,7 @@ class LocalTask:
     status: str = "running"
     last_activity: int = 1
     subagent_blocks: dict[str, Any] = field(default_factory=dict)
+    control_message_ts: str | None = None
 
     @property
     def key(self) -> ConversationKey:
@@ -226,6 +228,73 @@ async def test_agent_commands_cover_model_facet_effort_title_stats_todos_and_pin
     assert any(edit["channel_id"] == "GHOME" and edit["message_ts"] == "100.1" and edit["text"] == "New title" for edit in bot.edits)
 
 
+def test_resolve_model_name_matches_shorthand_and_flags_ambiguity() -> None:
+    available = ["router/gpt-5.6-sol:api", "router/gpt-5.6-luna:api", "router-anthropic/claude-sonnet-5:api"]
+    assert _resolve_model_name("sol", available) == ("router/gpt-5.6-sol:api", [])
+    assert _resolve_model_name("router/gpt-5.6-sol:api", available) == ("router/gpt-5.6-sol:api", [])
+    assert _resolve_model_name("ROUTER/GPT-5.6-SOL:API", available) == ("router/gpt-5.6-sol:api", [])
+    resolved, candidates = _resolve_model_name("gpt-5.6", available)
+    assert resolved is None and set(candidates) == {"router/gpt-5.6-sol:api", "router/gpt-5.6-luna:api"}
+    resolved, candidates = _resolve_model_name("does-not-exist", available)
+    assert resolved is None and candidates == []
+    # When the model registry could not be fetched, trust the caller rather
+    # than blocking every model switch on a transient listing failure.
+    assert _resolve_model_name("sol", []) == ("sol", [])
+
+
+@pytest.mark.asyncio
+async def test_agent_model_command_resolves_shorthand_name() -> None:
+    registry = LocalRegistry()
+    registry.models = ["router/gpt-5.6-sol:api", "router/gpt-5.6-luna:api"]
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    response = await dispatcher.dispatch({
+        "type": "slash_commands", "command": "/agent", "text": "model name=sol",
+        "channel_id": "GHOME", "thread_ts": "100.1", "user_id": "UOWNER", "team_id": "T1",
+    })
+    assert not response.text.startswith("❌"), response.text
+    assert ("set_model", ("task-12345678", "router/gpt-5.6-sol:api"), {"owner_user_id": "UOWNER", "reasoning_effort": None}) in registry.calls
+    # A resolved slash-command reply is known to belong to the task's thread,
+    # so it must be visible in Slack's agent-view Messages tab rather than an
+    # ephemeral message the surface silently drops.
+    assert response.ephemeral is False
+
+
+@pytest.mark.asyncio
+async def test_agent_model_command_reports_unknown_name_without_swallowing_it() -> None:
+    registry = LocalRegistry()
+    registry.models = ["router/gpt-5.6-sol:api", "router/gpt-5.6-luna:api"]
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    response = await dispatcher.dispatch({
+        "type": "slash_commands", "command": "/agent", "text": "model name=nonexistent",
+        "channel_id": "GHOME", "thread_ts": "100.1", "user_id": "UOWNER", "team_id": "T1",
+    })
+    assert "Unknown model" in response.text and "nonexistent" in response.text
+    assert not any(name == "set_model" for name, _, _ in registry.calls)
+
+
+@pytest.mark.asyncio
+async def test_session_command_error_preserves_specific_reason_instead_of_generic_text() -> None:
+    """Regression: _dispatch's outer catch used to discard the specific,
+    already-safe reason TaskSpawnError carried and always show the same
+    generic "Could not complete that request" text, making every failure
+    (wrong model name, daemon rejection, etc.) look identical and
+    undiagnosable from Slack."""
+    registry = LocalRegistry()
+
+    async def _raise_set_model(*args: Any, **kwargs: Any) -> None:
+        from bridge.tasks import TaskSpawnError
+        raise TaskSpawnError("daemon rejected model change (HTTP 400)")
+
+    registry.set_model = _raise_set_model  # type: ignore[method-assign]
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    response = await dispatcher.dispatch({
+        "type": "slash_commands", "command": "/agent", "text": "model name=model-b",
+        "channel_id": "GHOME", "thread_ts": "100.1", "user_id": "UOWNER", "team_id": "T1",
+    })
+    assert "daemon rejected model change" in response.text
+    assert "Could not complete that request" not in response.text
+
+
 def test_view_submission_normalization_restores_private_channel_context() -> None:
     normalized = normalize_socket_payload({
         "type": "view_submission", "user": {"id": "UOWNER"},
@@ -342,6 +411,36 @@ async def test_configure_submission_applies_only_changed_settings_and_auth() -> 
     })
     assert denied.ephemeral and "not allowed" in denied.text.lower()
     assert len([name for name, _, _ in registry.calls if name in {"set_model", "set_facet", "invoke_skill"}]) == 3
+
+
+@pytest.mark.asyncio
+async def test_configure_submission_with_root_ts_metadata_posts_visibly_into_thread() -> None:
+    """Regression: the Configure modal's metadata never carried root_ts, so
+    even a successful model/facet switch confirmed via an ephemeral message
+    that Slack's agent-view Messages tab silently drops -- looking exactly
+    like nothing happened. The modal now round-trips root_ts through
+    private_metadata and the confirmation must be posted into the thread."""
+    registry = LocalRegistry()
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    opened = await dispatcher.dispatch({
+        "type": "block_actions", "team_id": "T1", "user_id": "UOWNER",
+        "channel_id": "GHOME", "message": {"ts": "100.1"}, "trigger_id": "TR-CONFIG",
+        "actions": [{"action_id": "task.configure", "value": "task-12345678"}],
+    })
+    metadata = json.loads(opened.modal["private_metadata"])
+    assert metadata["root_ts"] == "100.1"
+    submitted = await dispatcher.dispatch({
+        "type": "view_submission", "team_id": "T1", "user_id": "UOWNER",
+        "view": {
+            "callback_id": "bridge.configure",
+            "private_metadata": opened.modal["private_metadata"],
+            "state": {"values": {
+                "configure_facet": {"facet": {"action_id": "facet", "value": "plan"}},
+            }},
+        },
+    })
+    assert "facet" in submitted.text
+    assert submitted.ephemeral is False
 
 
 @pytest.mark.asyncio

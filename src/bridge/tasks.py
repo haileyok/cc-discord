@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
+from urllib.parse import urlparse
 
 import aiosqlite
 
@@ -158,6 +159,10 @@ class SlackFile:
     size: int | None = None
     mimetype: str | None = None
     file_id: str | None = None
+    title: str | None = None
+    permalink: str | None = None
+    uploader_id: str | None = None
+    created: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +366,10 @@ def _file(value: Any) -> SlackFile:
         size=_value(value, "size", None),
         mimetype=_value(value, "mimetype", None) or _value(value, "mime_type", None),
         file_id=_value(value, "id", None),
+        title=_value(value, "title", None),
+        permalink=_value(value, "permalink", None),
+        uploader_id=_value(value, "user", None),
+        created=_value(value, "created", None) or _value(value, "timestamp", None),
     )
 
 
@@ -593,6 +602,10 @@ class TaskRegistry:
         self._deferred_consumers: set[str] = set()
         self._header_refreshers: dict[str, asyncio.Task[None]] = {}
         self._compaction_workers: dict[str, asyncio.Task[None]] = {}
+        # Agent View context has no session identifier. This personal bridge has
+        # one trusted owner, so retain the latest authenticated entity list per
+        # workspace and consume it with the owner's next DM prompt.
+        self._agent_context: dict[str, list[dict[str, Any]]] = {}
 
     def bind_bot(self, bot: "Bot") -> None:
         self._bot = bot
@@ -1226,6 +1239,27 @@ class TaskRegistry:
             })
             fallback = f"{fallback}\n\n{task.progress_answer}"[:2900]
         return fallback[:2900], blocks
+
+    @staticmethod
+    def _source_blocks(text: str) -> list[dict[str, Any]]:
+        """Render answer URLs using Slack's documented native citation fallback."""
+        urls: list[str] = []
+        for match in re.finditer(r"https?://[^\s<>|]+", str(text)):
+            url = match.group(0).rstrip(".,;:!?)]}'\"")[:500]
+            if url and url not in urls:
+                urls.append(url)
+            if len(urls) >= 8:
+                break
+        if not urls:
+            return []
+        links: list[str] = []
+        for index, url in enumerate(urls, 1):
+            host = urlparse(url).netloc.removeprefix("www.") or "source"
+            links.append(f"<{url}|[{index}] {host}>")
+        return [{
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "*Sources:* " + " · ".join(links)}],
+        }]
 
     @staticmethod
     def _feedback_blocks(task: Task) -> list[dict[str, Any]]:
@@ -1871,12 +1905,15 @@ class TaskRegistry:
             # downloading after a task exists. Ask for a follow-up rather than
             # silently dropping files from the task-creating mention.
             request = (request + "\n\n[Slack attachments were included with the task-starting mention; inspect the thread for them.]").strip()
+        agent_context = await self._consume_agent_context(msg)
+        if agent_context:
+            request = request + "\n\n" + agent_context
         provenance = MessageProvenance(
             msg.team_id, msg.channel_id, msg.root_ts, msg.message_ts, msg.event_id,
             msg.actor_id, "human",
         )
         try:
-            await self.spawn_task(
+            task = await self.spawn_task(
                 self.ad_hoc_cwd,
                 team_id=msg.team_id,
                 channel_id=msg.channel_id,
@@ -1888,6 +1925,9 @@ class TaskRegistry:
                 # conversation is already addressed to the bridge.
                 mention_required=False if msg.is_dm else None,
             )
+            if msg.files:
+                names = ", ".join(f"`{Path(item.filename).name}`" for item in msg.files[:5])
+                await self._post(task, f"📎 Added Slack file context with provenance: {names}.")
         except TaskRoutingError:
             # A concurrent redelivery may have won the root reservation. The
             # durable task now owns this conversation, so treat this event as
@@ -1977,7 +2017,14 @@ class TaskRegistry:
             return True
         body_parts = [raw_text] if raw_text else []
         body_parts.extend(voice_parts)
-        body_parts.extend(f"@{path}" for path in other_paths)
+        body_parts.extend(self._attachment_prompt_parts(msg, paths))
+        agent_context = await self._consume_agent_context(msg)
+        if agent_context:
+            body_parts.append(agent_context)
+        if msg.files and paths:
+            names = ", ".join(f"`{Path(item.filename).name}`" for item in msg.files[:5])
+            suffix = "" if len(msg.files) <= 5 else f" and {len(msg.files) - 5} more"
+            await self._post(task, f"📎 Added {len(paths)} Slack file{'s' if len(paths) != 1 else ''} with provenance: {names}{suffix}.")
         if not body_parts:
             if task.mention_required:
                 await self._post(task, "👋 I saw the mention, but Slack supplied no request text. Mention me with what you want the agent to do.")
@@ -2123,6 +2170,36 @@ class TaskRegistry:
         return saved
 
     @staticmethod
+    def _attachment_prompt_parts(msg: SlackMessage, paths: list[Path]) -> list[str]:
+        """Describe downloaded files with Slack provenance, not opaque local paths."""
+        parts: list[str] = []
+        unmatched = list(msg.files)
+        for path in paths:
+            attachment = next(
+                (item for item in unmatched if path.name.endswith("-" + (Path(item.filename).name or "attachment"))),
+                None,
+            )
+            if attachment is not None:
+                unmatched.remove(attachment)
+            metadata = {
+                "name": attachment.filename if attachment else path.name,
+                "title": attachment.title if attachment else None,
+                "file_id": attachment.file_id if attachment else None,
+                "mimetype": attachment.mimetype if attachment else None,
+                "size": attachment.size if attachment else None,
+                "uploader_id": attachment.uploader_id if attachment else None,
+                "shared_by": msg.actor_id,
+                "team_id": msg.team_id,
+                "channel_id": msg.channel_id,
+                "message_ts": msg.message_ts,
+                "created": attachment.created if attachment else None,
+                "permalink": attachment.permalink if attachment else None,
+                "local_reference": f"@{path}",
+            }
+            parts.append("[Slack file " + json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "]")
+        return parts
+
+    @staticmethod
     def _history_sort_key(message: Mapping[str, Any]) -> tuple[float, str]:
         raw = str(message.get("ts") or message.get("message_ts") or "")
         try:
@@ -2186,7 +2263,7 @@ class TaskRegistry:
                 count_limit=MAX_HISTORICAL_ATTACHMENTS,
             )
             body_parts = [normalized.text.strip()] if normalized.text.strip() else []
-            body_parts.extend(f"@{path}" for path in paths)
+            body_parts.extend(self._attachment_prompt_parts(normalized, paths))
             body_parts.extend(file_notices)
             body = " ".join(body_parts).strip() or "[message had no text or supported files]"
             provenance = MessageProvenance(
@@ -2439,6 +2516,7 @@ class TaskRegistry:
             await self._client_for(task).set_model(model, reasoning_effort=level)
         except PolytokenClientError as exc:
             raise TaskSpawnError(safe_error(exc, "daemon rejected effort change")) from exc
+        await self._refresh_task_header(task)
 
     async def clear_context(self, task_id: str, *, owner_user_id: str | SlackActor) -> None:
         task = self._require_task(task_id, owner_user_id)
@@ -2574,6 +2652,7 @@ class TaskRegistry:
             await self._client_for(task).set_model(model, reasoning_effort=reasoning_effort)
         except PolytokenClientError as exc:
             raise TaskSpawnError(safe_error(exc, "daemon rejected model change")) from exc
+        await self._refresh_task_header(task)
 
     async def set_facet(self, task_id: str, facet: str, *, owner_user_id: str | SlackActor) -> None:
         task = self._require_task(task_id, owner_user_id)
@@ -2581,6 +2660,7 @@ class TaskRegistry:
             await self._client_for(task).set_facet(facet)
         except PolytokenClientError as exc:
             raise TaskSpawnError(safe_error(exc, "daemon rejected facet change")) from exc
+        await self._refresh_task_header(task)
 
     async def get_state(self, task_id: str, owner_user_id: str | SlackActor) -> dict | None:
         task = self._require_task(task_id, owner_user_id)
@@ -2606,6 +2686,85 @@ class TaskRegistry:
             return await self._supervisor.list_models()
         except DaemonSupervisorError:
             return []
+
+    # -- Agent View lifecycle ----------------------------------------------
+
+    async def handle_app_home_opened(self, payload: Mapping[str, Any]) -> bool:
+        """Populate the Agent View Messages tab without posting welcome spam."""
+        event = payload.get("event") if isinstance(payload.get("event"), Mapping) else payload
+        if str(event.get("tab") or "") != "messages":
+            return False
+        actor_id = str(payload.get("actor_id") or event.get("user") or "")
+        owner_id = str(getattr(self._require_bot(), "owner_user_id", "") or "")
+        channel_id = str(payload.get("channel_id") or event.get("channel") or "")
+        if actor_id != owner_id or not channel_id:
+            return False
+        setter = getattr(self._require_bot(), "set_suggested_prompts", None)
+        if not callable(setter):
+            return False
+        try:
+            result = setter(channel_id, title="What should Hailey's Robot do?", prompts=[
+                {"title": "Investigate context", "message": "Investigate the Slack context I shared and recommend the next action."},
+                {"title": "Debug a problem", "message": "Help me debug a problem. Start by asking for the missing details."},
+                {"title": "Work on code", "message": "Inspect the relevant repository and implement the requested change with tests."},
+                {"title": "Research", "message": "Research this question, cite the strongest sources, and give me a concise recommendation."},
+            ])
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception as exc:
+            log.warning("could not set Agent View suggested prompts: %s", safe_error(exc, "prompt setup failed"))
+            return False
+
+    async def handle_app_context_changed(self, payload: Mapping[str, Any]) -> bool:
+        """Retain authenticated Slack entity references for the next owner DM."""
+        event = payload.get("event") if isinstance(payload.get("event"), Mapping) else payload
+        team_id = str(payload.get("team_id") or event.get("team_id") or "")
+        configured_team = str(getattr(self._require_bot(), "team_id", "") or "")
+        if not team_id or team_id != configured_team:
+            return False
+        context = event.get("context") if isinstance(event.get("context"), Mapping) else {}
+        raw_entities = context.get("entities") if isinstance(context, Mapping) else []
+        entities = [dict(item) for item in (raw_entities or []) if isinstance(item, Mapping)][:10]
+        self._agent_context[team_id] = entities
+        return True
+
+    async def _consume_agent_context(self, msg: SlackMessage) -> str:
+        """Resolve bounded context references through authenticated Slack APIs."""
+        entities = self._agent_context.pop(msg.team_id, [])
+        if not msg.is_dm or not entities:
+            return ""
+        bot = self._require_bot()
+        lines = ["[Slack Agent View context, ordered by relevance]"]
+        for entity in entities[:5]:
+            kind = str(entity.get("type") or "")
+            value = entity.get("value")
+            entity_team = str(entity.get("team_id") or msg.team_id)
+            if entity_team != msg.team_id:
+                continue
+            try:
+                if kind.endswith("message_context") and isinstance(value, Mapping):
+                    channel_id = str(value.get("channel_id") or "")
+                    message_ts = str(value.get("message_ts") or "")
+                    if not channel_id or not message_ts:
+                        continue
+                    # conversations.info is both an access check and useful name metadata.
+                    info = await bot.conversation_info(channel_id)
+                    result = await bot.fetch_thread_replies(channel_id, message_ts, limit=20)
+                    messages = result.get("messages") if isinstance(result, Mapping) else []
+                    target = next((item for item in (messages or []) if str(item.get("ts") or "") == message_ts), None)
+                    text = normalize_message(target).text[:4000] if isinstance(target, Mapping) else ""
+                    name = str(info.get("name") or channel_id)
+                    lines.append(json.dumps({"type": "message", "team_id": msg.team_id, "channel_id": channel_id, "channel_name": name, "message_ts": message_ts, "text": text}, ensure_ascii=False, sort_keys=True))
+                elif kind.endswith("channel_id") and isinstance(value, str):
+                    info = await bot.conversation_info(value)
+                    lines.append(json.dumps({"type": "channel", "team_id": msg.team_id, "channel_id": value, "name": info.get("name"), "topic": (info.get("topic") or {}).get("value") if isinstance(info.get("topic"), Mapping) else None, "purpose": (info.get("purpose") or {}).get("value") if isinstance(info.get("purpose"), Mapping) else None}, ensure_ascii=False, sort_keys=True))
+                else:
+                    lines.append(json.dumps({"type": kind, "team_id": msg.team_id, "value": value}, ensure_ascii=False, sort_keys=True))
+            except Exception:
+                # Preserve the authenticated reference even if content access is denied.
+                lines.append(json.dumps({"type": kind, "team_id": msg.team_id, "value": value, "content": "unavailable"}, ensure_ascii=False, sort_keys=True))
+        return "\n".join(lines) if len(lines) > 1 else ""
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -2759,7 +2918,7 @@ class TaskRegistry:
                             result = stopper(
                                 task.channel_id,
                                 task.progress_stream_ts,
-                                blocks=self._feedback_blocks(task),
+                                blocks=self._source_blocks(task.progress_answer) + self._feedback_blocks(task),
                             )
                         else:
                             result = stopper(task.channel_id, task.progress_stream_ts)
@@ -2795,7 +2954,7 @@ class TaskRegistry:
                             await self._require_bot().edit_message(
                                 task.channel_id, task.progress_fallback_ts,
                                 text=first,
-                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": first}}] + self._feedback_blocks(task),
+                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": first}}] + self._source_blocks(task.progress_answer) + self._feedback_blocks(task),
                             )
                             edited = True
                         except Exception as exc:

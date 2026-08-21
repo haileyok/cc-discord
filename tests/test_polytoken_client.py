@@ -59,7 +59,9 @@ def _build_stub_app() -> web.Application:
     async def reload(_request: web.Request) -> web.Response:
         return web.json_response({"reloaded": ["models", "skills"], "failed": []})
 
-    async def compact(_request: web.Request) -> web.Response:
+    async def compact(request: web.Request) -> web.Response:
+        assert request.content_type == "application/json"
+        assert await request.json() == {}
         return web.json_response({"compaction_id": "compact-123"}, status=202)
 
     async def health(_request: web.Request) -> web.Response:

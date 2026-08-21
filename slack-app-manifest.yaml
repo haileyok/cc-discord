@@ -13,10 +13,10 @@ features:
   agent_view:
     agent_description: "Drives trusted Polytoken agent sessions: coding tasks, infra investigation, and long-running background work from Slack threads or DMs."
     suggested_prompts:
-      - title: "Start a task"
-        message: "Investigate the failing deploy and summarize what you find."
-      - title: "List tasks"
-        message: "/agent list"
+      - title: "Investigate context"
+        message: "Investigate the Slack context I shared and recommend the next action."
+      - title: "Work on code"
+        message: "Inspect the relevant repository and implement the requested change with tests."
   bot_user:
     display_name: "Hailey's Robot"
     always_online: true

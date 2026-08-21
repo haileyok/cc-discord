@@ -111,11 +111,10 @@ def make_socket_dispatcher(dispatcher: CommandDispatcher, task_registry: TaskReg
                 return await task_registry.handle_agent_session_stopped(payload)
             if kind in {"reaction_added", "reaction_removed"}:
                 return None
-            if kind in {"app_home_opened", "app_context_changed"}:
-                # Agent-view lifecycle events. Opening the Messages tab needs no
-                # bridge action (tasks spawn from the first DM prompt), and
-                # Slack context payloads are not currently consumed.
-                return None
+            if kind == "app_home_opened":
+                return await task_registry.handle_app_home_opened(payload)
+            if kind == "app_context_changed":
+                return await task_registry.handle_app_context_changed(payload)
             return await dispatcher.dispatch(payload)
         except asyncio.CancelledError:
             raise

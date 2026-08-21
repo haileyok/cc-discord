@@ -324,7 +324,9 @@ class PolytokenClient:
         ``POST /compact`` returns 202 Accepted; completion is reported later on
         the SSE stream.  Callers must not interpret this response as completion.
         """
-        result = await self._request("POST", "/compact")
+        # Current Polytoken requires application/json even though compact has
+        # no options; an empty-body POST is rejected with HTTP 415.
+        result = await self._request("POST", "/compact", json_body={})
         compaction_id = result.get("compaction_id") if isinstance(result, Mapping) else None
         if not isinstance(compaction_id, str) or not compaction_id:
             raise PolytokenClientError("Polytoken daemon returned an invalid compaction acceptance")

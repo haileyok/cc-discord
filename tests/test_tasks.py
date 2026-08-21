@@ -146,6 +146,8 @@ class FakeBot:
     deletions: list[dict[str, Any]] = field(default_factory=list)
     thread_pages: dict[str, dict[str, Any]] = field(default_factory=dict)
     thread_calls: list[dict[str, Any]] = field(default_factory=list)
+    suggested_prompts: list[dict[str, Any]] = field(default_factory=list)
+    conversation_infos: dict[str, dict[str, Any]] = field(default_factory=dict)
     fail_invite: bool = False
     fail_root: bool = False
     _message_seq: int = 0
@@ -194,6 +196,12 @@ class FakeBot:
     async def fetch_thread_replies(self, channel_id: str, root_ts: str, *, cursor=None, limit=100):
         self.thread_calls.append({"channel_id": channel_id, "root_ts": root_ts, "cursor": cursor, "limit": limit})
         return self.thread_pages.get(str(cursor or ""), {"messages": [], "has_more": False})
+
+    async def conversation_info(self, channel_id: str):
+        return self.conversation_infos.get(channel_id, {"id": channel_id, "name": channel_id})
+
+    async def set_suggested_prompts(self, channel_id: str, *, title: str, prompts):
+        self.suggested_prompts.append({"channel_id": channel_id, "title": title, "prompts": prompts})
 
     async def add_reaction(self, channel_id: str, message_ts: str, name: str):
         self.reactions.append({"channel_id": channel_id, "message_ts": message_ts, "name": name})
@@ -559,6 +567,50 @@ class TestAC2IdentityRouting:
         assert "Tell me what you want" in bot.posts[-1]["text"]
         await reg.shutdown()
 
+    async def test_agent_view_home_sets_owner_prompts_without_posting(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        assert await reg.handle_app_home_opened({
+            "team_id": "T1", "actor_id": "UOWNER", "channel_id": "DOWNERDM",
+            "event": {"type": "app_home_opened", "tab": "messages", "user": "UOWNER", "channel": "DOWNERDM"},
+        })
+        assert bot.suggested_prompts[0]["channel_id"] == "DOWNERDM"
+        assert len(bot.suggested_prompts[0]["prompts"]) == 4
+        assert bot.posts == []
+
+    async def test_agent_context_is_authenticated_resolved_and_consumed_by_next_dm(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, channel="DOWNERDM", root="1.000")
+        bot.conversation_infos["CCONTEXT"] = {"id": "CCONTEXT", "name": "deploys"}
+        bot.thread_pages[""] = {"messages": [{"team": "T1", "channel": "CCONTEXT", "ts": "9.000", "user": "UOTHER", "text": "deploy is failing"}], "has_more": False}
+        assert await reg.handle_app_context_changed({
+            "team_id": "T1", "event": {"type": "app_context_changed", "context": {"entities": [
+                {"type": "slack#/types/message_context", "team_id": "T1", "value": {"channel_id": "CCONTEXT", "message_ts": "9.000"}},
+            ]}},
+        })
+        assert await reg.maybe_route_message({
+            "kind": "message", "team_id": "T1", "channel_id": "DOWNERDM", "channel_type": "im",
+            "root_ts": task.root_ts, "message_ts": "2.000", "actor_id": "UOWNER", "id": "E-context",
+            "text": "investigate this",
+        })
+        body = json.loads(client.prompts[0])["body"]
+        assert "Slack Agent View context" in body
+        assert '"channel_name": "deploys"' in body
+        assert '"text": "deploy is failing"' in body
+        # Context is one-shot: the next prompt does not silently reuse stale entities.
+        assert await reg.maybe_route_message({
+            "kind": "message", "team_id": "T1", "channel_id": "DOWNERDM", "channel_type": "im",
+            "root_ts": task.root_ts, "message_ts": "3.000", "actor_id": "UOWNER", "id": "E-context-2",
+            "text": "follow up",
+        })
+        assert "Slack Agent View context" not in json.loads(client.prompts[1])["body"]
+
+    def test_source_blocks_deduplicate_and_label_answer_urls(self):
+        blocks = TaskRegistry._source_blocks("See https://docs.slack.dev/x and https://docs.slack.dev/x. Also https://example.com/report")
+        assert len(blocks) == 1 and blocks[0]["type"] == "context"
+        text = blocks[0]["elements"][0]["text"]
+        assert text.count("docs.slack.dev/x") == 1
+        assert "[1] docs.slack.dev" in text and "[2] example.com" in text
+
     async def test_existing_thread_requires_exact_mention_before_auth_or_files(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.004b")
@@ -569,7 +621,11 @@ class TestAC2IdentityRouting:
         assert not await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE|bridge> spoof", "E3", "M3"))
         assert bot.downloads == []
         assert await reg.maybe_route_message(SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "<@UBRIDGE> verified", "E4", "M4", (attachment,)))
-        assert json.loads(client.prompts[0])["body"] == "verified @" + str(bot.downloads[0]["path"])
+        body = json.loads(client.prompts[0])["body"]
+        assert body.startswith("verified [Slack file ")
+        assert f'"local_reference": "@{bot.downloads[0]["path"]}"' in body
+        assert '"name": "a.png"' in body
+        assert '"shared_by": "UOWNER"' in body
 
     async def test_stopped_existing_thread_mention_gets_visible_restart_notice(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
@@ -654,7 +710,11 @@ class TestAC4AttachmentsAndInterrogatives:
         msg = SlackMessage("T1", "CHOME", task.root_ts, SlackActor("UOWNER"), "inspect", "E1", "M1", (SlackFile("https://files.slack.com/private", "notes.txt", 12),))
         assert await reg.maybe_route_message(msg)
         assert bot.downloads and bot.downloads[0]["max_bytes"] > 0
-        assert json.loads(client.prompts[0])["body"].startswith("inspect @")
+        body = json.loads(client.prompts[0])["body"]
+        assert body.startswith("inspect [Slack file ")
+        assert f'"local_reference": "@{bot.downloads[0]["path"]}"' in body
+        assert '"name": "notes.txt"' in body
+        assert any("Added 1 Slack file" in post["text"] for post in bot.posts)
 
     async def test_pending_is_actor_targeted_and_attachment_does_not_consume(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
@@ -825,6 +885,30 @@ async def test_live_control_header_shows_title_context_and_todos(in_memory_db):
     assert len(bot.renames) == 1
     runtime = await state.get_runtime(in_memory_db, task.task_id)
     assert runtime is not None and runtime.control_message_ts == "controls-1"
+
+
+@pytest.mark.asyncio
+async def test_set_model_and_set_facet_refresh_the_visible_header_immediately(in_memory_db):
+    """Regression: set_model/set_facet used to rely solely on the 60s
+    periodic header refresh loop, so a successful model/facet switch left
+    the visible task root message showing stale info for up to a minute
+    (and indefinitely if the loop wasn't running), looking like the switch
+    silently failed. They must now refresh the header inline, like
+    set_title already does."""
+    bot = FakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, client = await _task(reg, root="1000.refresh")
+    task.control_message_ts = "controls-refresh"
+    await reg._persist_root(task)
+
+    client.state_payload.update({"active_model": "router/gpt-5.6-sol:api", "active_facet": "execute"})
+    await reg.set_model(task.task_id, "router/gpt-5.6-sol:api", owner_user_id="UOWNER")
+    assert bot.edits, "set_model must refresh the visible header, not just the daemon"
+    assert "router/gpt-5.6-sol:api" in str(bot.edits[-1]["blocks"])
+
+    client.state_payload.update({"active_facet": "plan"})
+    await reg.set_facet(task.task_id, "plan", owner_user_id="UOWNER")
+    assert "plan" in str(bot.edits[-1]["blocks"])
 
 
 @pytest.mark.asyncio
