@@ -1337,21 +1337,44 @@ class TaskRegistry:
                 return
             except Exception as exc:
                 log.warning("native Slack stream fallback conversion failed: %s", safe_error(exc, "progress fallback failed"))
+                # Giving up on this message entirely (about to post a fresh
+                # one below): leaving the old, now-broken stream_ts set would
+                # make _end_turn retry a stop_stream against it later, and
+                # produce a second, misleading "message_not_in_streaming_
+                # state" warning at turn end.
+                task.progress_stream_ts = None
+                task.progress_stream_started_at = None
         if task.progress_fallback_ts is None:
             sent = await self._post(task, fallback, blocks=blocks)
             task.progress_fallback_ts = sent[0] if sent else None
         elif task.progress_fallback_ts:
-            with contextlib.suppress(Exception):
+            try:
                 await bot.edit_message(task.channel_id, task.progress_fallback_ts, text=fallback, blocks=blocks)
+            except Exception as exc:
+                # Previously a bare contextlib.suppress: a persistently failing
+                # edit here left the Slack message frozen mid-turn with zero
+                # log signal at all, since every other failure path in this
+                # file logs a warning but this one silently ate it.
+                code = slack_error_code(exc)
+                log.warning(
+                    "fallback progress card update failed%s: %s",
+                    f" ({code})" if code else "", safe_error(exc, "progress fallback update failed"),
+                )
 
     async def _update_fallback_progress(self, task: Task, *, outcome: str = "running") -> None:
         if task.progress_fallback_ts is None:
             await self._ensure_fallback_progress(task, outcome=outcome)
             return
         fallback, blocks = self._progress_blocks(task, outcome=outcome)
-        with contextlib.suppress(Exception):
+        try:
             await self._require_bot().edit_message(
                 task.channel_id, task.progress_fallback_ts, text=fallback, blocks=blocks,
+            )
+        except Exception as exc:
+            code = slack_error_code(exc)
+            log.warning(
+                "fallback progress card update failed%s: %s",
+                f" ({code})" if code else "", safe_error(exc, "progress fallback update failed"),
             )
 
     async def _append_progress(self, task: Task, *, markdown_text: str | None = None,

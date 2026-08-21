@@ -1064,6 +1064,71 @@ async def test_assistant_text_first_block_has_no_leading_separator(in_memory_db)
 
 
 @pytest.mark.asyncio
+async def test_stream_append_failure_clears_stream_ts_avoiding_redundant_stop(in_memory_db):
+    """Regression: a failed append_stream (e.g. msg_too_long on a long,
+    chatty turn) previously left task.progress_stream_ts pointing at the
+    now-broken message. _end_turn would then attempt a second, redundant
+    stop_stream against it, producing an unrelated-looking
+    "message_not_in_streaming_state" warning at turn end. The stream ts must
+    be cleared as soon as the append fails."""
+    class AppendFailsBot(RichFakeBot):
+        async def append_stream(self, channel_id, stream_ts, *, markdown_text=None, chunks=None):
+            self.stream_appends.append({
+                "channel_id": channel_id, "stream_ts": stream_ts,
+                "markdown_text": markdown_text, "chunks": chunks,
+            })
+            raise RuntimeError("msg_too_long")
+
+    rich_bot = AppendFailsBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.append-fail")
+    await reg._render(task, events.TurnStarted("prompt-fail"))
+    assert task.progress_stream_ts is not None
+
+    await reg._render(task, events.ToolLine("✓ Bash: pwd"))
+    assert task.progress_stream_disabled is True
+    assert task.progress_stream_ts is None
+    assert len(rich_bot.stream_stops) == 1
+
+    await reg._render(task, events.TurnComplete("prompt-fail"))
+    # No second, redundant stop_stream against the already-broken message.
+    assert len(rich_bot.stream_stops) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_progress_update_failure_is_logged_not_silent(in_memory_db, caplog):
+    """Regression: a persistently failing fallback-card edit was previously
+    swallowed by a bare contextlib.suppress with zero log output, so the
+    Slack message could freeze mid-turn with no operator-visible signal at
+    all. It must now log a warning and, critically, must not raise."""
+    class AlwaysFailsBot(RichFakeBot):
+        async def append_stream(self, channel_id, stream_ts, *, markdown_text=None, chunks=None):
+            raise RuntimeError("msg_too_long")
+
+        async def edit_message(self, channel_id, message_ts, *, text=None, blocks=None, content=None):
+            raise RuntimeError("some_persistent_slack_error")
+
+    rich_bot = AlwaysFailsBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.fallback-fail")
+    await reg._render(task, events.TurnStarted("prompt-ff"))
+
+    with caplog.at_level("WARNING", logger="bridge.tasks"):
+        # First activity: append_stream fails -> stream_ts is cleared (see
+        # the previous regression fix) -> falls back to a fresh _post (which
+        # succeeds here, establishing progress_fallback_ts).
+        await reg._render(task, events.ToolLine("✓ Bash: pwd"))
+        # Second activity: now routes through _update_fallback_progress's
+        # edit_message call, which always fails in this bot -- this must be
+        # logged, not silently swallowed.
+        await reg._render(task, events.ToolLine("✓ Bash: ls"))
+
+    assert any("fallback progress card update failed" in rec.message for rec in caplog.records)
+    # Must not have raised out of _render at any point.
+    await reg._render(task, events.TurnComplete("prompt-ff"))
+
+
+@pytest.mark.asyncio
 async def test_native_agent_stop_cancels_turn_without_terminating_session(in_memory_db):
     rich_bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
