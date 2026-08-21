@@ -1298,6 +1298,36 @@ async def test_goal_proposal_blocks_post_failure_falls_back_to_plain_text(in_mem
     assert pending is not None and pending.payload["kind"] == "goal_proposal"
 
 
+@pytest.mark.asyncio
+async def test_goal_proposal_answer_with_bot_mention_is_not_misread_as_reject(in_memory_db):
+    """Regression: live report -- user replied "yes @Hailey's Robot" to an
+    "Accept this goal?" prompt (mentioning the bot is how replies route in
+    most threads) and the daemon recorded it as rejected. Root cause:
+    maybe_route_message's raw_text (fed to _answer_interrogative) used
+    msg.text unconditionally, so the literal <@BOT_ID> mention token rode
+    along into _goal_proposal_response's exact-match check, which silently
+    defaulted to accepted=False for anything that wasn't a bare "yes"."""
+    reg, bot = _registry(in_memory_db)
+    task, client = await _task(reg, root="1000.goal-mention")
+    action = events.GoalProposal(
+        interrogative_id="gp-mention", prompt_id="prompt-mention",
+        title="Accept this goal?",
+        proposed_summary="Finish implementing Atproto Spaces alpha support",
+        proposed_file_path=None,
+        action_labels={"accept": "Accept goal", "reject": "Reject goal"},
+    )
+    await reg._render(task, action)
+
+    assert await reg.maybe_route_message(SlackMessage(
+        "T1", "CHOME", task.root_ts, SlackActor("UOWNER"),
+        "yes <@UBRIDGE>", "E1", "M1",
+    ))
+
+    assert client.interrogative_responses[-1] == {
+        "id": "gp-mention", "response": {"kind": "goal_proposal_answer", "accepted": True},
+    }
+
+
 def test_goal_proposal_blocks_truncates_long_title_to_avoid_invalid_blocks() -> None:
     """Regression: live failure `interrogative post with blocks failed
     (invalid_blocks)`. `title` can fall back to the daemon's raw

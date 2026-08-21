@@ -2222,7 +2222,14 @@ class TaskRegistry:
         for path in voice_paths:
             transcript = await voice.transcribe(path)
             voice_parts.append(f"[voice memo] {transcript}" if transcript else f"[voice memo received: {path}]")
-        raw_text = msg.text.rstrip()
+        # Interrogative answers are matched by exact string (yes/no, a decision
+        # keyword, a number, ...). Unlike command_text above, this previously
+        # used msg.text unconditionally, so a reply like "yes @Hailey's Robot"
+        # (mentioning the bot is required to route in most threads) carried
+        # the raw <@BOT_ID> token straight into e.g. _goal_proposal_response's
+        # exact-match check, which silently fell through to the "not accepted"
+        # default -- a reply of "yes" was recorded as a rejection.
+        raw_text = (mention_text if mention_text is not None else msg.text).rstrip()
         # Attachments and voice are normal prompts, never answers to a pending
         # actor-targeted interrogative.
         if pending is not None and raw_text and not msg.files and not voice_parts and not other_paths:
