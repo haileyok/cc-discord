@@ -257,22 +257,12 @@ def build_task_root_blocks(task_id: str, *, mode: str = "personal") -> list[dict
     value = str(task_id)
     first = [
         ("task.compact", "Compact", "primary"),
-        ("task.todos", "Todos", None),
-        ("task.stats", "Stats", None),
         ("task.stop", "Stop", "danger"),
         ("task.kill", "Kill", "danger"),
     ]
     second = [
         ("task.participants", "Participants", None),
-        ("task.promote", "Promote", None),
-        ("task.title", "Title", None),
         ("task.configure", "Configure", None),
-        ("task.activity", "Activity", None),
-    ] if mode != "collaborative" else [
-        ("task.participants", "Participants", None),
-        ("task.title", "Title", None),
-        ("task.configure", "Configure", None),
-        ("task.activity", "Activity", None),
     ]
 
     def button(action_id: str, text: str, style: str | None) -> dict[str, Any]:
@@ -591,8 +581,8 @@ class CommandDispatcher:
         if operation == "compact":
             outcome = await self.registry.request_compaction(task.task_id, owner_user_id=actor)
             if outcome == "queued":
-                return await self._reply(payload, "🕒 Compaction queued; it will run when the active turn finishes.")
-            return await self._reply(payload, "🧹 Compaction accepted; completion will appear in the activity stream.")
+                return await self._reply(payload, "🕒 Compaction queued; it will run when the active turn finishes.", ephemeral=False)
+            return await self._reply(payload, "🧹 Compaction accepted; Slack will post when it completes.", ephemeral=False)
         if operation == "clear":
             await self.registry.clear_context(task.task_id, owner_user_id=actor)
             return await self._reply(payload, "🗑️ Context cleared. Durable session history remains on disk.")

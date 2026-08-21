@@ -246,7 +246,9 @@ def test_working_directory_resolution_accepts_quotes_case_and_aliases(tmp_path: 
 def test_task_root_blocks_have_controls_and_task_value() -> None:
     blocks = build_task_root_blocks("T123", mode="personal")
     actions = [element for block in blocks for element in block["elements"]]
-    assert {item["action_id"] for item in actions} >= {"task.compact", "task.clear", "task.todos", "task.stats", "task.stop", "task.kill", "task.participants", "task.promote"}
+    action_ids = {item["action_id"] for item in actions}
+    assert action_ids == {"task.compact", "task.clear", "task.stop", "task.kill", "task.participants", "task.configure"}
+    assert action_ids.isdisjoint({"task.todos", "task.stats", "task.activity", "task.title", "task.promote"})
     assert all(item["value"] == "T123" for item in actions)
     clear = next(item for item in actions if item["action_id"] == "task.clear")
     assert clear["style"] == "danger" and clear["confirm"]["style"] == "danger"

@@ -716,15 +716,21 @@ class Bot:
         actor_id = str(payload.get("actor_id") or payload.get("user_id") or "")
         if not channel_id or not actor_id:
             raise SlackAdapterError("Slack response omitted channel or actor identity")
+        ephemeral = bool(getattr(response, "ephemeral", True))
         kwargs: dict[str, Any] = {
             "channel": channel_id,
-            "user": actor_id,
             "text": text or self._blocks_fallback(blocks),
         }
         if blocks:
             kwargs["blocks"] = blocks
+        if ephemeral:
+            kwargs["user"] = actor_id
+        else:
+            root_ts = str(payload.get("root_ts") or "")
+            if root_ts:
+                kwargs["thread_ts"] = root_ts
         try:
-            return await self._api("chat_postEphemeral", **kwargs)
+            return await self._api("chat_postEphemeral" if ephemeral else "chat_postMessage", **kwargs)
         except SlackApiError as exc:
             if slack_error_code(exc) == "not_in_channel":
                 logger.warning("cannot deliver ephemeral response: bot is not in channel")

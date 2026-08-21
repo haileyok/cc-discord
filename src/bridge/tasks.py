@@ -1361,10 +1361,7 @@ class TaskRegistry:
             activity.update(title="Recent tool calls", details="\n".join(task.recent_tool_lines[-5:]))
         else:
             activity["title"] = task.progress_lines[-1][:240] if task.progress_lines else "Starting agent turn…"
-        chunks: list[dict[str, Any]] = [
-            {"type": "plan_update", "title": "Agent working"},
-            activity,
-        ]
+        chunks: list[dict[str, Any]] = [activity]
         chunks.extend(
             {"type": "markdown_text", "text": text}
             for text in self._progress_chunk_text(task.progress_answer)
@@ -2712,10 +2709,9 @@ class TaskRegistry:
                     task.root_ts,
                     recipient_user_id=task.owner_user_id,
                     recipient_team_id=task.team_id,
-                    chunks=[
-                        {"type": "plan_update", "title": "Agent working"},
-                        {"type": "task_update", "id": "turn", "title": "Agent working", "status": "in_progress"},
-                    ],
+                    # Native agents.sessions processing status already renders
+                    # Slack's working state and Stop control. Tool activity and
+                    # answer text are appended when they actually exist.
                     task_display_mode="timeline",
                 )
                 if inspect.isawaitable(stream_ts):
@@ -2746,9 +2742,9 @@ class TaskRegistry:
                 "error": "Agent failed",
             }.get(outcome, "Agent working")
             final_status = "complete" if outcome == "complete" else "error"
-            if task.progress_stream_ts is not None:
-                # Complete the existing turn card without adding an extra
-                # "Agent complete" timeline entry beside the real response.
+            if task.progress_stream_ts is not None and outcome != "complete":
+                # Successful completion needs no synthetic timeline item: the
+                # native session status and final answer already communicate it.
                 await self._append_progress(task, chunks=[{
                     "type": "task_update", "id": "turn",
                     "title": final_title, "status": final_status,

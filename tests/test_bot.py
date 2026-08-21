@@ -197,6 +197,19 @@ class TestAC4WebApiAndRetry:
         assert call.kwargs == {"channel": "GHOME", "user": "UOWNER", "text": "missing cwd"}
 
     @pytest.mark.asyncio
+    async def test_non_ephemeral_interaction_response_posts_in_task_thread(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("chat_postMessage", {"ok": True, "ts": "1.1"}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        response = SimpleNamespace(text="compaction accepted", blocks=None, ephemeral=False)
+        await bot.respond({"channel_id": "DOWNERDM", "root_ts": "1.0", "actor_id": "UOWNER"}, response)
+        call = client.calls[-1]
+        assert call.method == "chat_postMessage"
+        assert call.kwargs == {"channel": "DOWNERDM", "thread_ts": "1.0", "text": "compaction accepted"}
+
+    @pytest.mark.asyncio
     async def test_root_thread_blocks_edit_and_reactions(self) -> None:
         client = FakeSlackClient(script=_startup_script() + [
             ("chat_postMessage", {"ok": True, "ts": "1.1"}),
