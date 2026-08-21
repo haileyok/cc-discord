@@ -473,11 +473,10 @@ class CommandDispatcher:
             ok = await self.registry.kill_task(task.task_id, actor)
             return await self._reply(payload, f"💥 Killed `{task.task_id[:8]}`" if ok else f"⚠️ Could not terminate `{task.task_id[:8]}`; it remains active.")
         if name == "compact":
-            client_for = getattr(self.registry, "_client_for", None)
-            if not callable(client_for):
-                raise TaskRoutingError("compact is unavailable in this registry")
-            await client_for(task).compact()
-            return await self._reply(payload, f"🧹 Compaction requested for `{task.task_id[:8]}`.")
+            outcome = await self.registry.request_compaction(task.task_id, owner_user_id=actor)
+            if outcome == "queued":
+                return await self._reply(payload, f"🕒 Compaction queued for `{task.task_id[:8]}`; it will run when the active turn finishes.")
+            return await self._reply(payload, f"🧹 Compaction completed for `{task.task_id[:8]}`.")
         if name == "reload":
             result = await self.registry.reload_daemon(task.task_id, owner_user_id=actor)
             failed = result.get("failed") if isinstance(result, Mapping) else None
@@ -571,9 +570,10 @@ class CommandDispatcher:
             ok = await (self.registry.stop_task(task.task_id, actor) if operation == "stop" else self.registry.kill_task(task.task_id, actor))
             return await self._reply(payload, f"{'✅ Stopped' if operation == 'stop' and ok else '💥 Killed' if operation == 'kill' and ok else '⚠️ Termination rejected'} `{task.task_id[:8]}`.")
         if operation == "compact":
-            client_for = getattr(self.registry, "_client_for")
-            await client_for(task).compact()
-            return await self._reply(payload, "🧹 Compaction requested.")
+            outcome = await self.registry.request_compaction(task.task_id, owner_user_id=actor)
+            if outcome == "queued":
+                return await self._reply(payload, "🕒 Compaction queued; it will run when the active turn finishes.")
+            return await self._reply(payload, "🧹 Compaction completed.")
         if operation == "stats":
             state = await self.registry.get_state(task.task_id, actor)
             return await self._reply(payload, usage.format_state_summary(state or {}))

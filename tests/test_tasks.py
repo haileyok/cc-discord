@@ -42,6 +42,7 @@ class FakeClient:
     model_calls: list[dict[str, Any]] = field(default_factory=list)
     facet_calls: list[str] = field(default_factory=list)
     reload_calls: int = 0
+    compact_calls: int = 0
     terminated: int = 0
     cancelled: int = 0
     terminate_error_status: int | None = None
@@ -70,6 +71,10 @@ class FakeClient:
     async def reload(self):
         self.reload_calls += 1
         return {"reloaded": ["models"], "failed": []}
+
+    async def compact(self):
+        self.compact_calls += 1
+        return {"status": "compacted"}
 
     async def cancel_turn(self):
         self.cancelled += 1
@@ -976,6 +981,25 @@ class TestAC7LifecycleAndConfig:
         await reg.set_facet(task.task_id, "plan", owner_user_id="UOWNER")
         await reg.close_task(task.task_id, "UOWNER")
         assert bot.archives == ["GPRIVATE"]
+
+    async def test_compaction_runs_immediately_when_idle_and_queues_during_turn(self, in_memory_db):
+        reg, bot = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.compact")
+        client.state_payload["turn_in_flight"] = False
+        assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "completed"
+        assert client.compact_calls == 1
+
+        client.state_payload["turn_in_flight"] = True
+        assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "queued"
+        assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "queued"
+        assert task.compaction_pending is True
+        assert client.compact_calls == 1
+
+        client.state_payload["turn_in_flight"] = False
+        await reg._render(task, events.TurnComplete("prompt-compact"))
+        assert task.compaction_pending is False
+        assert client.compact_calls == 2
+        assert sum("Queued compaction completed" in post.get("text", "") for post in bot.posts) == 1
 
     async def test_model_effort_skill_and_restart_contract(self, in_memory_db):
         reg, _ = _registry(in_memory_db)

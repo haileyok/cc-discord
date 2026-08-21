@@ -275,6 +275,8 @@ class Task:
     progress_answer: str = ""
     progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
     progress_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    compaction_pending: bool = False
+    compaction_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
     control_message_ts: str | None = None
@@ -1024,13 +1026,16 @@ class TaskRegistry:
                 await self._begin_turn(task)
             elif isinstance(action, TurnComplete):
                 await self._end_turn(task, outcome="complete")
+                await self._run_pending_compaction(task)
                 await self._refresh_task_header(task)
             elif isinstance(action, TurnCancelled):
                 await self._end_turn(task, outcome="cancelled")
                 await self._post(task, f"🛑 Turn cancelled ({action.reason})")
+                await self._run_pending_compaction(task)
             elif isinstance(action, ModelError):
                 await self._end_turn(task, outcome="error")
                 await self._post(task, "⚠ Model error: the daemon could not complete this request.")
+                await self._run_pending_compaction(task)
             elif isinstance(action, TitleChange):
                 snapshot = await self._state_snapshot(task)
                 if action.title.strip():
@@ -2252,6 +2257,34 @@ class TaskRegistry:
             await self._client_for(task).set_model(model, reasoning_effort=level)
         except PolytokenClientError as exc:
             raise TaskSpawnError(safe_error(exc, "daemon rejected effort change")) from exc
+
+    async def request_compaction(self, task_id: str, *, owner_user_id: str | SlackActor) -> str:
+        """Compact now when idle, or queue exactly once for the active turn's end."""
+        task = self._require_task(task_id, owner_user_id)
+        async with task.compaction_lock:
+            state = await self._state_snapshot(task)
+            if task.progress_started or bool(state.get("turn_in_flight")):
+                task.compaction_pending = True
+                return "queued"
+            try:
+                await self._client_for(task).compact()
+            except PolytokenClientError as exc:
+                raise TaskSpawnError(safe_error(exc, "daemon compaction failed")) from exc
+            await self._refresh_task_header(task)
+            return "completed"
+
+    async def _run_pending_compaction(self, task: Task) -> None:
+        async with task.compaction_lock:
+            if not task.compaction_pending:
+                return
+            task.compaction_pending = False
+            try:
+                await self._client_for(task).compact()
+            except (PolytokenClientError, TaskSpawnError) as exc:
+                await self._post(task, f"⚠️ Queued compaction failed: {safe_error(exc, 'daemon rejected compaction')}.")
+                return
+            await self._refresh_task_header(task)
+            await self._post(task, "🧹 Queued compaction completed.")
 
     async def reload_daemon(self, task_id: str, *, owner_user_id: str | SlackActor) -> dict[str, Any]:
         task = self._require_task(task_id, owner_user_id)

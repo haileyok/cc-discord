@@ -110,6 +110,10 @@ class LocalRegistry:
     async def set_effort(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("set_effort", args, kwargs))
 
+    async def request_compaction(self, *args: Any, **kwargs: Any) -> str:
+        self.calls.append(("request_compaction", args, kwargs))
+        return "queued"
+
     async def reload_daemon(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("reload_daemon", args, kwargs))
         return {"reloaded": ["models"], "failed": []}
@@ -256,6 +260,9 @@ async def test_shortcut_modal_submission_and_block_action_routing() -> None:
     assert "model-a" in submitted.text
     control = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.stop", "value": "task-12345678"}]})
     assert "Stopped" in control.text
+    compact = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.compact", "value": "task-12345678"}]})
+    assert "queued" in compact.text.lower()
+    assert any(name == "request_compaction" for name, _, _ in registry.calls)
 
 
 @pytest.mark.asyncio
