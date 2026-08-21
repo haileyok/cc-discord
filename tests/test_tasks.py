@@ -495,6 +495,70 @@ class TestAC2IdentityRouting:
         assert supervisor._seq == 0
         await reg.shutdown()
 
+    async def test_owner_dm_without_task_starts_ad_hoc_session(self, in_memory_db, tmp_path):
+        bot = FakeBot()
+        supervisor = FakeSupervisor()
+        reg = TaskRegistry(in_memory_db, bot, supervisor, ad_hoc_cwd=str(tmp_path))
+        prompts: list[str] = []
+
+        async def capture(_task, content, **_kwargs):
+            prompts.append(content)
+            return True
+
+        reg._prompt = capture  # type: ignore[method-assign]
+        event = {
+            "kind": "message", "team_id": "T1", "channel_id": "DOWNERDM",
+            "channel_type": "im", "root_ts": "1.000", "message_ts": "1.000",
+            "actor_id": "UOWNER", "id": "E-dm-1",
+            "text": "investigate the failing deploy",
+        }
+        assert await reg.maybe_route_message(event)
+        task = reg.get_by_conversation("T1", "DOWNERDM", "1.000")
+        assert task is not None
+        assert task.cwd == str(tmp_path)
+        # Agent-view DMs are already addressed to the bridge; no mention gate.
+        assert task.mention_required is False
+        assert supervisor._seq == 1
+        assert len(prompts) == 1
+        assert "investigate the failing deploy" in prompts[0]
+
+        # A threaded follow-up in the DM session routes without any mention.
+        followup = {
+            "kind": "message", "team_id": "T1", "channel_id": "DOWNERDM",
+            "channel_type": "im", "root_ts": "1.000", "message_ts": "2.000",
+            "actor_id": "UOWNER", "id": "E-dm-2", "text": "also check the logs",
+        }
+        assert await reg.maybe_route_message(followup)
+        assert supervisor._seq == 1  # no second daemon
+        assert len(prompts) == 2
+        assert "also check the logs" in prompts[1]
+        await reg.shutdown()
+
+    async def test_non_owner_dm_without_task_is_ignored(self, in_memory_db, tmp_path):
+        bot = FakeBot()
+        supervisor = FakeSupervisor()
+        reg = TaskRegistry(in_memory_db, bot, supervisor, ad_hoc_cwd=str(tmp_path))
+        assert not await reg.maybe_route_message({
+            "kind": "message", "team_id": "T1", "channel_id": "DSTRANGER",
+            "channel_type": "im", "root_ts": "1.000", "message_ts": "1.000",
+            "actor_id": "UOTHER", "id": "E-dm-stranger", "text": "do something",
+        })
+        assert supervisor._seq == 0
+        await reg.shutdown()
+
+    async def test_empty_owner_dm_gets_usage_hint_without_spawning(self, in_memory_db, tmp_path):
+        bot = FakeBot()
+        supervisor = FakeSupervisor()
+        reg = TaskRegistry(in_memory_db, bot, supervisor, ad_hoc_cwd=str(tmp_path))
+        assert await reg.maybe_route_message({
+            "kind": "message", "team_id": "T1", "channel_id": "DOWNERDM",
+            "channel_type": "im", "root_ts": "3.000", "message_ts": "3.000",
+            "actor_id": "UOWNER", "id": "E-dm-empty", "text": "   ",
+        })
+        assert supervisor._seq == 0
+        assert "Tell me what you want" in bot.posts[-1]["text"]
+        await reg.shutdown()
+
     async def test_existing_thread_requires_exact_mention_before_auth_or_files(self, in_memory_db):
         reg, bot = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.004b")

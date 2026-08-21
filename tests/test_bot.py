@@ -116,7 +116,12 @@ class TestAC1StartupAndHealth:
         assert "- groups:history" in manifest
         assert "- assistant:write" in manifest
         assert "- agent_session_stopped" in manifest
-        assert "agent_view" not in manifest
+        assert "agent_view:" in manifest
+        assert "agent_description:" in manifest
+        assert "- message.im" in manifest
+        assert "- app_home_opened" in manifest
+        assert "- app_context_changed" in manifest
+        assert "- im:history" in manifest
         assert "callback_id: start_agent_here" in manifest
         assert "type: message" in manifest
 

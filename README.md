@@ -27,12 +27,12 @@
 1. Create a Slack app from `slack-app-manifest.yaml` (or add the equivalent settings in the Slack app dashboard).
 2. Enable **Socket Mode** and create an app-level token with the `connections:write` scope. Keep the resulting `xapp-...` token private.
 3. Install/reinstall the app in the workspace. Copy the bot token (`xoxb-...`) and app token (`xapp-...`). Do not create or use a user token for this bridge.
-4. Enable the manifest's `/agent`, shortcuts, interactivity, `message.channels`, `message.groups`, `app_mention`, and `agent_session_stopped` subscriptions. Grant `assistant:write` for native agent-session lifecycle and naming.
+4. Enable the manifest's `/agent`, shortcuts, interactivity, `message.channels`, `message.groups`, `message.im`, `app_mention`, `app_home_opened`, `app_context_changed`, and `agent_session_stopped` subscriptions. Grant `assistant:write` (agent-session lifecycle and naming) and `im:history` (DM prompts).
 5. Invite the bot to a public or private home channel. Record the workspace team ID, home channel ID, and the trusted owner's user ID.
 
 The manifest enables public-channel history for an observable home channel and private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) for private homes and promoted collaboration channels. Review scopes against your workspace policy before installing.
 
-Slack's irreversible `features.agent_view` migration is intentionally **not enabled** yet. The bridge uses native agent streaming, status, naming, Stop, and feedback APIs while retaining channel threads as the canonical personal and collaborative task surface.
+The manifest enables Slack's `features.agent_view` (an irreversible migration for the app): the bot's Messages tab becomes the native agent experience, and a DM from the owner starts an ad-hoc task from `BRIDGE_AD_HOC_CWD` — no mention needed, threaded replies continue the session. Channel threads remain the canonical personal and collaborative task surface; agent view only adds the DM surface. `app_home_opened` and `app_context_changed` events are subscribed but require no bridge action today.
 
 ## Install and configure
 

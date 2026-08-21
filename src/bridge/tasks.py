@@ -211,6 +211,12 @@ class SlackMessage:
     message_ts: str | None = None
     files: tuple[SlackFile, ...] = ()
     verified_mention: bool = False
+    channel_type: str = ""
+
+    @property
+    def is_dm(self) -> bool:
+        """True for direct messages with the bridge (agent-view surface)."""
+        return self.channel_type == "im" or self.channel_id.startswith("D")
 
     @property
     def actor_id(self) -> str:
@@ -432,6 +438,7 @@ def normalize_message(value: Any) -> SlackMessage:
         message_ts=str(message_ts) if message_ts is not None else None,
         files=tuple(_file(item) for item in files),
         verified_mention=str(_value(source, "kind", None) or _value(source, "type", "")) == "app_mention",
+        channel_type=str(_value(source, "channel_type", "") or ""),
     )
 
 
@@ -1712,6 +1719,7 @@ class TaskRegistry:
         prompt: str | None = None,
         participants: list[str] | None = None,
         bind_existing_root: bool = False,
+        mention_required: bool | None = None,
     ) -> Task:
         if not Path(cwd).is_dir():
             raise TaskSpawnError(f"cwd does not exist: {cwd}")
@@ -1748,7 +1756,7 @@ class TaskRegistry:
             )
             root_ts = str(roots)
         channel_owned = bool(mode == "collaborative" and channel_id != self.home_channel_id and channel_id in getattr(bot, "_owned_channel_ids", set()))
-        task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned, mention_required=bind_existing_root, control_message_ts=None if bind_existing_root else str(root_ts))
+        task = Task(task_id, team_id, channel_id, str(root_ts), owner_user_id, mode, cwd, "spawning", created_at=created, last_activity=created, app_exchange_budget=self.app_exchange_budget, channel_owned=channel_owned, mention_required=bind_existing_root if mention_required is None else mention_required, control_message_ts=None if bind_existing_root else str(root_ts))
         if reusable is not None:
             self._torn_down.discard(task_id)
         if bind_existing_root:
@@ -1842,11 +1850,11 @@ class TaskRegistry:
         return True
 
     async def _spawn_from_owner_mention(self, msg: SlackMessage) -> bool:
-        """Create an attached ad-hoc task for a verified owner mention."""
+        """Create an attached ad-hoc task for a verified owner mention or owner DM."""
         bot = self._require_bot()
         owner_id = str(getattr(bot, "owner_user_id", "") or "")
         cleaned = _strip_verified_mention(msg.text, self._bridge_user_id)
-        if not msg.verified_mention and cleaned is None:
+        if not msg.is_dm and not msg.verified_mention and cleaned is None:
             return False
         if msg.actor.is_app or not owner_id or msg.actor_id != owner_id:
             return False
@@ -1854,11 +1862,12 @@ class TaskRegistry:
             return True
         request = cleaned if cleaned is not None else msg.text.strip()
         if not request and not msg.files:
-            await bot.post(
-                "👋 I saw the mention, but Slack supplied no request text. Mention me with what you want the agent to do.",
-                channel_id=msg.channel_id,
-                root_ts=msg.root_ts,
+            hint = (
+                "👋 Tell me what you want the agent to do."
+                if msg.is_dm
+                else "👋 I saw the mention, but Slack supplied no request text. Mention me with what you want the agent to do."
             )
+            await bot.post(hint, channel_id=msg.channel_id, root_ts=msg.root_ts)
             return True
         if msg.files:
             # The normal routed-message path applies authenticated attachment
@@ -1878,6 +1887,9 @@ class TaskRegistry:
                 root_ts=msg.root_ts,
                 prompt=provenance.wire(request),
                 bind_existing_root=True,
+                # DM (agent-view) sessions never require mentions: the whole
+                # conversation is already addressed to the bridge.
+                mention_required=False if msg.is_dm else None,
             )
         except TaskRoutingError:
             # A concurrent redelivery may have won the root reservation. The

@@ -3,6 +3,15 @@ display_information:
   description: Drive trusted Polytoken agent sessions from a private Slack workspace.
   background_color: "#1f2937"
 features:
+  # Irreversible migration: agent_view converts the app's Messages tab into
+  # Slack's agent experience. Channel-thread operation is unaffected.
+  agent_view:
+    agent_description: "Drives trusted Polytoken agent sessions: coding tasks, infra investigation, and long-running background work from Slack threads or DMs."
+    suggested_prompts:
+      - title: "Start a task"
+        message: "Investigate the failing deploy and summarize what you find."
+      - title: "List tasks"
+        message: "/agent list"
   bot_user:
     display_name: claude-slack-bridge
     always_online: true
@@ -30,7 +39,10 @@ settings:
     bot_events:
       - message.channels
       - message.groups
+      - message.im
       - app_mention
+      - app_home_opened
+      - app_context_changed
       - reaction_added
       - reaction_removed
       - agent_session_stopped
@@ -47,6 +59,7 @@ oauth_config:
       - chat:write
       - commands
       - files:read
+      - im:history
       - files:write
       - reactions:read
       - reactions:write
