@@ -775,6 +775,7 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     task, _ = await _task(reg, root="1000.rich")
     await reg._render(task, events.TurnStarted("prompt-rich"))
     assert task.progress_keepalive is not None and not task.progress_keepalive.done()
+    await reg._render(task, events.AssistantThinking("private reasoning fragment"))
     await reg._render(task, events.ToolLine("✓ Bash: pwd"))
     await reg._render(task, events.ToolLine("✓ Read: pyproject.toml"))
     await reg._render(task, events.AssistantText("final answer"))
@@ -796,8 +797,11 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     )
     task_chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call["chunks"]]
     activity_chunks = [chunk for chunk in task_chunks if chunk["type"] == "task_update" and chunk["id"] == "activity"]
-    assert [chunk["title"] for chunk in activity_chunks] == ["✓ Bash: pwd", "✓ Read: pyproject.toml"]
+    assert [chunk["title"] for chunk in activity_chunks] == ["Recent tool calls", "Recent tool calls"]
+    assert activity_chunks[-1]["details"] == "✓ Bash: pwd\n✓ Read: pyproject.toml"
     assert all(chunk["status"] == "in_progress" for chunk in activity_chunks)
+    assert "private reasoning fragment" not in "\n".join(task.progress_lines)
+    assert not any("private reasoning fragment" in str(call) for call in rich_bot.stream_appends)
     assert any(chunk["type"] == "task_update" and chunk["id"] == "subagent-h1" for chunk in task_chunks)
     assert rich_bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
     assert rich_bot.statuses == [
@@ -807,6 +811,21 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
     assert task.progress_stream_ts is None and task.progress_started is False
     assert task.progress_keepalive is None
+
+
+@pytest.mark.asyncio
+async def test_tool_activity_keeps_only_five_most_recent_calls(in_memory_db):
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.tools-five")
+    await reg._render(task, events.TurnStarted("prompt-tools"))
+    for index in range(7):
+        await reg._render(task, events.ToolLine(f"tool call {index}"))
+    assert task.recent_tool_lines == [f"tool call {index}" for index in range(2, 7)]
+    chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call.get("chunks")]
+    activity = [chunk for chunk in chunks if chunk.get("id") == "activity"][-1]
+    assert activity["details"] == "\n".join(f"tool call {index}" for index in range(2, 7))
+    await reg._render(task, events.TurnComplete("prompt-tools"))
 
 
 @pytest.mark.asyncio

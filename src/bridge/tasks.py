@@ -271,6 +271,7 @@ class Task:
     progress_stream_disabled: bool = False
     progress_started: bool = False
     progress_lines: list[str] = field(default_factory=list)
+    recent_tool_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
     progress_answer: str = ""
     progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -983,19 +984,14 @@ class TaskRegistry:
                 else:
                     await self._stream_assistant_text(task, action.text)
             elif isinstance(action, AssistantThinking):
-                if not action.subagent_handle:
-                    await self._progress_line(task, f"💭 {action.text[:180]}")
-                    if task.progress_stream_ts is None and task.progress_fallback_ts is None:
-                        await self._post(task, f"💭 {action.text}")
+                # Thinking arrives as high-frequency text deltas. Keep it private
+                # and represent it only through Slack's generic processing state;
+                # rendering fragments makes the task timeline noisy and hard to scan.
+                pass
             elif isinstance(action, ToolLine):
                 if not task.progress_started:
                     self._agg_for(task).append(action.line)
-                # Reuse one timeline item for ordinary tool activity. A fresh
-                # ID per call makes Slack append a visible row for every tool;
-                # the stable ID updates the current Agent working row in place.
-                await self._progress_task_update(
-                    task, action.line, task_id="activity", status="in_progress",
-                )
+                await self._progress_tool_update(task, action.line)
             elif isinstance(action, (ToolDiff, ToolFailure)):
                 line = action.block if isinstance(action, ToolDiff) else action.line
                 await self._progress_line(task, line)
@@ -1204,10 +1200,16 @@ class TaskRegistry:
         return False
 
     def _native_progress_chunks(self, task: Task) -> list[dict[str, Any]]:
-        title = task.progress_lines[-1][:240] if task.progress_lines else "Starting agent turn…"
+        activity: dict[str, Any] = {
+            "type": "task_update", "id": "activity", "status": "in_progress",
+        }
+        if task.recent_tool_lines:
+            activity.update(title="Recent tool calls", details="\n".join(task.recent_tool_lines[-5:]))
+        else:
+            activity["title"] = task.progress_lines[-1][:240] if task.progress_lines else "Starting agent turn…"
         chunks: list[dict[str, Any]] = [
             {"type": "plan_update", "title": "Agent working"},
-            {"type": "task_update", "id": "activity", "title": title, "status": "in_progress"},
+            activity,
         ]
         chunks.extend(
             {"type": "markdown_text", "text": text}
@@ -1272,11 +1274,14 @@ class TaskRegistry:
                     if not await self._rotate_progress_stream(task):
                         return
                     continue
-                title = task.progress_lines[-1][:240] if task.progress_lines else "Agent working"
-                if not await self._append_progress(task, chunks=[{
-                    "type": "task_update", "id": "activity",
-                    "title": title, "status": "in_progress",
-                }]):
+                activity: dict[str, Any] = {
+                    "type": "task_update", "id": "activity", "status": "in_progress",
+                }
+                if task.recent_tool_lines:
+                    activity.update(title="Recent tool calls", details="\n".join(task.recent_tool_lines[-5:]))
+                else:
+                    activity["title"] = task.progress_lines[-1][:240] if task.progress_lines else "Agent working"
+                if not await self._append_progress(task, chunks=[activity]):
                     return
         except asyncio.CancelledError:
             return
@@ -1299,6 +1304,23 @@ class TaskRegistry:
             del task.progress_lines[:-100]
         if task.progress_stream_ts is None:
             await self._update_fallback_progress(task)
+
+    async def _progress_tool_update(self, task: Task, line: str) -> None:
+        if not task.progress_started:
+            return
+        cleaned = str(line).strip().replace("\x00", "")[:300]
+        if not cleaned:
+            return
+        task.recent_tool_lines.append(cleaned)
+        del task.recent_tool_lines[:-5]
+        await self._progress_line(task, cleaned)
+        await self._append_progress(task, chunks=[{
+            "type": "task_update",
+            "id": "activity",
+            "title": "Recent tool calls",
+            "details": "\n".join(task.recent_tool_lines),
+            "status": "in_progress",
+        }])
 
     async def _progress_task_update(self, task: Task, title: str, *, task_id: str | None = None,
                                     status: str = "complete", details: str | None = None,
@@ -2390,6 +2412,7 @@ class TaskRegistry:
             return
         task.progress_started = True
         task.progress_lines.clear()
+        task.recent_tool_lines.clear()
         task.progress_sequence = 0
         task.progress_answer = ""
         bot = self._require_bot()
