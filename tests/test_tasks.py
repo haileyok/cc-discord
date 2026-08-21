@@ -41,6 +41,7 @@ class FakeClient:
     interrogative_responses: list[dict[str, Any]] = field(default_factory=list)
     model_calls: list[dict[str, Any]] = field(default_factory=list)
     facet_calls: list[str] = field(default_factory=list)
+    reload_calls: int = 0
     terminated: int = 0
     cancelled: int = 0
     terminate_error_status: int | None = None
@@ -65,6 +66,10 @@ class FakeClient:
 
     async def set_facet(self, facet: str):
         self.facet_calls.append(facet)
+
+    async def reload(self):
+        self.reload_calls += 1
+        return {"reloaded": ["models"], "failed": []}
 
     async def cancel_turn(self):
         self.cancelled += 1
@@ -962,6 +967,11 @@ class TestAC7LifecycleAndConfig:
     async def test_model_effort_skill_and_restart_contract(self, in_memory_db):
         reg, _ = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.013")
+        result = await reg.reload_daemon(task.task_id, owner_user_id="UOWNER")
+        assert result == {"reloaded": ["models"], "failed": []}
+        assert client.reload_calls == 1
+        with pytest.raises(TaskPrivilegeError):
+            await reg.reload_daemon(task.task_id, owner_user_id="UOTHER")
         await reg.set_effort(task.task_id, "low", owner_user_id="UOWNER")
         await reg.set_model(task.task_id, "openai/gpt-5", owner_user_id="UOWNER", reasoning_effort="high")
         await reg.invoke_skill(task.task_id, "brainstorming", "go", owner_user_id="UOWNER")

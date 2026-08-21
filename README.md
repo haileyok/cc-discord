@@ -82,7 +82,7 @@ uv run claude-slack-bridge doctor
 
 ## Commands and routing
 
-The Slack command surface is implemented by the current adapter. `/agent` is the primary entry point; task operations map to the existing registry lifecycle (start/spawn, list, stop, kill, skill, effort, model, facet, rename, stats, tasks, pin/unpin where supported). Use a root message thread for normal prompts and answers.
+The Slack command surface is implemented by the current adapter. `/agent` is the primary entry point; task operations map to the existing registry lifecycle (start/spawn, list, stop, kill, reload, skill, effort, model, facet, rename, stats, tasks, pin/unpin where supported). `/agent reload` applies the daemon's on-disk configuration to the current task without restarting it. Use a root message thread for normal prompts and answers.
 
 Slack limitations are intentional:
 

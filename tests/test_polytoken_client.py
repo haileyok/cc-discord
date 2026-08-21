@@ -56,6 +56,9 @@ def _build_stub_app() -> web.Application:
     async def cancel(_request: web.Request) -> web.Response:
         return web.json_response({"status": "cancel_requested"}, status=202)
 
+    async def reload(_request: web.Request) -> web.Response:
+        return web.json_response({"reloaded": ["models", "skills"], "failed": []})
+
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
 
@@ -92,6 +95,7 @@ def _build_stub_app() -> web.Application:
     app.router.add_post("/title", title)
     app.router.add_post("/model", model)
     app.router.add_post("/turn/cancel", cancel)
+    app.router.add_post("/reload", reload)
     app.router.add_get("/health", health)
     app.router.add_get("/events", events)
     return app
@@ -181,6 +185,11 @@ class TestPolytokenClient:
         async with PolytokenClient(stub_port) as client:
             res = await client.cancel_turn()
         assert res["status"] == "cancel_requested"
+
+    async def test_reload(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            result = await client.reload()
+        assert result == {"reloaded": ["models", "skills"], "failed": []}
 
     async def test_health_true(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:

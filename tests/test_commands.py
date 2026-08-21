@@ -110,6 +110,10 @@ class LocalRegistry:
     async def set_effort(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("set_effort", args, kwargs))
 
+    async def reload_daemon(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("reload_daemon", args, kwargs))
+        return {"reloaded": ["models"], "failed": []}
+
     async def set_model(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("set_model", args, kwargs))
 
@@ -203,10 +207,11 @@ async def test_agent_commands_cover_model_facet_effort_title_stats_todos_and_pin
     bot = LocalBot()
     dispatcher = CommandDispatcher(bot, registry)
     common = {"channel_id": "GHOME", "thread_ts": "100.1", "user_id": "UOWNER", "team_id": "T1"}
-    for text in ("model name=model-b", "facet name=plan", "effort level=high", "title name=New title", "stats", "todos", "pin text=remember", "unpin id=P1"):
+    for text in ("reload", "model name=model-b", "facet name=plan", "effort level=high", "title name=New title", "stats", "todos", "pin text=remember", "unpin id=P1"):
         response = await dispatcher.dispatch({"type": "slash_commands", "command": "/agent", "text": text, **common})
         assert not response.text.startswith("❌"), (text, response.text)
     names = [name for name, _, _ in registry.calls]
+    assert "reload_daemon" in names
     assert "set_model" in names and "set_facet" in names and "set_effort" in names
     assert any(edit["channel_id"] == "GHOME" and edit["message_ts"] == "100.1" and edit["text"] == "New title" for edit in bot.edits)
 

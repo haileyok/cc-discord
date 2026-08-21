@@ -321,6 +321,11 @@ class PolytokenClient:
     async def compact(self) -> Any:
         return await self._request("POST", "/compact")
 
+    async def reload(self) -> dict[str, Any]:
+        """Reload daemon configuration and return subsystem results."""
+        result = await self._request("POST", "/reload")
+        return result if isinstance(result, dict) else {}
+
     async def clear(self) -> Any:
         return await self._request("POST", "/clear")
 

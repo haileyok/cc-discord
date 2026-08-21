@@ -382,7 +382,7 @@ class CommandDispatcher:
     async def _slash(self, payload: Mapping[str, Any]) -> SlackResponse:
         command = str(payload.get("command") or "")
         text = str(payload.get("text") or "").strip()
-        if command and command.rstrip("/").split("/")[-1] not in {"agent", "start", "spawn", "list", "stop", "kill", "restart", "skill", "model", "facet", "effort", "title", "rename", "stats", "todos", "tasks", "pin", "unpin"}:
+        if command and command.rstrip("/").split("/")[-1] not in {"agent", "start", "spawn", "list", "stop", "kill", "restart", "reload", "skill", "model", "facet", "effort", "title", "rename", "stats", "todos", "tasks", "pin", "unpin"}:
             return await self._error(payload, "Unknown command. Try `/agent help`.")
         if command.rstrip("/").split("/")[-1] != "agent" and command:
             text = " ".join([command.lstrip("/"), text]).strip()
@@ -412,7 +412,7 @@ class CommandDispatcher:
         if name == "restart":
             task = await self._task_from_payload(payload, actor, require_owner=True)
             return await self._reply(payload, f"❌ Restart is unsupported for `{task.task_id[:8]}`; use `/agent kill` then `/agent start` (headless resume is unavailable).")
-        if name in {"stop", "kill", "compact", "skill", "model", "facet", "effort", "title", "rename", "stats", "todos", "tasks", "pin", "unpin"}:
+        if name in {"stop", "kill", "compact", "reload", "skill", "model", "facet", "effort", "title", "rename", "stats", "todos", "tasks", "pin", "unpin"}:
             return await self._session_command(payload, name, args, tokens, actor)
         return await self._error(payload, "Unknown `/agent` command. Try `/agent help`.")
 
@@ -478,6 +478,13 @@ class CommandDispatcher:
                 raise TaskRoutingError("compact is unavailable in this registry")
             await client_for(task).compact()
             return await self._reply(payload, f"🧹 Compaction requested for `{task.task_id[:8]}`.")
+        if name == "reload":
+            result = await self.registry.reload_daemon(task.task_id, owner_user_id=actor)
+            failed = result.get("failed") if isinstance(result, Mapping) else None
+            if failed:
+                names = ", ".join(str(item) for item in failed)
+                return await self._reply(payload, f"⚠️ Reloaded `{task.task_id[:8]}` with failures: {names}.")
+            return await self._reply(payload, f"♻️ Reloaded daemon configuration for `{task.task_id[:8]}`.")
         if name == "skill":
             skill_name = args.get("name") or (args.get("_positional", "").split(maxsplit=1) or [""])[0]
             skill_args = args.get("args")
@@ -834,7 +841,7 @@ class CommandDispatcher:
     @staticmethod
     def _help_text() -> str:
         return ("*Polytoken commands:* `/agent start cwd=<path> [prompt=<text>]`, `/agent spawn project=<name>`, "
-                "`list`, `stop`, `kill`, `restart`, `compact`, `skill`, `model`, `facet`, `effort`, `title`, "
+                "`list`, `stop`, `kill`, `restart`, `reload`, `compact`, `skill`, `model`, `facet`, `effort`, `title`, "
                 "`stats`, `todos`, `pin`, `unpin`. Task controls are also available on each root message.")
 
 

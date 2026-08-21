@@ -2235,6 +2235,15 @@ class TaskRegistry:
         except PolytokenClientError as exc:
             raise TaskSpawnError(safe_error(exc, "daemon rejected effort change")) from exc
 
+    async def reload_daemon(self, task_id: str, *, owner_user_id: str | SlackActor) -> dict[str, Any]:
+        task = self._require_task(task_id, owner_user_id)
+        try:
+            result = await self._client_for(task).reload()
+        except PolytokenClientError as exc:
+            raise TaskSpawnError(safe_error(exc, "daemon configuration reload failed")) from exc
+        await self._refresh_task_header(task)
+        return result
+
     async def set_model(self, task_id: str, model: str, *, owner_user_id: str | SlackActor, reasoning_effort: str | None = None) -> None:
         task = self._require_task(task_id, owner_user_id)
         try:
