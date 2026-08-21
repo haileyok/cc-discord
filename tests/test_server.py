@@ -274,3 +274,98 @@ async def test_serve_orders_reconcile_before_slack_and_cleans_up(monkeypatch: py
     assert order.index("slack-start") < order.index("flush") < order.index("consumers")
     assert order[-1] == "db-close"
     assert "sweep" in order
+    # bind_bot must be called again after slack-start: bot.bot_user_id/bot_id
+    # are only populated by bot.start()'s auth.test call, so a bind_bot()
+    # captured before start() only ever sees None for both. Without this
+    # second bind, task_registry._bridge_user_id (used by
+    # _strip_verified_mention for every mention-stripping call in the
+    # process's lifetime) is permanently None.
+    bind_indices = [i for i, entry in enumerate(order) if entry == "bind"]
+    assert len(bind_indices) == 2
+    assert bind_indices[0] < order.index("slack-start") < bind_indices[1]
+
+
+@pytest.mark.asyncio
+async def test_serve_rebinds_bot_after_start_so_identity_is_populated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct regression for the live bug: the registry's bridge identity
+    (mirroring TaskRegistry._bridge_user_id) must reflect the bot's real
+    identity once known, not the pre-auth.test None captured by the first
+    bind_bot() call. A bind_bot() captured too early made
+    _strip_verified_mention silently no-op on every message forever, so any
+    reply that included the required bot mention (e.g. "yes @Hailey's Robot")
+    fed the raw, unstripped mention token into interrogative-answer parsing
+    and was misread."""
+    stop = asyncio.Event()
+    conn = object()
+    bind_calls: list[str | None] = []
+
+    class Registry:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._bridge_user_id: str | None = None
+
+        def bind_bot(self, bot: Any) -> None:
+            # Mirrors the real TaskRegistry.bind_bot's merge logic exactly.
+            self._bridge_user_id = getattr(bot, "bot_user_id", None) or self._bridge_user_id
+            bind_calls.append(self._bridge_user_id)
+
+        async def load_from_db(self, **kwargs: Any) -> None:
+            return None
+
+        async def flush_startup_notices(self) -> None:
+            return None
+
+        async def start_event_consumers(self) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    class Bot(LocalBot):
+        def __init__(self, token: str, **kwargs: Any) -> None:
+            super().__init__()
+            # Not known until start()'s auth.test call, exactly like the real Bot.
+            self.bot_user_id = None
+
+        async def start(self) -> None:
+            self.bot_user_id = "UBRIDGE"
+            stop.set()
+
+        async def close(self) -> None:
+            stop.set()
+
+    class Runner:
+        async def setup(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            return None
+
+    class Site:
+        async def start(self) -> None:
+            return None
+
+    class Secrets:
+        bot_token = "xoxb-test"
+        app_token = "xapp-test"
+        team_id = "T1"
+        home_channel_id = "GHOME"
+        owner_user_id = "UOWNER"
+
+    async def open_db() -> Any:
+        return conn
+
+    async def close_db(value: Any) -> None:
+        return None
+
+    monkeypatch.setattr(server_module.state, "open_db", open_db)
+    monkeypatch.setattr(server_module.state, "close_db", close_db)
+    monkeypatch.setattr(server_module, "TaskRegistry", Registry)
+    monkeypatch.setattr(server_module.web, "AppRunner", lambda app: Runner())
+    monkeypatch.setattr(server_module.web, "TCPSite", lambda runner, host, port: Site())
+    monkeypatch.setattr(server_module.tasks_module, "sweep_old_attachments", lambda: None)
+
+    await server_module.serve(Secrets(), bot_factory=Bot, stop_event=stop)
+
+    # First call (before start()): bot_user_id not yet known -> None. Second
+    # call (after start()): the real id must have propagated.
+    assert bind_calls == [None, "UBRIDGE"]

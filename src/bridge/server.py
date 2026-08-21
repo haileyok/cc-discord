@@ -224,6 +224,13 @@ async def serve(
         await bot.start()
         while not bool(getattr(bot, "is_ready", False)):
             await asyncio.sleep(0.05)
+        # bot.bot_user_id / bot.bot_id are only populated by bot.start()'s
+        # auth.test call, which runs after the bind_bot() above. Without this
+        # second call, task_registry._bridge_user_id stays None for the
+        # process's entire lifetime, and every mention-stripping helper
+        # (_strip_verified_mention) silently no-ops on every message forever
+        # -- not just at startup. bind_bot() is idempotent/safe to call again.
+        task_registry.bind_bot(bot)
         reconcile_promotions = getattr(task_registry, "reconcile_promotion_journals", None)
         if callable(reconcile_promotions):
             result = reconcile_promotions()
