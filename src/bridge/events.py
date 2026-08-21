@@ -153,6 +153,18 @@ class TitleChange(Action):
 
 
 @dataclass(frozen=True)
+class CompactionUpdate(Action):
+    stage: str
+    reason: str | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextCleared(Action):
+    pass
+
+
+@dataclass(frozen=True)
 class StatusNote(Action):
     """A small informational note (model/facet switch, compaction, etc.)."""
 
@@ -342,6 +354,34 @@ class Translator:
         # Provider/model payloads may contain URLs, prompts, credentials, or
         # filesystem paths. Never forward the raw daemon error to Slack.
         return [ModelError(error=safe_error(None, "The daemon reported a model error"))]
+
+    @staticmethod
+    def _compaction_reason(e: dict[str, Any]) -> str | None:
+        reason = e.get("reason")
+        if isinstance(reason, dict):
+            reason = reason.get("type") or reason.get("kind")
+        return str(reason).strip()[:80] if reason else None
+
+    def _on_compaction_started(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("started", self._compaction_reason(e))]
+
+    def _on_compaction_retry(self, e: dict[str, Any]) -> list[Action]:
+        attempt = e.get("attempt")
+        maximum = e.get("max_attempts") or e.get("total_attempts")
+        detail = f"attempt {attempt}/{maximum}" if attempt and maximum else "retrying"
+        return [CompactionUpdate("retry", self._compaction_reason(e), detail)]
+
+    def _on_compaction_complete(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("complete", self._compaction_reason(e))]
+
+    def _on_compaction_failed(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("failed", self._compaction_reason(e))]
+
+    def _on_compaction_cancelled(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("cancelled", self._compaction_reason(e))]
+
+    def _on_context_cleared(self, e: dict[str, Any]) -> list[Action]:
+        return [ContextCleared()]
 
     # -- tools ------------------------------------------------------------
 

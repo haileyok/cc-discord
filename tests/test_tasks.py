@@ -43,6 +43,7 @@ class FakeClient:
     facet_calls: list[str] = field(default_factory=list)
     reload_calls: int = 0
     compact_calls: int = 0
+    clear_calls: int = 0
     terminated: int = 0
     cancelled: int = 0
     terminate_error_status: int | None = None
@@ -75,6 +76,10 @@ class FakeClient:
     async def compact(self):
         self.compact_calls += 1
         return {"status": "compacted"}
+
+    async def clear(self):
+        self.clear_calls += 1
+        return {"status": "cleared"}
 
     async def cancel_turn(self):
         self.cancelled += 1
@@ -1000,6 +1005,32 @@ class TestAC7LifecycleAndConfig:
         await reg.set_facet(task.task_id, "plan", owner_user_id="UOWNER")
         await reg.close_task(task.task_id, "UOWNER")
         assert bot.archives == ["GPRIVATE"]
+
+    async def test_compaction_lifecycle_is_visible_and_labels_automatic_runs(self, in_memory_db):
+        rich_bot = RichFakeBot()
+        reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+        task, _ = await _task(reg, root="1000.compaction-events")
+        await reg._render(task, events.CompactionUpdate("started", "threshold"))
+        await reg._render(task, events.CompactionUpdate("retry", "threshold", "attempt 2/3"))
+        await reg._render(task, events.CompactionUpdate("complete", "threshold"))
+        chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call.get("chunks")]
+        updates = [chunk for chunk in chunks if chunk.get("id") == "compaction"]
+        assert [chunk["title"] for chunk in updates] == [
+            "Automatic compaction started", "Automatic compaction retrying", "Automatic compaction completed",
+        ]
+        assert updates[1]["details"] == "attempt 2/3"
+        assert task.progress_started is False
+
+    async def test_clear_context_rejects_active_turn_and_clears_idle_context(self, in_memory_db):
+        reg, _ = _registry(in_memory_db)
+        task, client = await _task(reg, root="1000.clear")
+        client.state_payload["turn_in_flight"] = True
+        with pytest.raises(TaskSpawnError, match="active"):
+            await reg.clear_context(task.task_id, owner_user_id="UOWNER")
+        assert client.clear_calls == 0
+        client.state_payload["turn_in_flight"] = False
+        await reg.clear_context(task.task_id, owner_user_id="UOWNER")
+        assert client.clear_calls == 1
 
     async def test_compaction_runs_immediately_when_idle_and_queues_during_turn(self, in_memory_db):
         reg, bot = _registry(in_memory_db)

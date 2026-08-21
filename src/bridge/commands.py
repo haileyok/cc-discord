@@ -284,11 +284,20 @@ def build_task_root_blocks(task_id: str, *, mode: str = "personal") -> list[dict
         }
         if style:
             item["style"] = style
+        if action_id == "task.clear":
+            item["confirm"] = {
+                "title": {"type": "plain_text", "text": "Clear context?"},
+                "text": {"type": "mrkdwn", "text": "This removes the current model context while retaining durable session history. This cannot be undone from Slack."},
+                "confirm": {"type": "plain_text", "text": "Clear context"},
+                "deny": {"type": "plain_text", "text": "Cancel"},
+                "style": "danger",
+            }
         return item
 
     return [
         {"type": "actions", "block_id": f"task-controls-{value}", "elements": [button(*item) for item in first]},
         {"type": "actions", "block_id": f"task-controls-more-{value}", "elements": [button(*item) for item in second]},
+        {"type": "actions", "block_id": f"task-controls-context-{value}", "elements": [button("task.clear", "Clear context", "danger")]},
     ]
 
 
@@ -574,6 +583,9 @@ class CommandDispatcher:
             if outcome == "queued":
                 return await self._reply(payload, "🕒 Compaction queued; it will run when the active turn finishes.")
             return await self._reply(payload, "🧹 Compaction completed.")
+        if operation == "clear":
+            await self.registry.clear_context(task.task_id, owner_user_id=actor)
+            return await self._reply(payload, "🗑️ Context cleared. Durable session history remains on disk.")
         if operation == "stats":
             state = await self.registry.get_state(task.task_id, actor)
             return await self._reply(payload, usage.format_state_summary(state or {}))

@@ -91,6 +91,8 @@ Slack limitations are intentional:
 - Slack blocks and messages have provider limits, so long output is chunked and rich rendering may degrade to fallback text.
 - Slack file uploads/downloads are bounded and limited to the adapter's supported file APIs. An attachment that cannot be authenticated or exceeds the configured cap is skipped/reported rather than handed to the daemon.
 - Questions consume the next plain-text reply in that task thread. A reply with files/voice is treated as a new prompt and the question remains pending.
+- Manual and threshold-triggered automatic compactions are shown in the live activity surface with start, retry, completion, cancellation, and failure status. Compact requests made during an active turn are queued until it ends.
+- *Clear context* is an owner-only destructive task control with Slack confirmation. It is rejected while a turn is active and clears model context without deleting durable session history.
 - Permission interrogatives are suppressed because Polytoken runs in bypass mode. Only user-facing clarification, confirmation, and choice questions are surfaced.
 
 ## Configuration

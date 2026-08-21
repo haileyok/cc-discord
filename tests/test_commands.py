@@ -110,6 +110,9 @@ class LocalRegistry:
     async def set_effort(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("set_effort", args, kwargs))
 
+    async def clear_context(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(("clear_context", args, kwargs))
+
     async def request_compaction(self, *args: Any, **kwargs: Any) -> str:
         self.calls.append(("request_compaction", args, kwargs))
         return "queued"
@@ -240,8 +243,10 @@ def test_working_directory_resolution_accepts_quotes_case_and_aliases(tmp_path: 
 def test_task_root_blocks_have_controls_and_task_value() -> None:
     blocks = build_task_root_blocks("T123", mode="personal")
     actions = [element for block in blocks for element in block["elements"]]
-    assert {item["action_id"] for item in actions} >= {"task.compact", "task.todos", "task.stats", "task.stop", "task.kill", "task.participants", "task.promote"}
+    assert {item["action_id"] for item in actions} >= {"task.compact", "task.clear", "task.todos", "task.stats", "task.stop", "task.kill", "task.participants", "task.promote"}
     assert all(item["value"] == "T123" for item in actions)
+    clear = next(item for item in actions if item["action_id"] == "task.clear")
+    assert clear["style"] == "danger" and clear["confirm"]["style"] == "danger"
 
 
 @pytest.mark.asyncio
@@ -263,6 +268,9 @@ async def test_shortcut_modal_submission_and_block_action_routing() -> None:
     compact = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.compact", "value": "task-12345678"}]})
     assert "queued" in compact.text.lower()
     assert any(name == "request_compaction" for name, _, _ in registry.calls)
+    cleared = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.clear", "value": "task-12345678"}]})
+    assert "Context cleared" in cleared.text
+    assert any(name == "clear_context" for name, _, _ in registry.calls)
 
 
 @pytest.mark.asyncio

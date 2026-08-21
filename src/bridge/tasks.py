@@ -46,7 +46,9 @@ from bridge.events import (
     AssistantThinking,
     AttentionPing,
     Clarification,
+    CompactionUpdate,
     Confirmation,
+    ContextCleared,
     ImageResolved,
     ModelError,
     Reconcile,
@@ -277,6 +279,7 @@ class Task:
     progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
     progress_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     compaction_pending: bool = False
+    compaction_standalone: bool = False
     compaction_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
@@ -1032,6 +1035,28 @@ class TaskRegistry:
                 await self._end_turn(task, outcome="error")
                 await self._post(task, "⚠ Model error: the daemon could not complete this request.")
                 await self._run_pending_compaction(task)
+            elif isinstance(action, CompactionUpdate):
+                reason = (action.reason or "").lower()
+                automatic = any(word in reason for word in ("auto", "threshold", "context"))
+                label = "Automatic compaction" if automatic else "Compaction"
+                if action.stage == "started":
+                    task.compaction_standalone = not task.progress_started
+                    if task.compaction_standalone:
+                        await self._begin_turn(task)
+                    await self._progress_task_update(task, f"{label} started", task_id="compaction", status="in_progress")
+                elif action.stage == "retry":
+                    await self._progress_task_update(task, f"{label} retrying", task_id="compaction", status="in_progress", details=action.detail)
+                else:
+                    status = "complete" if action.stage == "complete" else "failed"
+                    verb = {"complete": "completed", "failed": "failed", "cancelled": "cancelled"}.get(action.stage, action.stage)
+                    await self._progress_task_update(task, f"{label} {verb}", task_id="compaction", status=status)
+                    await self._refresh_task_header(task)
+                    if task.compaction_standalone:
+                        task.compaction_standalone = False
+                        await self._end_turn(task, outcome="complete" if action.stage == "complete" else "error")
+            elif isinstance(action, ContextCleared):
+                await self._post(task, "🗑️ Session context cleared. Durable session history remains on disk.")
+                await self._refresh_task_header(task)
             elif isinstance(action, TitleChange):
                 snapshot = await self._state_snapshot(task)
                 if action.title.strip():
@@ -2279,6 +2304,17 @@ class TaskRegistry:
             await self._client_for(task).set_model(model, reasoning_effort=level)
         except PolytokenClientError as exc:
             raise TaskSpawnError(safe_error(exc, "daemon rejected effort change")) from exc
+
+    async def clear_context(self, task_id: str, *, owner_user_id: str | SlackActor) -> None:
+        task = self._require_task(task_id, owner_user_id)
+        state = await self._state_snapshot(task)
+        if task.progress_started or bool(state.get("turn_in_flight")):
+            raise TaskSpawnError("cannot clear context while an agent turn is active")
+        try:
+            await self._client_for(task).clear()
+        except PolytokenClientError as exc:
+            raise TaskSpawnError(safe_error(exc, "daemon rejected context clear")) from exc
+        await self._refresh_task_header(task)
 
     async def request_compaction(self, task_id: str, *, owner_user_id: str | SlackActor) -> str:
         """Compact now when idle, or queue exactly once for the active turn's end."""

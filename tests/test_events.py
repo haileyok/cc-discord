@@ -8,7 +8,9 @@ from bridge.events import (
     AssistantThinking,
     AttentionPing,
     Clarification,
+    CompactionUpdate,
     Confirmation,
+    ContextCleared,
     ModelError,
     Reconcile,
     StateRefresh,
@@ -75,6 +77,14 @@ class TestStreaming:
     def test_model_error(self) -> None:
         f = _Feed()
         assert _types(f.send({"type": "model_error", "prompt_id": "p", "error": "boom"})) == [ModelError]
+
+    def test_compaction_lifecycle_and_context_clear(self) -> None:
+        f = _Feed()
+        assert f.send({"type": "compaction_started", "reason": "threshold"}) == [CompactionUpdate("started", "threshold")]
+        assert f.send({"type": "compaction_retry", "reason": "threshold", "attempt": 2, "max_attempts": 3}) == [CompactionUpdate("retry", "threshold", "attempt 2/3")]
+        assert f.send({"type": "compaction_complete", "reason": "threshold"}) == [CompactionUpdate("complete", "threshold")]
+        assert f.send({"type": "compaction_failed", "error": "secret upstream body"}) == [CompactionUpdate("failed")]
+        assert f.send({"type": "context_cleared"}) == [ContextCleared()]
 
 
 class TestTools:
