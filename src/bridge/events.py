@@ -157,6 +157,7 @@ class CompactionUpdate(Action):
     stage: str
     reason: str | None = None
     detail: str | None = None
+    compaction_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +290,10 @@ class Translator:
     # -- entry point ------------------------------------------------------
 
     def handle(self, env: SseEnvelope) -> list[Action]:
+        # Reconnects may replay the boundary event. Never dispatch duplicates or
+        # out-of-order envelopes twice; lifecycle actions are not all idempotent.
+        if env.seq is not None and self.last_seq is not None and env.seq <= self.last_seq:
+            return []
         actions = self._check_seq(env)
         try:
             actions.extend(self._dispatch(env.event))
@@ -362,23 +367,28 @@ class Translator:
             reason = reason.get("type") or reason.get("kind")
         return str(reason).strip()[:80] if reason else None
 
+    @staticmethod
+    def _compaction_id(e: dict[str, Any]) -> str | None:
+        value = e.get("compaction_id")
+        return value if isinstance(value, str) and value else None
+
     def _on_compaction_started(self, e: dict[str, Any]) -> list[Action]:
-        return [CompactionUpdate("started", self._compaction_reason(e))]
+        return [CompactionUpdate("started", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
 
     def _on_compaction_retry(self, e: dict[str, Any]) -> list[Action]:
         attempt = e.get("attempt")
         maximum = e.get("max_attempts") or e.get("total_attempts")
         detail = f"attempt {attempt}/{maximum}" if attempt and maximum else "retrying"
-        return [CompactionUpdate("retry", self._compaction_reason(e), detail)]
+        return [CompactionUpdate("retry", self._compaction_reason(e), detail, self._compaction_id(e))]
 
     def _on_compaction_complete(self, e: dict[str, Any]) -> list[Action]:
-        return [CompactionUpdate("complete", self._compaction_reason(e))]
+        return [CompactionUpdate("complete", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
 
     def _on_compaction_failed(self, e: dict[str, Any]) -> list[Action]:
-        return [CompactionUpdate("failed", self._compaction_reason(e))]
+        return [CompactionUpdate("failed", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
 
     def _on_compaction_cancelled(self, e: dict[str, Any]) -> list[Action]:
-        return [CompactionUpdate("cancelled", self._compaction_reason(e))]
+        return [CompactionUpdate("cancelled", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
 
     def _on_context_cleared(self, e: dict[str, Any]) -> list[Action]:
         return [ContextCleared()]

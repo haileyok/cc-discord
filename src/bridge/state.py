@@ -66,6 +66,8 @@ class RuntimeRow:
     channel_owned: bool = False
     mention_required: bool = False
     control_message_ts: str | None = None
+    compaction_pending: bool = False
+    compaction_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +148,8 @@ _NORMALIZED_SCHEMA = (
         channel_owned INTEGER NOT NULL DEFAULT 0 CHECK(channel_owned IN (0, 1)),
         mention_required INTEGER NOT NULL DEFAULT 0 CHECK(mention_required IN (0, 1)),
         control_message_ts TEXT,
+        compaction_pending INTEGER NOT NULL DEFAULT 0 CHECK(compaction_pending IN (0, 1)),
+        compaction_id TEXT,
         updated_at INTEGER NOT NULL,
         UNIQUE(team_id, channel_id, root_id)
     )
@@ -355,6 +359,10 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE task_runtime ADD COLUMN mention_required INTEGER NOT NULL DEFAULT 0 CHECK(mention_required IN (0, 1))")
     if "control_message_ts" not in runtime_columns:
         await conn.execute("ALTER TABLE task_runtime ADD COLUMN control_message_ts TEXT")
+    if "compaction_pending" not in runtime_columns:
+        await conn.execute("ALTER TABLE task_runtime ADD COLUMN compaction_pending INTEGER NOT NULL DEFAULT 0")
+    if "compaction_id" not in runtime_columns:
+        await conn.execute("ALTER TABLE task_runtime ADD COLUMN compaction_id TEXT")
     await conn.commit()
 
 
@@ -457,8 +465,8 @@ async def upsert_runtime(
                owner_id, owner_kind, mode, created_at, last_activity,
                app_exchange_budget, app_exchanges, owner_alerted, promotion_state,
                binding_id, cleanup_pending, channel_owned, mention_required,
-               control_message_ts, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               control_message_ts, compaction_pending, compaction_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
               team_id=excluded.team_id, channel_id=excluded.channel_id, root_id=excluded.root_id,
               session_id=excluded.session_id, port=excluded.port, status=excluded.status,
@@ -468,7 +476,9 @@ async def upsert_runtime(
               owner_alerted=excluded.owner_alerted, promotion_state=excluded.promotion_state,
               binding_id=excluded.binding_id, cleanup_pending=excluded.cleanup_pending,
               channel_owned=excluded.channel_owned, mention_required=excluded.mention_required,
-              control_message_ts=excluded.control_message_ts, updated_at=excluded.updated_at
+              control_message_ts=excluded.control_message_ts,
+              compaction_pending=excluded.compaction_pending, compaction_id=excluded.compaction_id,
+              updated_at=excluded.updated_at
             """,
             (runtime.task_id, runtime.key.team_id, runtime.key.channel_id, runtime.key.root_id,
              runtime.session_id, runtime.port, runtime.status, runtime.cwd,
@@ -476,7 +486,8 @@ async def upsert_runtime(
              runtime.created_at, runtime.last_activity, runtime.app_exchange_budget,
              runtime.app_exchanges, int(runtime.owner_alerted), runtime.promotion_state,
              runtime.binding_id, int(runtime.cleanup_pending), int(runtime.channel_owned),
-             int(runtime.mention_required), runtime.control_message_ts, stamp),
+             int(runtime.mention_required), runtime.control_message_ts,
+             int(runtime.compaction_pending), runtime.compaction_id, stamp),
         )
         for participant in participants or []:
             await _participant_sql(conn, runtime.key, participant, stamp)
@@ -498,14 +509,15 @@ def _runtime_from_row(row: tuple[Any, ...]) -> RuntimeRow:
         app_exchange_budget=int(row[13]), app_exchanges=int(row[14]),
         owner_alerted=bool(row[15]), promotion_state=str(row[16]), binding_id=row[17],
         cleanup_pending=bool(row[18]), channel_owned=bool(row[19]), mention_required=bool(row[20]),
-        control_message_ts=row[21],
+        control_message_ts=row[21], compaction_pending=bool(row[22]), compaction_id=row[23],
     )
 
 
 _RUNTIME_SELECT = """SELECT task_id, team_id, channel_id, root_id, session_id, port,
  status, cwd, owner_id, owner_kind, mode, created_at, last_activity,
  app_exchange_budget, app_exchanges, owner_alerted, promotion_state, binding_id,
- cleanup_pending, channel_owned, mention_required, control_message_ts FROM task_runtime"""
+ cleanup_pending, channel_owned, mention_required, control_message_ts,
+ compaction_pending, compaction_id FROM task_runtime"""
 
 
 async def get_runtime(conn: aiosqlite.Connection, task_id: str) -> RuntimeRow | None:
@@ -534,14 +546,14 @@ async def update_runtime(
 ) -> RuntimeRow | None:
     allowed = {"session_id", "port", "status", "cwd", "app_exchanges", "owner_alerted",
                 "promotion_state", "binding_id", "cleanup_pending", "channel_owned", "mention_required", "last_activity",
-                "app_exchange_budget", "control_message_ts"}
+                "app_exchange_budget", "control_message_ts", "compaction_pending", "compaction_id"}
     unknown = set(changes) - allowed
     if unknown:
         raise ValueError(f"unknown runtime fields: {sorted(unknown)}")
     if not changes:
         return await get_runtime(conn, task_id)
     fields = list(changes)
-    values = [int(value) if field in {"owner_alerted", "cleanup_pending", "channel_owned", "mention_required"} else value
+    values = [int(value) if field in {"owner_alerted", "cleanup_pending", "channel_owned", "mention_required", "compaction_pending"} else value
               for field, value in changes.items()]
     fields.append("updated_at")
     values.append(_now(now))
@@ -580,6 +592,7 @@ async def restore_runtime_binding(
         binding_id=binding_id, cleanup_pending=runtime.cleanup_pending,
         channel_owned=False, mention_required=runtime.mention_required,
         control_message_ts=runtime.control_message_ts,
+        compaction_pending=runtime.compaction_pending, compaction_id=runtime.compaction_id,
     )
     await replace_runtime_binding(conn, old_key, restored, participants, now=now)
     return restored
@@ -617,12 +630,13 @@ async def replace_runtime_binding(
         for participant in participants:
             await _participant_sql(conn, runtime.key, participant, stamp)
         await conn.execute(
-            "UPDATE task_runtime SET team_id=?, channel_id=?, root_id=?, status=?, cwd=?, session_id=?, port=?, owner_id=?, owner_kind=?, mode=?, last_activity=?, app_exchange_budget=?, app_exchanges=?, owner_alerted=?, promotion_state=?, binding_id=?, cleanup_pending=?, channel_owned=?, mention_required=?, control_message_ts=?, updated_at=? WHERE task_id=?",
+            "UPDATE task_runtime SET team_id=?, channel_id=?, root_id=?, status=?, cwd=?, session_id=?, port=?, owner_id=?, owner_kind=?, mode=?, last_activity=?, app_exchange_budget=?, app_exchanges=?, owner_alerted=?, promotion_state=?, binding_id=?, cleanup_pending=?, channel_owned=?, mention_required=?, control_message_ts=?, compaction_pending=?, compaction_id=?, updated_at=? WHERE task_id=?",
             (runtime.key.team_id, runtime.key.channel_id, runtime.key.root_id, runtime.status,
              runtime.cwd, runtime.session_id, runtime.port, runtime.owner.actor_id, runtime.owner.kind.value,
              runtime.owner.mode, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges,
              int(runtime.owner_alerted), runtime.promotion_state, runtime.binding_id, int(runtime.cleanup_pending), int(runtime.channel_owned),
-             int(runtime.mention_required), runtime.control_message_ts, stamp, runtime.task_id),
+             int(runtime.mention_required), runtime.control_message_ts,
+             int(runtime.compaction_pending), runtime.compaction_id, stamp, runtime.task_id),
         )
         await conn.commit()
     except BaseException:

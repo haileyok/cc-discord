@@ -139,6 +139,27 @@ async def test_socket_bot_callback_passes_normalized_human_and_bot_messages_to_r
 
 
 @pytest.mark.asyncio
+async def test_socket_dispatcher_routes_native_agent_stop_to_task_registry() -> None:
+    class Registry:
+        def __init__(self) -> None:
+            self.stops: list[dict[str, Any]] = []
+
+        async def handle_agent_session_stopped(self, payload: dict[str, Any]) -> bool:
+            self.stops.append(payload)
+            return True
+
+    class Dispatcher:
+        async def dispatch(self, payload: Any) -> None:
+            raise AssertionError("native stop reached command dispatcher")
+
+    registry = Registry()
+    dispatch = make_socket_dispatcher(Dispatcher(), registry)
+    payload = {"kind": "agent_session_stopped", "team_id": "T1", "channel_id": "C1", "root_ts": "1.0", "actor_id": "UOWNER"}
+    assert await dispatch(payload) is True
+    assert registry.stops == [payload]
+
+
+@pytest.mark.asyncio
 async def test_socket_dispatcher_logs_and_contains_malformed_registry_mapping(caplog: pytest.LogCaptureFixture) -> None:
     class StrictRegistry:
         async def maybe_route_message(self, payload: Any) -> bool:

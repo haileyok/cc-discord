@@ -121,6 +121,9 @@ class LocalRegistry:
         self.calls.append(("reload_daemon", args, kwargs))
         return {"reloaded": ["models"], "failed": []}
 
+    async def set_title(self, *args: Any, **kwargs: Any) -> None:
+        self.calls.append(("set_title", args, kwargs))
+
     async def set_model(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("set_model", args, kwargs))
 
@@ -219,7 +222,7 @@ async def test_agent_commands_cover_model_facet_effort_title_stats_todos_and_pin
         assert not response.text.startswith("❌"), (text, response.text)
     names = [name for name, _, _ in registry.calls]
     assert "reload_daemon" in names
-    assert "set_model" in names and "set_facet" in names and "set_effort" in names
+    assert "set_model" in names and "set_facet" in names and "set_effort" in names and "set_title" in names
     assert any(edit["channel_id"] == "GHOME" and edit["message_ts"] == "100.1" and edit["text"] == "New title" for edit in bot.edits)
 
 
@@ -268,6 +271,8 @@ async def test_shortcut_modal_submission_and_block_action_routing() -> None:
     compact = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.compact", "value": "task-12345678"}]})
     assert "queued" in compact.text.lower()
     assert any(name == "request_compaction" for name, _, _ in registry.calls)
+    feedback = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.feedback", "value": '{"task_id":"task-12345678","rating":"positive"}'}]})
+    assert "thanks for the feedback" in feedback.text.lower()
     cleared = await dispatcher.dispatch({"type": "block_actions", "team_id": "T1", "user_id": "UOWNER", "channel_id": "GHOME", "thread_ts": "100.1", "actions": [{"action_id": "task.clear", "value": "task-12345678"}]})
     assert "Context cleared" in cleared.text
     assert any(name == "clear_context" for name, _, _ in registry.calls)

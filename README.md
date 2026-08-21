@@ -10,7 +10,8 @@
 - Mentioning the bot as the configured owner automatically starts an ad-hoc task when that thread has no task yet. It imports the thread for context and runs from `BRIDGE_AD_HOC_CWD` (default `/home/hailey/bluesky`), so requests such as thread analysis or an Attie deployment do not need a separate start step.
 - Each task runs `polytoken new --no-attach` in a project directory. Prompts go to the daemon's loopback `POST /prompt`; assistant/tool activity comes from its resumable `GET /events` SSE stream.
 - Replies in a task's root message thread become prompts. Structured questions are rendered to Slack; the next plain-text reply answers the pending question.
-- Text, thinking, tool summaries, subagent activity, todo state, reactions, and attachments are translated to Slack messages/blocks/files.
+- Text, quiet progress, five recent tool summaries, subagent activity, todo state, and attachments are translated into native Slack streams, blocks, and files. Final answers include unobtrusive feedback controls.
+- Where the workspace exposes Slack Agent Sessions, sessions are named from the Polytoken title and use native `processing`, `suspended` (waiting for an answer), `active`, and `closed` states. Slack's native Stop cancels only the current turn and keeps the session ready; these enhancements remain best-effort until Agent View is deliberately enabled.
 - Incoming private files are downloaded with the bot token, bounded, stored under the bridge state directory, and passed as `@<absolute-path>` references. Agent files use `[[attach: /absolute/path]]` markers.
 - Personal tasks are owner-only. Collaborative tasks invite explicit Slack participants and enforce a bounded app-to-app exchange budget (default **20** messages; set `BRIDGE_APP_EXCHANGE_BUDGET` to change it). When the cap is reached the task pauses and alerts its owner.
 
@@ -26,10 +27,12 @@
 1. Create a Slack app from `slack-app-manifest.yaml` (or add the equivalent settings in the Slack app dashboard).
 2. Enable **Socket Mode** and create an app-level token with the `connections:write` scope. Keep the resulting `xapp-...` token private.
 3. Install/reinstall the app in the workspace. Copy the bot token (`xoxb-...`) and app token (`xapp-...`). Do not create or use a user token for this bridge.
-4. Enable the manifest's `/agent`, global shortcut, interactivity, `message.channels`, `message.groups`, `app_mention`, and reaction subscriptions.
+4. Enable the manifest's `/agent`, shortcuts, interactivity, `message.channels`, `message.groups`, `app_mention`, and `agent_session_stopped` subscriptions. Grant `assistant:write` for native agent-session lifecycle and naming.
 5. Invite the bot to a public or private home channel. Record the workspace team ID, home channel ID, and the trusted owner's user ID.
 
 The manifest enables public-channel history for an observable home channel and private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) for private homes and promoted collaboration channels. Review scopes against your workspace policy before installing.
+
+Slack's irreversible `features.agent_view` migration is intentionally **not enabled** yet. The bridge uses native agent streaming, status, naming, Stop, and feedback APIs while retaining channel threads as the canonical personal and collaborative task surface.
 
 ## Install and configure
 

@@ -485,7 +485,7 @@ class CommandDispatcher:
             outcome = await self.registry.request_compaction(task.task_id, owner_user_id=actor)
             if outcome == "queued":
                 return await self._reply(payload, f"🕒 Compaction queued for `{task.task_id[:8]}`; it will run when the active turn finishes.")
-            return await self._reply(payload, f"🧹 Compaction completed for `{task.task_id[:8]}`.")
+            return await self._reply(payload, f"🧹 Compaction accepted for `{task.task_id[:8]}`; completion will appear in the activity stream.")
         if name == "reload":
             result = await self.registry.reload_daemon(task.task_id, owner_user_id=actor)
             failed = result.get("failed") if isinstance(result, Mapping) else None
@@ -527,7 +527,11 @@ class CommandDispatcher:
             title = " ".join((title or "").split())[:100]
             if not title:
                 return await self._error(payload, "No title is available; pass `name=<title>`." )
-            await self.bot.edit_message(task.channel_id, task.root_ts, text=title)
+            await self.registry.set_title(task.task_id, title, owner_user_id=actor)
+            # Preserve the existing visible root title where the root is
+            # bot-authored; the registry synchronizes Polytoken + Agent session.
+            if not bool(getattr(task, "mention_required", False)):
+                await self.bot.edit_message(task.channel_id, task.root_ts, text=title)
             return await self._reply(payload, f"✏️ Renamed task to `{title}`.")
         if name in {"stats", "todos", "tasks"}:
             state = await self.registry.get_state(task.task_id, actor)
@@ -575,6 +579,12 @@ class CommandDispatcher:
             return await self._answer_from_interaction(payload, action, actor)
         task = await self._task_from_payload(payload, actor, task_id=task_id or None, require_owner=True)
         operation = action_id.rsplit(".", 1)[-1].rsplit(":", 1)[-1].lower()
+        if operation == "feedback":
+            rating = str(value.get("rating") or "").lower()
+            if rating not in {"positive", "negative"}:
+                return await self._error(payload, "That feedback action is invalid.")
+            log.info("Slack agent response feedback task=%s rating=%s", task.task_id[:8], rating)
+            return await self._reply(payload, "Thanks for the feedback.")
         if operation in {"stop", "kill"}:
             ok = await (self.registry.stop_task(task.task_id, actor) if operation == "stop" else self.registry.kill_task(task.task_id, actor))
             return await self._reply(payload, f"{'✅ Stopped' if operation == 'stop' and ok else '💥 Killed' if operation == 'kill' and ok else '⚠️ Termination rejected'} `{task.task_id[:8]}`.")
@@ -582,7 +592,7 @@ class CommandDispatcher:
             outcome = await self.registry.request_compaction(task.task_id, owner_user_id=actor)
             if outcome == "queued":
                 return await self._reply(payload, "🕒 Compaction queued; it will run when the active turn finishes.")
-            return await self._reply(payload, "🧹 Compaction completed.")
+            return await self._reply(payload, "🧹 Compaction accepted; completion will appear in the activity stream.")
         if operation == "clear":
             await self.registry.clear_context(task.task_id, owner_user_id=actor)
             return await self._reply(payload, "🗑️ Context cleared. Durable session history remains on disk.")

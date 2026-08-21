@@ -41,6 +41,7 @@ class FakeClient:
     interrogative_responses: list[dict[str, Any]] = field(default_factory=list)
     model_calls: list[dict[str, Any]] = field(default_factory=list)
     facet_calls: list[str] = field(default_factory=list)
+    title_calls: list[str] = field(default_factory=list)
     reload_calls: int = 0
     compact_calls: int = 0
     clear_calls: int = 0
@@ -48,6 +49,7 @@ class FakeClient:
     cancelled: int = 0
     terminate_error_status: int | None = None
     closed: bool = False
+    state_sequence: list[dict[str, Any]] = field(default_factory=list)
     state_payload: dict[str, Any] = field(default_factory=lambda: {
         "active_model": "anthropic/claude-opus-4-8",
         "session_title": "fake-title",
@@ -61,6 +63,8 @@ class FakeClient:
         self.interrogative_responses.append({"id": interrogative_id, "response": response})
 
     async def state(self):
+        if self.state_sequence:
+            return dict(self.state_sequence.pop(0))
         return dict(self.state_payload)
 
     async def set_model(self, model: str, *, reasoning_effort=None):
@@ -69,13 +73,17 @@ class FakeClient:
     async def set_facet(self, facet: str):
         self.facet_calls.append(facet)
 
+    async def set_title(self, title: str):
+        self.title_calls.append(title)
+        self.state_payload["session_title"] = title
+
     async def reload(self):
         self.reload_calls += 1
         return {"reloaded": ["models"], "failed": []}
 
     async def compact(self):
         self.compact_calls += 1
-        return {"status": "compacted"}
+        return f"compact-{self.compact_calls}"
 
     async def clear(self):
         self.clear_calls += 1
@@ -200,6 +208,7 @@ class RichFakeBot(FakeBot):
         self.stream_appends: list[dict[str, Any]] = []
         self.stream_stops: list[dict[str, Any]] = []
         self.statuses: list[dict[str, str]] = []
+        self.renames: list[dict[str, str]] = []
 
     async def start_stream(self, channel_id, thread_ts, *, recipient_user_id, recipient_team_id,
                            chunks=None, task_display_mode=None, markdown_text=None):
@@ -223,6 +232,10 @@ class RichFakeBot(FakeBot):
 
     async def set_agent_status(self, channel_id, thread_ts, status):
         self.statuses.append({"channel_id": channel_id, "thread_ts": thread_ts, "status": status})
+        return True
+
+    async def rename_agent_session(self, channel_id, thread_ts, title):
+        self.renames.append({"channel_id": channel_id, "thread_ts": thread_ts, "title": title})
         return True
 
 
@@ -669,7 +682,10 @@ async def test_long_fallback_answer_uses_small_update_and_threaded_continuations
     await reg._render(task, events.TurnComplete("prompt-long"))
 
     final_edit = [edit for edit in bot.edits if edit["message_ts"] == working_ts and edit.get("blocks")][-1]
-    assert len(final_edit["blocks"]) == 1
+    assert len(final_edit["blocks"]) == 2
+    assert final_edit["blocks"][0]["type"] == "section"
+    assert final_edit["blocks"][1]["type"] == "context_actions"
+    assert final_edit["blocks"][1]["elements"][0]["type"] == "feedback_buttons"
     assert len(final_edit["text"]) <= 2800
     continuations = [post["text"] for post in bot.posts[1:]]
     assert "".join([final_edit["text"], *continuations]) == answer
@@ -711,7 +727,8 @@ async def test_resumed_activity_reconstructs_one_native_progress_surface(in_memo
 
 @pytest.mark.asyncio
 async def test_live_control_header_shows_title_context_and_todos(in_memory_db):
-    reg, bot = _registry(in_memory_db)
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
     task, client = await _task(reg, root="1000.header")
     task.control_message_ts = "controls-1"
     await reg._persist_root(task)
@@ -734,6 +751,14 @@ async def test_live_control_header_shows_title_context_and_todos(in_memory_db):
     assert "42.1k / 200.0k (21.1%)" in rendered
     assert "Compare error windows" in rendered
     assert "Check deploy configuration" in rendered
+    assert bot.renames == [{
+        "channel_id": task.channel_id,
+        "thread_ts": task.root_ts,
+        "title": "Investigate Attie migration",
+    }]
+    # Periodic header refreshes do not spam the rename endpoint.
+    await reg._refresh_task_header(task)
+    assert len(bot.renames) == 1
     runtime = await state.get_runtime(in_memory_db, task.task_id)
     assert runtime is not None and runtime.control_message_ts == "controls-1"
 
@@ -824,7 +849,12 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert "private reasoning fragment" not in "\n".join(task.progress_lines)
     assert not any("private reasoning fragment" in str(call) for call in rich_bot.stream_appends)
     assert any(chunk["type"] == "task_update" and chunk["id"] == "subagent-h1" for chunk in task_chunks)
-    assert rich_bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
+    assert len(rich_bot.stream_stops) == 1
+    assert rich_bot.stream_stops[0]["channel_id"] == task.channel_id
+    assert rich_bot.stream_stops[0]["stream_ts"] == "stream-1"
+    feedback = rich_bot.stream_stops[0]["blocks"][0]["elements"][0]
+    assert feedback["type"] == "feedback_buttons"
+    assert feedback["action_id"] == "task.feedback"
     assert rich_bot.statuses == [
         {"channel_id": task.channel_id, "thread_ts": task.root_ts, "status": "processing"},
         {"channel_id": task.channel_id, "thread_ts": task.root_ts, "status": "active"},
@@ -832,6 +862,44 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
     assert task.progress_stream_ts is None and task.progress_started is False
     assert task.progress_keepalive is None
+
+
+@pytest.mark.asyncio
+async def test_native_agent_stop_cancels_turn_without_terminating_session(in_memory_db):
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, client = await _task(reg, root="1000.native-stop")
+    client.state_payload["turn_in_flight"] = True
+    await reg._render(task, events.TurnStarted("prompt-stop"))
+
+    handled = await reg.handle_agent_session_stopped({
+        "team_id": task.team_id,
+        "channel_id": task.channel_id,
+        "root_ts": task.root_ts,
+        "actor_id": task.owner_user_id,
+    })
+
+    assert handled is True
+    assert client.cancelled == 1
+    assert client.terminated == 0
+    assert task.status == "running"
+    assert task.native_stop_pending is True
+    assert rich_bot.statuses[-1]["status"] == "active"
+    assert any("session remains ready" in post.get("text", "") for post in rich_bot.posts)
+
+
+@pytest.mark.asyncio
+async def test_interrogative_suspends_agent_session_and_answer_resumes_processing(in_memory_db):
+    rich_bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, rich_bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.suspended")
+    action = events.Confirmation("iq-status", "prompt-status", "Continue?")
+    await reg._render(task, action)
+    assert rich_bot.statuses[-1]["status"] == "suspended"
+    pending = await reg._pending_for(task, task.owner_user_id)
+    assert pending is not None
+    await reg._answer_interrogative(task, pending, "yes")
+    assert rich_bot.statuses[-1]["status"] == "processing"
 
 
 @pytest.mark.asyncio
@@ -1052,20 +1120,40 @@ class TestAC7LifecycleAndConfig:
         reg, bot = _registry(in_memory_db)
         task, client = await _task(reg, root="1000.compact")
         client.state_payload["turn_in_flight"] = False
-        assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "completed"
+        assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "accepted"
         assert client.compact_calls == 1
+        assert task.compaction_id == "compact-1"
+        # An untagged/different automatic terminal must not complete the manual
+        # operation. Only the matching SSE operation ID is authoritative.
+        await reg._render(task, events.CompactionUpdate("complete", "threshold"))
+        assert task.compaction_id == "compact-1"
+        await reg._render(task, events.CompactionUpdate("complete", "manual", compaction_id="compact-1"))
+        assert task.compaction_id is None
 
         client.state_payload["turn_in_flight"] = True
         assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "queued"
         assert await reg.request_compaction(task.task_id, owner_user_id="UOWNER") == "queued"
         assert task.compaction_pending is True
         assert client.compact_calls == 1
+        worker = reg._compaction_workers[task.task_id]
 
         client.state_payload["turn_in_flight"] = False
+        # message_complete may arrive before the daemon releases its turn slot.
+        # The queued request must wait for authoritative idle state.
+        client.state_sequence = [
+            {**client.state_payload, "turn_in_flight": True},
+            {**client.state_payload, "turn_in_flight": True},
+            {**client.state_payload, "turn_in_flight": False},
+        ]
         await reg._render(task, events.TurnComplete("prompt-compact"))
+        await worker
         assert task.compaction_pending is False
+        assert task.compaction_id == "compact-2"
         assert client.compact_calls == 2
-        assert sum("Queued compaction completed" in post.get("text", "") for post in bot.posts) == 1
+        assert sum("Queued compaction accepted" in post.get("text", "") for post in bot.posts) == 1
+        assert not any("Queued compaction completed" in post.get("text", "") for post in bot.posts)
+        await reg._render(task, events.CompactionUpdate("complete", "manual", compaction_id="compact-2"))
+        assert task.compaction_id is None
 
     async def test_model_effort_skill_and_restart_contract(self, in_memory_db):
         reg, _ = _registry(in_memory_db)

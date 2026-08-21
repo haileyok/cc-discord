@@ -107,6 +107,8 @@ def make_socket_dispatcher(dispatcher: CommandDispatcher, task_registry: TaskReg
                 # consume actor_id/team/channel/root fields without reaching into
                 # provider-specific payload nesting.
                 return await task_registry.maybe_route_message(payload)
+            if kind == "agent_session_stopped":
+                return await task_registry.handle_agent_session_stopped(payload)
             if kind in {"reaction_added", "reaction_removed"}:
                 return None
             return await dispatcher.dispatch(payload)

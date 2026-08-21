@@ -59,6 +59,9 @@ def _build_stub_app() -> web.Application:
     async def reload(_request: web.Request) -> web.Response:
         return web.json_response({"reloaded": ["models", "skills"], "failed": []})
 
+    async def compact(_request: web.Request) -> web.Response:
+        return web.json_response({"compaction_id": "compact-123"}, status=202)
+
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
 
@@ -96,6 +99,7 @@ def _build_stub_app() -> web.Application:
     app.router.add_post("/model", model)
     app.router.add_post("/turn/cancel", cancel)
     app.router.add_post("/reload", reload)
+    app.router.add_post("/compact", compact)
     app.router.add_get("/health", health)
     app.router.add_get("/events", events)
     return app
@@ -190,6 +194,11 @@ class TestPolytokenClient:
         async with PolytokenClient(stub_port) as client:
             result = await client.reload()
         assert result == {"reloaded": ["models", "skills"], "failed": []}
+
+    async def test_compact_returns_accepted_operation_id(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            result = await client.compact()
+        assert result == "compact-123"
 
     async def test_health_true(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:

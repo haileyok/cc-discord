@@ -318,8 +318,17 @@ class PolytokenClient:
     async def cancel_turn(self) -> Any:
         return await self._request("POST", "/turn/cancel")
 
-    async def compact(self) -> Any:
-        return await self._request("POST", "/compact")
+    async def compact(self) -> str:
+        """Request asynchronous compaction and return its operation ID.
+
+        ``POST /compact`` returns 202 Accepted; completion is reported later on
+        the SSE stream.  Callers must not interpret this response as completion.
+        """
+        result = await self._request("POST", "/compact")
+        compaction_id = result.get("compaction_id") if isinstance(result, Mapping) else None
+        if not isinstance(compaction_id, str) or not compaction_id:
+            raise PolytokenClientError("Polytoken daemon returned an invalid compaction acceptance")
+        return compaction_id
 
     async def reload(self) -> dict[str, Any]:
         """Reload daemon configuration and return subsystem results."""

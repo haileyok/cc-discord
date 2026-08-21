@@ -280,12 +280,18 @@ class Task:
     progress_answer: str = ""
     progress_keepalive: asyncio.Task[None] | None = field(default=None, repr=False)
     progress_io_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # ``pending`` means requested while a turn is draining but not yet accepted.
+    # Once POST /compact returns 202, ``compaction_id`` tracks the asynchronous
+    # operation until its matching terminal SSE event arrives.
     compaction_pending: bool = False
+    compaction_id: str | None = None
     compaction_standalone: bool = False
     compaction_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Existing-thread tasks require an explicit verified bot mention to route.
     mention_required: bool = False
     control_message_ts: str | None = None
+    agent_session_title: str | None = None
+    native_stop_pending: bool = False
 
     @property
     def key(self) -> ConversationKey:
@@ -579,6 +585,7 @@ class TaskRegistry:
         self._startup_notices: list[tuple[Task, str]] = []
         self._deferred_consumers: set[str] = set()
         self._header_refreshers: dict[str, asyncio.Task[None]] = {}
+        self._compaction_workers: dict[str, asyncio.Task[None]] = {}
 
     def bind_bot(self, bot: "Bot") -> None:
         self._bot = bot
@@ -640,7 +647,8 @@ class TaskRegistry:
                     runtime.owner_alerted, runtime.promotion_state,
                     runtime.binding_id, runtime.cleanup_pending,
                     runtime.channel_owned, runtime.mention_required,
-                    runtime.control_message_ts,
+                    runtime.control_message_ts, runtime.compaction_pending,
+                    runtime.compaction_id,
                 )
         task = Task(
             runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id),
@@ -652,11 +660,15 @@ class TaskRegistry:
             credential_file_path=credential_file_path,
             mention_required=runtime.mention_required,
             control_message_ts=runtime.control_message_ts,
+            compaction_pending=runtime.compaction_pending,
+            compaction_id=runtime.compaction_id,
         )
         self._disabled_roots.discard(task.key)
         await self._index(task)
         if task.status in {"running", "spawning"}:
             self._start_consumer(task)
+            if task.compaction_pending:
+                self._schedule_pending_compaction(task)
         log.warning("restored missing in-memory Slack task binding for %s", task.task_id[:8])
         return task
 
@@ -687,6 +699,8 @@ class TaskRegistry:
             binding_id=task.binding_id, cleanup_pending=task.cleanup_pending,
             channel_owned=task.channel_owned, mention_required=task.mention_required,
             control_message_ts=task.control_message_ts,
+            compaction_pending=task.compaction_pending,
+            compaction_id=task.compaction_id,
         )
 
     async def _persist_root(self, task: Task, *, now: int | None = None) -> None:
@@ -735,8 +749,20 @@ class TaskRegistry:
                     credential_file_path = getattr(info, "credential_file_path", None)
                     if runtime.port != info.port or runtime.cwd != info.project_path:
                         await update_runtime(self._conn, runtime.task_id, port=info.port, cwd=info.project_path)
-                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, runtime.mention_required, runtime.control_message_ts)
-            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path, mention_required=runtime.mention_required, control_message_ts=runtime.control_message_ts)
+                        runtime = RuntimeRow(runtime.task_id, runtime.key, runtime.session_id, info.port, runtime.status, info.project_path, runtime.owner, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, runtime.mention_required, runtime.control_message_ts, runtime.compaction_pending, runtime.compaction_id)
+            task = Task(runtime.task_id, str(runtime.key.team_id), str(runtime.key.channel_id), str(runtime.key.root_id), str(runtime.owner.actor_id), str(runtime.owner.mode), runtime.cwd, status, runtime.session_id, runtime.port, runtime.created_at, runtime.last_activity, runtime.app_exchange_budget, runtime.app_exchanges, runtime.owner_alerted, runtime.promotion_state, runtime.binding_id, runtime.cleanup_pending, runtime.channel_owned, credential_file_path=credential_file_path, mention_required=runtime.mention_required, control_message_ts=runtime.control_message_ts, compaction_pending=runtime.compaction_pending, compaction_id=runtime.compaction_id)
+            if task.compaction_id:
+                # The daemon exposes no operation lookup endpoint. After a bridge
+                # restart we cannot truthfully claim whether an accepted operation
+                # completed while disconnected, so clear only the correlation and
+                # ask the owner to retry if context usage did not change.
+                task.compaction_id = None
+                task.compaction_pending = False
+                await update_runtime(
+                    self._conn, task.task_id,
+                    compaction_pending=False, compaction_id=None,
+                )
+                self._startup_notices.append((task, "⚠️ A compaction was in progress when the bridge restarted. Check context usage and retry Compact if needed."))
             if task.channel_owned and self._bot is not None:
                 remember = getattr(self._bot, "remember_owned_channel", None)
                 if callable(remember):
@@ -843,6 +869,8 @@ class TaskRegistry:
                 self._deferred_consumers.discard(task.task_id)
                 continue
             self._start_consumer(task)
+            if task.compaction_pending:
+                self._schedule_pending_compaction(task)
         self._deferred_consumers.clear()
 
     async def shutdown(self) -> None:
@@ -858,6 +886,12 @@ class TaskRegistry:
                 with contextlib.suppress(asyncio.CancelledError):
                     await refresher
         self._header_refreshers.clear()
+        for worker in list(self._compaction_workers.values()):
+            if not worker.done():
+                worker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker
+        self._compaction_workers.clear()
         for client in list(self._clients.values()):
             with contextlib.suppress(Exception):
                 await client.aclose()
@@ -900,12 +934,15 @@ class TaskRegistry:
         await self._refresh_task_header(task)
 
     async def _refresh_task_header(self, task: Task, state: Mapping[str, Any] | None = None) -> None:
-        target_ts = task.control_message_ts
-        if not target_ts or self._bot is None:
+        if self._bot is None:
             return
+        target_ts = task.control_message_ts
         try:
             snapshot = dict(state) if state is not None else await self._client_for(task).state()
             title = str(snapshot.get("session_title") or Path(task.cwd).name or "Agent task").strip()[:150]
+            await self._rename_agent_session(task, title)
+            if not target_ts:
+                return
             stats = usage.format_state_summary(snapshot)
             todos = snapshot.get("todos") or []
             todo_lines: list[str] = []
@@ -977,6 +1014,14 @@ class TaskRegistry:
 
     async def _render(self, task: Task, action: Any) -> None:
         try:
+            activity_actions = (
+                TurnStarted, AssistantText, AssistantThinking, ToolLine, ToolDiff,
+                ToolFailure, SubagentStarted, SubagentActivity, SubagentCompleted,
+            )
+            if task.native_stop_pending and isinstance(action, activity_actions):
+                # Slack Stop has already cancelled this turn. Late buffered
+                # output must not recreate a processing surface.
+                return
             # A bridge restart can resume a live daemon stream after its
             # TurnStarted frame. Reconstruct the one native progress surface
             # before rendering resumed activity instead of posting each event.
@@ -1038,16 +1083,20 @@ class TaskRegistry:
                 await self._begin_turn(task)
             elif isinstance(action, TurnComplete):
                 await self._end_turn(task, outcome="complete")
-                await self._run_pending_compaction(task)
+                task.native_stop_pending = False
+                self._schedule_pending_compaction(task)
                 await self._refresh_task_header(task)
             elif isinstance(action, TurnCancelled):
                 await self._end_turn(task, outcome="cancelled")
-                await self._post(task, f"🛑 Turn cancelled ({action.reason})")
-                await self._run_pending_compaction(task)
+                if task.native_stop_pending:
+                    task.native_stop_pending = False
+                else:
+                    await self._post(task, f"🛑 Turn cancelled ({action.reason})")
+                self._schedule_pending_compaction(task)
             elif isinstance(action, ModelError):
                 await self._end_turn(task, outcome="error")
                 await self._post(task, "⚠ Model error: the daemon could not complete this request.")
-                await self._run_pending_compaction(task)
+                self._schedule_pending_compaction(task)
             elif isinstance(action, CompactionUpdate):
                 reason = (action.reason or "").lower()
                 automatic = any(word in reason for word in ("auto", "threshold", "context"))
@@ -1062,11 +1111,28 @@ class TaskRegistry:
                 else:
                     status = "complete" if action.stage == "complete" else "failed"
                     verb = {"complete": "completed", "failed": "failed", "cancelled": "cancelled"}.get(action.stage, action.stage)
-                    await self._progress_task_update(task, f"{label} {verb}", task_id="compaction", status=status)
+                    async with task.compaction_lock:
+                        expected_id = task.compaction_id
+                        matched_manual = bool(
+                            expected_id and action.compaction_id and action.compaction_id == expected_id
+                        )
+                        if matched_manual:
+                            task.compaction_id = None
+                            task.compaction_pending = False
+                            await update_runtime(
+                                self._conn, task.task_id,
+                                compaction_pending=False, compaction_id=None,
+                            )
+                    # Never let an untagged/different automatic operation replace
+                    # the status row for an accepted manual operation.
+                    display_id = "compaction" if not expected_id or matched_manual else f"compaction-{action.compaction_id or 'automatic'}"
+                    await self._progress_task_update(task, f"{label} {verb}", task_id=display_id, status=status)
                     await self._refresh_task_header(task)
                     if task.compaction_standalone:
                         task.compaction_standalone = False
                         await self._end_turn(task, outcome="complete" if action.stage == "complete" else "error")
+                    if task.compaction_pending:
+                        self._schedule_pending_compaction(task)
             elif isinstance(action, ContextCleared):
                 await self._post(task, "🗑️ Session context cleared. Durable session history remains on disk.")
                 await self._refresh_task_header(task)
@@ -1154,6 +1220,26 @@ class TaskRegistry:
             fallback = f"{fallback}\n\n{task.progress_answer}"[:2900]
         return fallback[:2900], blocks
 
+    @staticmethod
+    def _feedback_blocks(task: Task) -> list[dict[str, Any]]:
+        def value(rating: str) -> str:
+            return json.dumps({"task_id": task.task_id, "rating": rating}, separators=(",", ":"))
+        return [{
+            "type": "context_actions",
+            "elements": [{
+                "type": "feedback_buttons",
+                "action_id": "task.feedback",
+                "positive_button": {
+                    "text": {"type": "plain_text", "text": "👍"},
+                    "value": value("positive"),
+                },
+                "negative_button": {
+                    "text": {"type": "plain_text", "text": "👎"},
+                    "value": value("negative"),
+                },
+            }],
+        }]
+
     async def _set_agent_status(self, task: Task, status: str) -> None:
         setter = getattr(self._require_bot(), "set_agent_status", None)
         if not callable(setter):
@@ -1166,6 +1252,22 @@ class TaskRegistry:
             # Native status is an optional enhancement.  Never let it affect a
             # daemon turn, and keep credentials/URLs out of logs.
             log.warning("native Slack status update suppressed: %s", safe_error(exc, "status update failed"))
+
+    async def _rename_agent_session(self, task: Task, title: str) -> None:
+        normalized = " ".join(str(title).split())[:200]
+        if not normalized or normalized == task.agent_session_title:
+            return
+        renamer = getattr(self._require_bot(), "rename_agent_session", None)
+        if not callable(renamer):
+            return
+        try:
+            result = renamer(task.channel_id, task.root_ts, normalized)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not False:
+                task.agent_session_title = normalized
+        except Exception as exc:
+            log.warning("native Slack session rename suppressed: %s", safe_error(exc, "session rename failed"))
 
     async def _ensure_fallback_progress(self, task: Task, *, outcome: str = "running") -> None:
         fallback, blocks = self._progress_blocks(task, outcome=outcome)
@@ -1515,11 +1617,13 @@ class TaskRegistry:
         existing = await get_pending_interrogative(self._conn, task.key, ActorId(actor_id))
         if existing is not None and existing.interrogative_id == iid:
             self._pending[(task.key, actor_id)] = existing
+            await self._set_agent_status(task, "suspended")
             return
         pending = StoredInterrogative(iid, ActorId(actor_id), payload, now + 86400, now)
         await put_pending_interrogative(self._conn, task.key, pending, binding_id=binding_id, target_kind=ParticipantKind.APP if actor_id == self.app_actor_id else ParticipantKind.HUMAN)
         self._pending[(task.key, actor_id)] = pending
         await self._post(task, text[:3900])
+        await self._set_agent_status(task, "suspended")
 
     async def _pending_for(self, task: Task, actor_id: str) -> StoredInterrogative | None:
         cached = self._pending.get((task.key, actor_id))
@@ -1551,6 +1655,7 @@ class TaskRegistry:
                 return
             await self._client_for(task).respond_interrogative(pending.interrogative_id, response)
             self._pending.pop((task.key, str(pending.actor_id)), None)
+            await self._set_agent_status(task, "processing")
         except PolytokenClientError:
             # Delivery failed after the atomic claim. Restore the durable row so
             # the targeted actor can retry instead of losing the question.
@@ -1924,6 +2029,7 @@ class TaskRegistry:
         try:
             wire_body = envelope.provenance.wire(envelope.body)
             await self._client_for(task).prompt(wire_body)
+            task.native_stop_pending = False
             task.last_activity = int(time.time())
             await update_runtime(self._conn, task.task_id, last_activity=task.last_activity)
             return True
@@ -2337,32 +2443,98 @@ class TaskRegistry:
         await self._refresh_task_header(task)
 
     async def request_compaction(self, task_id: str, *, owner_user_id: str | SlackActor) -> str:
-        """Compact now when idle, or queue exactly once for the active turn's end."""
+        """Request compaction without confusing HTTP acceptance with completion."""
         task = self._require_task(task_id, owner_user_id)
+        schedule = False
         async with task.compaction_lock:
+            if task.compaction_id:
+                return "accepted"
             state = await self._state_snapshot(task)
             if task.progress_started or bool(state.get("turn_in_flight")):
                 task.compaction_pending = True
-                return "queued"
-            try:
-                await self._client_for(task).compact()
-            except PolytokenClientError as exc:
-                raise TaskSpawnError(safe_error(exc, "daemon compaction failed")) from exc
-            await self._refresh_task_header(task)
-            return "completed"
+                await update_runtime(self._conn, task.task_id, compaction_pending=True)
+                schedule = True
+                outcome = "queued"
+            else:
+                try:
+                    task.compaction_id = await self._client_for(task).compact()
+                except PolytokenClientError as exc:
+                    # The state read and request are not atomic. A busy response
+                    # is owned by the background dispatcher instead of discarded.
+                    if exc.status != 409:
+                        raise TaskSpawnError(safe_error(exc, "daemon compaction failed")) from exc
+                    task.compaction_pending = True
+                    await update_runtime(self._conn, task.task_id, compaction_pending=True)
+                    schedule = True
+                    outcome = "queued"
+                else:
+                    task.compaction_pending = False
+                    await update_runtime(
+                        self._conn, task.task_id,
+                        compaction_pending=False, compaction_id=task.compaction_id,
+                    )
+                    outcome = "accepted"
+        if schedule:
+            self._schedule_pending_compaction(task)
+        return outcome
+
+    def _schedule_pending_compaction(self, task: Task) -> None:
+        if not task.compaction_pending or task.compaction_id:
+            return
+        previous = self._compaction_workers.get(task.task_id)
+        if previous is not None and not previous.done():
+            return
+        worker = asyncio.create_task(self._run_pending_compaction(task))
+        self._compaction_workers[task.task_id] = worker
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._compaction_workers.get(task.task_id) is done:
+                self._compaction_workers.pop(task.task_id, None)
+            if not done.cancelled() and done.exception() is not None:
+                log.error("queued compaction worker failed for %s: %s", task.task_id[:8], done.exception())
+
+        worker.add_done_callback(finished)
 
     async def _run_pending_compaction(self, task: Task) -> None:
+        """Dispatch queued compaction without blocking the sole SSE consumer."""
+        for _ in range(120):
+            async with task.compaction_lock:
+                if not task.compaction_pending or task.compaction_id:
+                    return
+            state = await self._state_snapshot(task)
+            if bool(state.get("turn_in_flight")):
+                await asyncio.sleep(0.25)
+                continue
+            compaction_id: str | None = None
+            failure: str | None = None
+            async with task.compaction_lock:
+                if not task.compaction_pending or task.compaction_id:
+                    return
+                try:
+                    compaction_id = await self._client_for(task).compact()
+                except PolytokenClientError as exc:
+                    if exc.status != 409:
+                        task.compaction_pending = False
+                        await update_runtime(self._conn, task.task_id, compaction_pending=False)
+                        failure = safe_error(exc, "daemon rejected compaction")
+                else:
+                    task.compaction_pending = False
+                    task.compaction_id = compaction_id
+                    await update_runtime(
+                        self._conn, task.task_id,
+                        compaction_pending=False, compaction_id=compaction_id,
+                    )
+            if compaction_id:
+                await self._post(task, "🧹 Queued compaction accepted; compaction is running.")
+                return
+            if failure:
+                await self._post(task, f"⚠️ Queued compaction failed: {failure}.")
+                return
+            await asyncio.sleep(0.25)
         async with task.compaction_lock:
-            if not task.compaction_pending:
-                return
             task.compaction_pending = False
-            try:
-                await self._client_for(task).compact()
-            except (PolytokenClientError, TaskSpawnError) as exc:
-                await self._post(task, f"⚠️ Queued compaction failed: {safe_error(exc, 'daemon rejected compaction')}.")
-                return
-            await self._refresh_task_header(task)
-            await self._post(task, "🧹 Queued compaction completed.")
+            await update_runtime(self._conn, task.task_id, compaction_pending=False)
+        await self._post(task, "⚠️ Compaction could not start because the daemon did not become idle; try again.")
 
     async def reload_daemon(self, task_id: str, *, owner_user_id: str | SlackActor) -> dict[str, Any]:
         task = self._require_task(task_id, owner_user_id)
@@ -2372,6 +2544,20 @@ class TaskRegistry:
             raise TaskSpawnError(safe_error(exc, "daemon configuration reload failed")) from exc
         await self._refresh_task_header(task)
         return result
+
+    async def set_title(self, task_id: str, title: str, *, owner_user_id: str | SlackActor) -> None:
+        task = self._require_task(task_id, owner_user_id)
+        normalized = " ".join(str(title).split())[:200]
+        if not normalized:
+            raise TaskSpawnError("title cannot be empty")
+        try:
+            await self._client_for(task).set_title(normalized)
+        except PolytokenClientError as exc:
+            raise TaskSpawnError(safe_error(exc, "daemon rejected title change")) from exc
+        await self._rename_agent_session(task, normalized)
+        snapshot = await self._state_snapshot(task)
+        snapshot["session_title"] = normalized
+        await self._refresh_task_header(task, snapshot)
 
     async def set_model(self, task_id: str, model: str, *, owner_user_id: str | SlackActor, reasoning_effort: str | None = None) -> None:
         task = self._require_task(task_id, owner_user_id)
@@ -2421,6 +2607,37 @@ class TaskRegistry:
             tasks = [task for task in tasks if task.owner_user_id == actor_id]
         return sorted(tasks, key=lambda task: task.last_activity, reverse=True)
 
+    async def handle_agent_session_stopped(self, payload: Mapping[str, Any]) -> bool:
+        """Handle Slack's native Stop without terminating the durable session."""
+        key = ConversationKey(
+            str(payload.get("team_id") or ""),
+            str(payload.get("channel_id") or ""),
+            str(payload.get("root_ts") or ""),
+        )
+        task = self.get_by_conversation(str(key.team_id), str(key.channel_id), str(key.root_id))
+        if task is None:
+            task = await self.restore_by_conversation(str(key.team_id), str(key.channel_id), str(key.root_id))
+        actor_id = str(payload.get("actor_id") or "")
+        if task is None or actor_id != task.owner_user_id:
+            return False
+        state = await self._state_snapshot(task)
+        # Only an explicit daemon idle state is safe to acknowledge without a
+        # cancellation request. An empty snapshot means unknown, not idle.
+        if not task.progress_started and state.get("turn_in_flight") is False:
+            await self._set_agent_status(task, "active")
+            return True
+        try:
+            await self._client_for(task).cancel_turn()
+        except PolytokenClientError as exc:
+            if exc.status not in {404, 409}:
+                await self._post(task, f"⚠️ Slack Stop could not cancel the current turn: {safe_error(exc, 'daemon rejected cancellation')}.")
+                return False
+        task.native_stop_pending = True
+        await self._end_turn(task, outcome="cancelled")
+        await self._set_agent_status(task, "active")
+        await self._post(task, "🛑 Current turn stopped. The session remains ready.")
+        return True
+
     async def stop_task(self, task_id: str, owner_user_id: str | SlackActor, *, timeout: float = 5.0) -> bool:
         task = self._require_task(task_id, owner_user_id)
         if task.status not in {"running", "spawning", "paused"}:
@@ -2430,8 +2647,8 @@ class TaskRegistry:
         try:
             await self._client_for(task).terminate()
         except PolytokenClientError as exc:
-            if exc.status is not None:
-                await self._post(task, "⚠ The daemon rejected termination; task remains active.")
+            if exc.status is not None or not await self._daemon_is_gone(task):
+                await self._post(task, "⚠ Daemon termination was not confirmed; task remains active.")
                 return False
         await self._end_turn(task, outcome="cancelled")
         await self._teardown_task(task, status="stopped")
@@ -2444,7 +2661,8 @@ class TaskRegistry:
         try:
             await self._client_for(task).terminate()
         except PolytokenClientError as exc:
-            if exc.status is not None:
+            if exc.status is not None or not await self._daemon_is_gone(task):
+                await self._post(task, "⚠ Daemon termination was not confirmed; task remains active.")
                 return False
         await self._end_turn(task, outcome="cancelled")
         await self._teardown_task(task, status="crashed")
@@ -2460,6 +2678,8 @@ class TaskRegistry:
             task.status = "running"
             task.owner_alerted = False
             await self._persist_root(task)
+            if task.compaction_pending:
+                self._schedule_pending_compaction(task)
         return task
 
     async def _begin_turn(self, task: Task) -> None:
@@ -2527,7 +2747,14 @@ class TaskRegistry:
                 stopper = getattr(self._require_bot(), "stop_stream", None)
                 if callable(stopper):
                     try:
-                        result = stopper(task.channel_id, task.progress_stream_ts)
+                        if outcome == "complete":
+                            result = stopper(
+                                task.channel_id,
+                                task.progress_stream_ts,
+                                blocks=self._feedback_blocks(task),
+                            )
+                        else:
+                            result = stopper(task.channel_id, task.progress_stream_ts)
                         if inspect.isawaitable(result):
                             await result
                         task.progress_stream_ts = None
@@ -2560,7 +2787,7 @@ class TaskRegistry:
                             await self._require_bot().edit_message(
                                 task.channel_id, task.progress_fallback_ts,
                                 text=first,
-                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": first}}],
+                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": first}}] + self._feedback_blocks(task),
                             )
                             edited = True
                         except Exception as exc:
@@ -2613,12 +2840,18 @@ class TaskRegistry:
         task.status = status
         task.last_activity = int(time.time())
         await self._persist_root(task)
+        await self._set_agent_status(task, "closed")
         consumer = self._consumers.pop(task.task_id, None)
         if cancel_consumer and consumer is not None and not consumer.done():
             consumer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await consumer
         self._translators.pop(task.task_id, None)
+        worker = self._compaction_workers.pop(task.task_id, None)
+        if worker is not None and not worker.done() and worker is not asyncio.current_task():
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
         refresher = self._header_refreshers.pop(task.task_id, None)
         if refresher is not None and not refresher.done():
             refresher.cancel()

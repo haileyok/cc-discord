@@ -442,6 +442,7 @@ class Bot:
         # expose the generic API surface.  Once Slack gives a permanent
         # capability error, skip future attempts for this process.
         self._agent_status_unsupported = False
+        self._agent_rename_unsupported = False
         self._socket_handler = self.handle_socket_envelope
 
     @property
@@ -843,11 +844,11 @@ class Bot:
             if isinstance(exc, SlackApiError):
                 error = str(_response_value(_exception_response(exc), "error", error) or error).lower()
             permanent = {
-                "access_denied", "accesslimited", "channel_not_found", "deprecated_endpoint",
-                "enterprise_is_restricted", "feature_disabled", "invalid_arguments", "invalid_auth",
-                "method_deprecated", "missing_scope", "no_permission", "not_allowed_token_type",
-                "not_authorized", "not_authed", "team_access_not_granted", "thread_ts_not_allowed",
-                "thread_ts_required", "token_expired", "token_revoked", "unknown_method",
+                "access_denied", "accesslimited", "deprecated_endpoint",
+                "enterprise_is_restricted", "feature_disabled", "invalid_auth",
+                "method_deprecated", "missing_scope", "not_allowed_token_type",
+                "not_authorized", "not_authed", "team_access_not_granted",
+                "token_expired", "token_revoked", "unknown_method",
             }
             if (
                 error in permanent
@@ -856,6 +857,33 @@ class Bot:
             ):
                 self._agent_status_unsupported = True
             logger.warning("native Slack agent status unavailable: %s", safe_error(exc, "status update failed"))
+            return False
+
+    async def rename_agent_session(self, channel_id: str, thread_ts: str, title: str) -> bool:
+        """Best-effort native Slack agent session title update."""
+        if self._agent_rename_unsupported:
+            return False
+        payload = {
+            "channel_id": self._channel_for(channel_id),
+            "thread_ts": str(thread_ts),
+            "title": " ".join(str(title).split())[:200],
+        }
+        if not payload["title"]:
+            return False
+        try:
+            await self._api("api_call", api_method="agents.sessions.rename", json=payload)
+            return True
+        except Exception as exc:
+            error = str(getattr(exc, "error", "") or "").lower()
+            if isinstance(exc, SlackApiError):
+                error = str(_response_value(_exception_response(exc), "error", error) or error).lower()
+            if error in {
+                "access_denied", "feature_disabled", "invalid_auth", "missing_scope",
+                "not_allowed_token_type", "not_authorized", "not_authed",
+                "token_expired", "token_revoked", "unknown_method",
+            } or isinstance(exc, (AttributeError, TypeError, NotImplementedError)):
+                self._agent_rename_unsupported = True
+            logger.warning("native Slack agent rename unavailable: %s", safe_error(exc, "session rename failed"))
             return False
 
     async def post_with_attachments(self, file_paths: list[str | Path],

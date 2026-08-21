@@ -7,7 +7,7 @@ dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.21",
     "click>=8.1",
-    "slack-sdk>=3.35",
+    "slack-sdk>=3.43",
 ]
 
 [project.scripts]

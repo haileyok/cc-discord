@@ -24,6 +24,20 @@ async def test_fresh_schema_contains_only_normalized_slack_tables(in_memory_db) 
 
 
 @pytest.mark.asyncio
+async def test_compaction_operation_round_trips_in_runtime(in_memory_db) -> None:
+    runtime = state.RuntimeRow(
+        "task-compact", key(), "sess", 1234, "running", "/tmp",
+        Owner("UOWNER"), 1, 2, 20, 0, False,
+        compaction_pending=True, compaction_id="compact-123",
+    )
+    await state.upsert_runtime(in_memory_db, runtime)
+    restored = await state.get_runtime(in_memory_db, "task-compact")
+    assert restored is not None
+    assert restored.compaction_pending is True
+    assert restored.compaction_id == "compact-123"
+
+
+@pytest.mark.asyncio
 async def test_restore_runtime_binding_preserves_old_root_participants() -> None:
     conn = await aiosqlite.connect(":memory:")
     try:

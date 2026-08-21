@@ -82,9 +82,18 @@ class TestStreaming:
         f = _Feed()
         assert f.send({"type": "compaction_started", "reason": "threshold"}) == [CompactionUpdate("started", "threshold")]
         assert f.send({"type": "compaction_retry", "reason": "threshold", "attempt": 2, "max_attempts": 3}) == [CompactionUpdate("retry", "threshold", "attempt 2/3")]
-        assert f.send({"type": "compaction_complete", "reason": "threshold"}) == [CompactionUpdate("complete", "threshold")]
+        assert f.send({"type": "compaction_complete", "reason": "threshold", "compaction_id": "compact-123"}) == [
+            CompactionUpdate("complete", "threshold", compaction_id="compact-123")
+        ]
         assert f.send({"type": "compaction_failed", "error": "secret upstream body"}) == [CompactionUpdate("failed")]
         assert f.send({"type": "context_cleared"}) == [ContextCleared()]
+
+    def test_duplicate_and_out_of_order_lifecycle_events_are_ignored(self) -> None:
+        f = _Feed()
+        event = {"type": "compaction_complete", "compaction_id": "compact-1"}
+        assert f.send(event, seq=10) == [CompactionUpdate("complete", compaction_id="compact-1")]
+        assert f.send(event, seq=10) == []
+        assert f.send(event, seq=9) == []
 
 
 class TestTools:

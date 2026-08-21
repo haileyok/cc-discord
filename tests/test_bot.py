@@ -114,6 +114,9 @@ class TestAC1StartupAndHealth:
         assert "- message.groups" in manifest
         assert "- channels:history" in manifest
         assert "- groups:history" in manifest
+        assert "- assistant:write" in manifest
+        assert "- agent_session_stopped" in manifest
+        assert "agent_view" not in manifest
         assert "callback_id: start_agent_here" in manifest
         assert "type: message" in manifest
 
@@ -237,6 +240,21 @@ class TestAC4WebApiAndRetry:
         await bot.append_stream("GHOME", "3.1", chunks=chunks)
         await bot.stop_stream("GHOME", "3.1")
         assert await bot.set_agent_status("GHOME", "1.0", "processing")
+        client.assert_complete()
+
+    @pytest.mark.asyncio
+    async def test_native_agent_session_rename_uses_current_api(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("api_call", {"ok": True}),
+        ], expected_kwargs={
+            "api_call": {
+                "api_method": "agents.sessions.rename",
+                "json": {"channel_id": "GHOME", "thread_ts": "1.0", "title": "Attie migration"},
+            },
+        })
+        bot = _ready_bot(client=client)
+        await bot.start()
+        assert await bot.rename_agent_session("GHOME", "1.0", "  Attie   migration  ")
         client.assert_complete()
 
     @pytest.mark.asyncio
