@@ -514,7 +514,7 @@ class CommandDispatcher:
         # (which silently drops ephemeral replies) instead of vanishing.
         payload = {
             **dict(payload),
-            "root_ts": task.control_message_ts or task.root_ts,
+            "root_ts": task.root_ts,
             "channel_id": task.channel_id,
         }
         if name == "stop":
@@ -830,7 +830,20 @@ class CommandDispatcher:
             task = self.registry.get_by_task_id(task_id)
             if task is None:
                 raise TaskNotFound("unknown task id")
-            if (channel or root) and (team, channel, root) != (task.team_id, task.channel_id, task.root_ts):
+            # An existing-thread-bound task's control panel (Compact/Stop/
+            # Kill/Configure/Participants buttons) is posted as a separate
+            # bot reply, so its ts (control_message_ts) differs from the
+            # human root message it's attached to (root_ts). Both are
+            # legitimate proof the button/modal genuinely originated from
+            # this task's own messages; requiring an exact match against
+            # root_ts alone rejected every such button click and Configure
+            # submission even with a perfectly valid task_id.
+            valid_roots = {task.root_ts}
+            if task.control_message_ts:
+                valid_roots.add(task.control_message_ts)
+            if channel and channel != task.channel_id:
+                raise TaskRoutingError("task id does not match the supplied Slack conversation")
+            if root and root not in valid_roots:
                 raise TaskRoutingError("task id does not match the supplied Slack conversation")
         else:
             if not team or not channel or not root:
@@ -1023,7 +1036,14 @@ def _configure_modal(task: Task, state: Mapping[str, Any], models: Any) -> dict[
     metadata = {
         "task_id": task.task_id,
         "channel_id": task.channel_id,
-        "root_ts": task.control_message_ts or task.root_ts,
+        # Must be task.root_ts, not control_message_ts: _task_from_payload's
+        # conversation-identity check always compares the incoming root
+        # against task.root_ts (the two only coincide for ad-hoc tasks; an
+        # existing-thread binding posts its controls as a separate reply
+        # with its own ts, and using that here made every Configure
+        # submission fail with "task id does not match the supplied Slack
+        # conversation").
+        "root_ts": task.root_ts,
         "current_model": current_model,
         "current_effort": current_effort,
         "current_facet": current_facet,
@@ -1083,7 +1103,7 @@ def _participants_modal(task: Task) -> dict[str, Any]:
         "private_metadata": json.dumps({
             "task_id": task.task_id,
             "channel_id": task.channel_id,
-            "root_ts": task.control_message_ts or task.root_ts,
+            "root_ts": task.root_ts,  # see _configure_modal's comment
         }),
         "blocks": [{"type": "input", "block_id": "participants", "optional": True,
                      "label": {"type": "plain_text", "text": "Slack user IDs"},

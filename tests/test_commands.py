@@ -444,6 +444,38 @@ async def test_configure_submission_with_root_ts_metadata_posts_visibly_into_thr
 
 
 @pytest.mark.asyncio
+async def test_configure_submission_succeeds_when_control_message_differs_from_root() -> None:
+    """Regression: an existing-thread-bound task posts its control panel as a
+    separate reply, so control_message_ts != root_ts. The Configure modal's
+    metadata must carry root_ts (what _task_from_payload actually validates
+    against), not control_message_ts -- using the latter made every such
+    Configure submission fail with "task id does not match the supplied
+    Slack conversation" even though the task_id was correct."""
+    task = LocalTask(root_ts="100.1", control_message_ts="200.2")
+    registry = LocalRegistry(task)
+    dispatcher = CommandDispatcher(LocalBot(), registry)
+    opened = await dispatcher.dispatch({
+        "type": "block_actions", "team_id": "T1", "user_id": "UOWNER",
+        "channel_id": "GHOME", "message": {"ts": "200.2"}, "trigger_id": "TR-CONFIG",
+        "actions": [{"action_id": "task.configure", "value": task.task_id}],
+    })
+    metadata = json.loads(opened.modal["private_metadata"])
+    assert metadata["root_ts"] == "100.1"
+    submitted = await dispatcher.dispatch({
+        "type": "view_submission", "team_id": "T1", "user_id": "UOWNER",
+        "view": {
+            "callback_id": "bridge.configure",
+            "private_metadata": opened.modal["private_metadata"],
+            "state": {"values": {
+                "configure_facet": {"facet": {"action_id": "facet", "value": "plan"}},
+            }},
+        },
+    })
+    assert not submitted.text.startswith("❌"), submitted.text
+    assert ("set_facet", (task.task_id, "plan"), {"owner_user_id": "UOWNER"}) in registry.calls
+
+
+@pytest.mark.asyncio
 async def test_activity_button_is_owner_only_and_retains_completion_summary() -> None:
     registry = LocalRegistry()
     registry.task.subagent_blocks["h1"] = type("Block", (), {
