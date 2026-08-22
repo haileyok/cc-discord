@@ -297,6 +297,10 @@ class Task:
     recent_tool_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
     progress_answer: str = ""
+    # Generic notification_queued events carry no subagent identity. Once a
+    # subagent participates in this turn, suppress those redundant free-form
+    # pings and let SubagentCompleted own the visible result.
+    progress_had_subagent: bool = False
     # True once any progress content (tool/task activity line, or a prior
     # assistant text block) has been appended to the native stream this turn.
     # Used to insert a paragraph break before the next text block so it never
@@ -1097,6 +1101,7 @@ class TaskRegistry:
                 if not task.progress_started:
                     await self._post(task, line)
             elif isinstance(action, SubagentStarted):
+                task.progress_had_subagent = True
                 await self._subagent_started(task, action)
                 await self._progress_task_update(
                     task, f"{action.subagent_type or action.handle} started",
@@ -1106,6 +1111,7 @@ class TaskRegistry:
                 if block is not None:
                     block.last_progress_update_at = time.monotonic()
             elif isinstance(action, SubagentActivity):
+                task.progress_had_subagent = True
                 await self._subagent_activity(task, action.handle, action.line)
                 block = task.subagent_blocks.get(action.handle)
                 now = time.monotonic()
@@ -1118,6 +1124,7 @@ class TaskRegistry:
                         task_id=f"subagent-{action.handle}", status="in_progress",
                     )
             elif isinstance(action, SubagentCompleted):
+                task.progress_had_subagent = True
                 result_summary = _normalize_summary(action.result_summary)
                 fingerprint = _summary_fingerprint(result_summary)
                 if fingerprint:
@@ -1197,6 +1204,12 @@ class TaskRegistry:
             elif isinstance(action, StatusNote):
                 await self._post(task, action.text)
             elif isinstance(action, AttentionPing):
+                if task.progress_started and task.progress_had_subagent:
+                    # notification_queued is an unscoped duplicate channel for
+                    # subagent prose. It may precede SubagentCompleted and its
+                    # wording may differ, so fingerprint dedupe alone cannot
+                    # prevent transient bell-message leaks.
+                    return
                 normalized_summary = _normalize_summary(action.summary)
                 fingerprint = _summary_fingerprint(normalized_summary)
                 if fingerprint and fingerprint in task.recent_subagent_summary_hashes:
@@ -3115,6 +3128,7 @@ class TaskRegistry:
         task.recent_tool_lines.clear()
         task.progress_sequence = 0
         task.progress_answer = ""
+        task.progress_had_subagent = False
         task.progress_any_content = False
         bot = self._require_bot()
         starter = getattr(bot, "start_stream", None)

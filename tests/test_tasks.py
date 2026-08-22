@@ -943,6 +943,27 @@ async def test_duplicate_subagent_summary_notification_is_suppressed(in_memory_d
 
 
 @pytest.mark.asyncio
+async def test_unscoped_notification_is_suppressed_during_subagent_turn(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.subagent-notification")
+    await reg._render(task, events.TurnStarted("prompt-review"))
+    await reg._render(task, events.SubagentStarted("reviewer-1", "general-purpose", "model"))
+    calls_before = len(bot.stream_appends)
+
+    await reg._render(task, events.AttentionPing(
+        "## Actionable finding\n\n**medium — listBlobs exposes storage generations**"
+    ))
+
+    assert len(bot.stream_appends) == calls_before
+    assert not any("🔔" in str(post.get("text", "")) for post in bot.posts)
+    await reg._render(task, events.SubagentCompleted("reviewer-1", "success", None, "review complete"))
+    rich_completion = bot.stream_appends[-1]["chunks"][0]
+    assert rich_completion["status"] == "complete"
+    await reg._render(task, events.TurnComplete("prompt-review"))
+
+
+@pytest.mark.asyncio
 async def test_background_job_notification_updates_timeline_without_owner_ping(in_memory_db):
     bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
