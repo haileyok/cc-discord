@@ -135,6 +135,10 @@ SUBAGENT_EDIT_THROTTLE_SECS = 1.5
 # later updates reuse the same ID. Bursty subagents can otherwise exhaust the
 # stream payload and force a msg_too_long fallback within seconds.
 SUBAGENT_PROGRESS_THROTTLE_SECS = 5.0
+# notification_queued can trail the authoritative SubagentCompleted event and
+# contains no source/handle metadata. Bound late-duplicate suppression so an
+# unrelated future idle notification is not hidden indefinitely.
+SUBAGENT_NOTIFICATION_GRACE_SECS = 60.0
 MAX_ATTACHMENTS_PER_POST = 10
 DEFAULT_APP_EXCHANGE_BUDGET = int(os.environ.get("BRIDGE_APP_EXCHANGE_BUDGET", "20"))
 DEFAULT_AD_HOC_CWD = os.environ.get("BRIDGE_AD_HOC_CWD", "/home/hailey/bluesky")
@@ -301,6 +305,7 @@ class Task:
     # subagent participates in this turn, suppress those redundant free-form
     # pings and let SubagentCompleted own the visible result.
     progress_had_subagent: bool = False
+    last_subagent_event_at: float | None = None
     # True once any progress content (tool/task activity line, or a prior
     # assistant text block) has been appended to the native stream this turn.
     # Used to insert a paragraph break before the next text block so it never
@@ -1102,6 +1107,7 @@ class TaskRegistry:
                     await self._post(task, line)
             elif isinstance(action, SubagentStarted):
                 task.progress_had_subagent = True
+                task.last_subagent_event_at = time.monotonic()
                 await self._subagent_started(task, action)
                 await self._progress_task_update(
                     task, f"{action.subagent_type or action.handle} started",
@@ -1112,6 +1118,7 @@ class TaskRegistry:
                     block.last_progress_update_at = time.monotonic()
             elif isinstance(action, SubagentActivity):
                 task.progress_had_subagent = True
+                task.last_subagent_event_at = time.monotonic()
                 await self._subagent_activity(task, action.handle, action.line)
                 block = task.subagent_blocks.get(action.handle)
                 now = time.monotonic()
@@ -1125,6 +1132,7 @@ class TaskRegistry:
                     )
             elif isinstance(action, SubagentCompleted):
                 task.progress_had_subagent = True
+                task.last_subagent_event_at = time.monotonic()
                 result_summary = _normalize_summary(action.result_summary)
                 fingerprint = _summary_fingerprint(result_summary)
                 if fingerprint:
@@ -1204,11 +1212,20 @@ class TaskRegistry:
             elif isinstance(action, StatusNote):
                 await self._post(task, action.text)
             elif isinstance(action, AttentionPing):
-                if task.progress_started and task.progress_had_subagent:
+                since_subagent = (
+                    time.monotonic() - task.last_subagent_event_at
+                    if task.last_subagent_event_at is not None else None
+                )
+                if (
+                    task.progress_started and task.progress_had_subagent
+                ) or (
+                    since_subagent is not None
+                    and since_subagent <= SUBAGENT_NOTIFICATION_GRACE_SECS
+                ):
                     # notification_queued is an unscoped duplicate channel for
-                    # subagent prose. It may precede SubagentCompleted and its
-                    # wording may differ, so fingerprint dedupe alone cannot
-                    # prevent transient bell-message leaks.
+                    # subagent prose. It can arrive before or after TurnComplete
+                    # and its wording may differ, so fingerprint dedupe alone
+                    # cannot prevent transient bell-message leaks.
                     return
                 normalized_summary = _normalize_summary(action.summary)
                 fingerprint = _summary_fingerprint(normalized_summary)

@@ -962,6 +962,18 @@ async def test_unscoped_notification_is_suppressed_during_subagent_turn(in_memor
     assert rich_completion["status"] == "complete"
     await reg._render(task, events.TurnComplete("prompt-review"))
 
+    # Polytoken may queue a differently-worded notification after TurnComplete.
+    # It is still the same subagent result and must not reappear as an idle bell.
+    posts_before_late_notification = len(bot.posts)
+    await reg._render(task, events.AttentionPing(
+        "Local-only investigation findings (no files modified):\n\n## Direct serving path"
+    ))
+    assert len(bot.posts) == posts_before_late_notification
+
+    task.last_subagent_event_at -= 61
+    await reg._render(task, events.AttentionPing("unrelated later background job"))
+    assert len(bot.posts) == posts_before_late_notification + 1
+
 
 @pytest.mark.asyncio
 async def test_background_job_notification_updates_timeline_without_owner_ping(in_memory_db):
