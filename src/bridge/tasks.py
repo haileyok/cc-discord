@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import textwrap
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -473,8 +474,17 @@ def _strip_verified_mention(text: str, bot_user_id: str | None) -> str | None:
     return token.sub("", str(text)).strip()
 
 
+def _normalize_summary(text: str | None) -> str:
+    """Remove a leaked YAML literal-field wrapper from daemon summaries."""
+    value = str(text or "").strip()
+    wrapped = re.match(r"^summary:\s*[|>][+-]?\s*(?:\r?\n|$)", value)
+    if wrapped:
+        value = textwrap.dedent(value[wrapped.end():]).strip()
+    return value
+
+
 def _summary_fingerprint(text: str | None) -> str | None:
-    normalized = "\n".join(line.rstrip() for line in str(text or "").strip().splitlines())
+    normalized = "\n".join(line.rstrip() for line in _normalize_summary(text).splitlines())
     if not normalized:
         return None
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -1108,15 +1118,17 @@ class TaskRegistry:
                         task_id=f"subagent-{action.handle}", status="in_progress",
                     )
             elif isinstance(action, SubagentCompleted):
-                fingerprint = _summary_fingerprint(action.result_summary)
+                result_summary = _normalize_summary(action.result_summary)
+                fingerprint = _summary_fingerprint(result_summary)
                 if fingerprint:
                     task.recent_subagent_summary_hashes.append(fingerprint)
                     del task.recent_subagent_summary_hashes[:-20]
-                await self._subagent_completed(task, action)
+                normalized_action = replace(action, result_summary=result_summary)
+                await self._subagent_completed(task, normalized_action)
                 await self._progress_task_update(
-                    task, f"{action.handle}: {action.result_summary or 'completed'}",
+                    task, f"{action.handle}: {result_summary or 'completed'}",
                     task_id=f"subagent-{action.handle}", status="complete",
-                    output=action.result_summary,
+                    output=result_summary,
                 )
             elif isinstance(action, (AskQuestion, Clarification, Confirmation, PlanHandoff, GoalProposal)):
                 await self._post_interrogative(task, action)
@@ -1185,14 +1197,15 @@ class TaskRegistry:
             elif isinstance(action, StatusNote):
                 await self._post(task, action.text)
             elif isinstance(action, AttentionPing):
-                fingerprint = _summary_fingerprint(action.summary)
+                normalized_summary = _normalize_summary(action.summary)
+                fingerprint = _summary_fingerprint(normalized_summary)
                 if fingerprint and fingerprint in task.recent_subagent_summary_hashes:
                     # Polytoken emits both subagent_complete and a notification
                     # carrying the same result_summary. The subagent surface has
                     # already rendered it; posting the notification would chunk
                     # a long review report into several glitchy bell messages.
                     return
-                summary = str(action.summary).strip()[:240] or "Background job completed"
+                summary = normalized_summary[:240] or "Background job completed"
                 if task.progress_started:
                     await self._progress_task_update(
                         task, f"🔔 {summary}", task_id="background-job", status="complete",

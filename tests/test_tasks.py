@@ -830,6 +830,21 @@ async def test_idle_background_notification_does_not_open_progress_stream(in_mem
 
 
 @pytest.mark.asyncio
+async def test_attention_notification_strips_yaml_summary_wrapper(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.wrapped-notification")
+
+    await reg._render(task, events.AttentionPing(
+        "summary: |-\n  Re-reviewed PR #125.\n  Validation passed."
+    ))
+
+    assert len(bot.posts) == 1
+    assert bot.posts[0]["text"] == "🔔 Re-reviewed PR #125.\nValidation passed."
+    assert "summary:" not in bot.posts[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_resumed_activity_reconstructs_one_native_progress_surface(in_memory_db):
     bot = RichFakeBot()
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
