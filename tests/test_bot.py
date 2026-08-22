@@ -221,6 +221,7 @@ class TestAC4WebApiAndRetry:
             ("chat_update", {"ok": True, "ts": "1.2"}),
             ("reactions_add", {"ok": True}),
             ("reactions_add", {"ok": True}),
+            ("reactions_remove", {"ok": True}),
         ])
         bot = _ready_bot(client=client)
         await bot.start()
@@ -230,11 +231,13 @@ class TestAC4WebApiAndRetry:
         await bot.edit_message("GHOME", "1.2", blocks=blocks, text="fallback")
         await bot.add_reaction("GHOME", "1.2", ":white_check_mark:")
         await bot.add_reaction("GHOME", "1.2", "x")
+        await bot.remove_reaction("GHOME", "1.2", ":white_check_mark:")
         calls = client.calls
         post_calls = [call for call in calls if call.method == "chat_postMessage"]
         assert post_calls[1].kwargs["thread_ts"] == "1.1"
         assert post_calls[1].kwargs["text"] == "live"
-        assert calls[-1].kwargs["name"] == "x"
+        assert calls[-1].method == "reactions_remove"
+        assert calls[-1].kwargs["name"] == "white_check_mark"
 
     @pytest.mark.asyncio
     async def test_native_chat_stream_uses_current_sdk_kwargs_and_parses_ts(self) -> None:
@@ -327,6 +330,25 @@ class TestAC4WebApiAndRetry:
         assert [call.method for call in client.calls[-2:]] == [
             "files_getUploadURLExternal", "files_completeUploadExternal"
         ]
+
+    @pytest.mark.asyncio
+    async def test_attachment_post_does_not_silently_drop_files_after_tenth(self, tmp_path: Path) -> None:
+        bot = _ready_bot()
+        await bot.start()
+        paths = []
+        uploaded = []
+        for index in range(11):
+            path = tmp_path / f"report-{index}.txt"
+            path.write_text(str(index))
+            paths.append(path)
+
+        async def fake_upload(path, **kwargs):
+            uploaded.append(Path(path).name)
+            return {"file_id": f"F{len(uploaded)}"}
+
+        bot.upload_file = fake_upload  # type: ignore[method-assign]
+        await bot.post_with_attachments(paths, root_ts="1.0")
+        assert uploaded == [path.name for path in paths]
 
     @pytest.mark.asyncio
     async def test_private_channel_create_invite_and_home_archive_guard(self) -> None:

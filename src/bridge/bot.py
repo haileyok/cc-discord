@@ -560,7 +560,7 @@ class Bot:
     async def _api(self, method: str, **kwargs: Any) -> Any:
         if method in {
             "chat_postMessage", "chat_update", "chat_startStream", "chat_appendStream",
-            "chat_stopStream", "reactions_add", "files_completeUploadExternal",
+            "chat_stopStream", "reactions_add", "reactions_remove", "files_completeUploadExternal",
         }:
             await self._throttle_outbound(kwargs.get("channel") or kwargs.get("channel_id"))
         operation = getattr(self._client, method, None)
@@ -923,7 +923,7 @@ class Bot:
         self._require_ready()
         if not file_paths:
             raise ValueError("file_paths must not be empty")
-        selected = list(file_paths[:10])
+        selected = list(file_paths)
         aggregate = 0
         for path in selected:
             try:
@@ -1312,6 +1312,13 @@ class Bot:
         name = str(emoji).strip().strip(":")
         if name:
             await self._api("reactions_add", channel=self._channel_for(channel_id),
+                            timestamp=str(message_id), name=name)
+
+    async def remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> None:
+        self._require_ready()
+        name = str(emoji).strip().strip(":")
+        if name:
+            await self._api("reactions_remove", channel=self._channel_for(channel_id),
                             timestamp=str(message_id), name=name)
 
     async def remove_participants(self, channel_id: str, user_ids: list[str]) -> Any:

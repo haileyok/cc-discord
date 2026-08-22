@@ -48,8 +48,6 @@ settings:
       - app_mention
       - app_home_opened
       - app_context_changed
-      - reaction_added
-      - reaction_removed
       - agent_session_stopped
   incoming_webhooks:
     incoming_webhooks_enabled: false
@@ -66,7 +64,6 @@ oauth_config:
       - files:read
       - im:history
       - files:write
-      - reactions:read
       - reactions:write
       - users:read
       - groups:read

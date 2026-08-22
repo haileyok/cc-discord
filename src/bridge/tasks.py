@@ -139,7 +139,6 @@ SUBAGENT_PROGRESS_THROTTLE_SECS = 5.0
 # contains no source/handle metadata. Bound late-duplicate suppression so an
 # unrelated future idle notification is not hidden indefinitely.
 SUBAGENT_NOTIFICATION_GRACE_SECS = 60.0
-MAX_ATTACHMENTS_PER_POST = 10
 DEFAULT_APP_EXCHANGE_BUDGET = int(os.environ.get("BRIDGE_APP_EXCHANGE_BUDGET", "20"))
 DEFAULT_AD_HOC_CWD = os.environ.get("BRIDGE_AD_HOC_CWD", "/home/hailey/bluesky")
 ATTACH_MARKER = re.compile(r"\[\[attach:\s*([^\]]+?)\s*\]\]")
@@ -506,7 +505,7 @@ def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
         candidate = Path(match.group(1).strip())
         if candidate.is_absolute() and candidate.is_file():
             paths.append(candidate)
-    return ATTACH_MARKER.sub("", text).strip(), paths[:MAX_ATTACHMENTS_PER_POST]
+    return ATTACH_MARKER.sub("", text).strip(), paths
 
 
 def _cleanup_task_attachments(task_id: str) -> bool:
@@ -1269,17 +1268,10 @@ class TaskRegistry:
         cleaned, paths = _parse_attach_markers(text)
         if paths:
             await self._require_bot().post_with_attachments(
-                [str(path) for path in paths[:MAX_ATTACHMENTS_PER_POST]], channel_id=task.channel_id, root_ts=task.root_ts, text=cleaned
+                [str(path) for path in paths], channel_id=task.channel_id, root_ts=task.root_ts, text=cleaned
             )
         elif cleaned:
             await self._post(task, cleaned)
-
-    @staticmethod
-    def _progress_chunk_text(text: str, limit: int = 1800) -> list[str]:
-        value = str(text)
-        if not value:
-            return []
-        return [value[index:index + limit] for index in range(0, len(value), limit)]
 
     @staticmethod
     def _progress_identifier(value: str) -> str:
@@ -1653,7 +1645,7 @@ class TaskRegistry:
             await self._update_fallback_progress(task)
         if paths:
             await self._require_bot().post_with_attachments(
-                [str(path) for path in paths[:MAX_ATTACHMENTS_PER_POST]],
+                [str(path) for path in paths],
                 channel_id=task.channel_id, root_ts=task.root_ts,
                 text=None,
             )
@@ -2764,7 +2756,15 @@ class TaskRegistry:
         task = self.get_by_key(key)
         if task is not None:
             self._require_owner(task, owner_user_id)
-        return await delete_text_pin(self._conn, key, pin_id)
+        deleted = await delete_text_pin(self._conn, key, pin_id)
+        if deleted and not await list_text_pins(self._conn, key):
+            remover = getattr(self._require_bot(), "remove_reaction", None)
+            if callable(remover):
+                with contextlib.suppress(Exception):
+                    result = remover(key.channel_id, key.root_id, "pushpin")
+                    if inspect.isawaitable(result):
+                        await result
+        return deleted
 
     async def get_pin_for(self, key: ConversationKey, owner_user_id: str | SlackActor | None = None, pin_id: str | None = None) -> TextPin | None:
         task = self.get_by_key(key)

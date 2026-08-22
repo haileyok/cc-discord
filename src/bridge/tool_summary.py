@@ -184,11 +184,11 @@ def _diff_summary(tool_input: dict) -> str:
     return f"+{plus} -{minus}"
 
 
-# Keep checklist output within the neutral message budget used by the bridge;
-# bot.py chunks at 1900 to keep tool output readable. Diff/code blocks get
-# wrapped in a fenced container and may append a truncation marker.
-_MESSAGE_LIMIT = 2000
-_DIFF_BUDGET = 1850
+# Keep large tool payloads readable without applying the retired Discord-sized
+# 2,000-character transport limit. Ordinary Slack messages are bounded at 35k;
+# 12k preserves useful checklist/diff context while remaining scan-friendly.
+_MESSAGE_LIMIT = 12_000
+_DIFF_BUDGET = 11_800
 
 
 def diff_block(tool_name: str, tool_input: dict) -> str | None:
