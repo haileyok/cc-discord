@@ -1589,18 +1589,20 @@ class TaskRegistry:
         if not task.progress_started:
             await self._post_assistant_text(task, text)
             return
+        stream_text = cleaned
         if cleaned:
             if task.progress_any_content:
-                # A previous activity line (task_update badge) or an earlier
-                # assistant text block already rendered in this stream. Slack
-                # concatenates chunks with no implicit whitespace, so without
-                # this separator the new text glues directly onto whatever
-                # came before it (e.g. "70 updatesGoal persistence..." or
-                # "worktree.The worktree...").
+                # Slack strips leading whitespace from a markdown_text chunk
+                # when it follows a task_update chunk. A bare "\n\n" therefore
+                # still rendered as "last toolassistant prose". Anchor the
+                # stream boundary with a zero-width character so the paragraph
+                # break survives, but keep that transport workaround out of the
+                # stored/final answer.
+                stream_text = "\u200b\n\n" + cleaned
                 cleaned = "\n\n" + cleaned
             task.progress_answer = (task.progress_answer + cleaned)[-12000:]
             task.progress_any_content = True
-        chunks = self._progress_chunk_text(cleaned)
+        chunks = self._progress_chunk_text(stream_text)
         for chunk in chunks:
             # This stream starts in structured chunks mode for plan/task UI.
             # Slack rejects mixing the separate markdown_text parameter with

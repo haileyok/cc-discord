@@ -988,7 +988,7 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     # Prior tool activity already streamed this turn, so the text block gets a
     # leading paragraph break to avoid rendering glued onto that activity.
     assert any(
-        call["chunks"] == [{"type": "markdown_text", "text": "\n\nfinal answer"}]
+        call["chunks"] == [{"type": "markdown_text", "text": "\u200b\n\nfinal answer"}]
         and call["markdown_text"] is None
         for call in rich_bot.stream_appends
     )
@@ -1086,8 +1086,8 @@ async def test_assistant_text_gets_paragraph_break_after_prior_activity(in_memor
         if call["chunks"] and call["chunks"][0]["type"] == "markdown_text"
     ]
     assert text_chunks == [
-        "\n\nGoal persistence was not enabled.",
-        "\n\nThe worktree is ready.",
+        "\u200b\n\nGoal persistence was not enabled.",
+        "\u200b\n\nThe worktree is ready.",
     ]
 
 
