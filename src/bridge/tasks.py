@@ -301,6 +301,7 @@ class Task:
     recent_tool_lines: list[str] = field(default_factory=list)
     progress_sequence: int = 0
     progress_answer: str = ""
+    progress_answer_ts: str | None = None
     # Generic notification_queued events carry no subagent identity. Once a
     # subagent participates in this turn, suppress those redundant free-form
     # pings and let SubagentCompleted own the visible result.
@@ -1300,7 +1301,7 @@ class TaskRegistry:
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body[:2900]}"}},
         ]
-        if task.progress_answer:
+        if task.progress_answer and task.progress_answer_ts is None:
             # Keep prose above the compact status footer. Slack renders adjacent
             # context→section blocks with almost no visual gap, which produced
             # the literal-looking "100 updatesI’m resuming…" failure whenever a
@@ -1494,12 +1495,9 @@ class TaskRegistry:
             activity.update(title="Recent tool calls", details="\n".join(task.recent_tool_lines[-5:]))
         else:
             activity["title"] = task.progress_lines[-1][:240] if task.progress_lines else "Starting agent turn…"
-        chunks: list[dict[str, Any]] = [activity]
-        chunks.extend(
-            {"type": "markdown_text", "text": text}
-            for text in self._progress_chunk_text(task.progress_answer)
-        )
-        return chunks
+        # Assistant prose lives in its own ordinary message. Never seed it back
+        # into a replacement task stream, or Slack can split it independently.
+        return [activity]
 
     async def _rotate_progress_stream(self, task: Task) -> bool:
         """Replace a native stream before Slack's hard server-side lifetime."""
@@ -1632,34 +1630,26 @@ class TaskRegistry:
         if not task.progress_started:
             await self._post_assistant_text(task, text)
             return
-        stream_text = cleaned
         if cleaned:
-            if task.progress_any_content:
-                # Slack strips leading whitespace from a markdown_text chunk
-                # when it follows a task_update chunk. A bare "\n\n" therefore
-                # still rendered as "last toolassistant prose". Anchor the
-                # stream boundary with a zero-width character so the paragraph
-                # break survives, but keep that transport workaround out of the
-                # stored/final answer.
-                stream_text = "\u200b\n\n" + cleaned
+            if task.progress_answer:
                 cleaned = "\n\n" + cleaned
-            # Preserve enough text to recover the complete answer as one normal
-            # Slack message if the native stream later degrades. This remains
-            # below Bot's conservative 35k ordinary-message ceiling.
+            # Native task streams have a substantially lower accumulated-text
+            # ceiling than ordinary Slack messages and can split prose without
+            # respecting Markdown boundaries. Keep progress in the native stream,
+            # but render the answer in one ordinary message that is edited as new
+            # assistant blocks arrive.
             task.progress_answer = (task.progress_answer + cleaned)[-32000:]
+            if task.progress_answer_ts is None:
+                sent = await self._post(task, task.progress_answer)
+                task.progress_answer_ts = sent[0] if sent else None
+            else:
+                await self._require_bot().edit_message(
+                    task.channel_id, task.progress_answer_ts,
+                    text=task.progress_answer, blocks=None,
+                )
             task.progress_any_content = True
-        chunks = self._progress_chunk_text(stream_text)
-        for chunk in chunks:
-            # This stream starts in structured chunks mode for plan/task UI.
-            # Slack rejects mixing the separate markdown_text parameter with
-            # that mode (streaming_mode_mismatch), so text is a chunk too.
-            if not await self._append_progress(
-                task, chunks=[{"type": "markdown_text", "text": chunk}],
-            ):
-                break
         if task.progress_fallback_ts is not None:
-            # The fallback card is the turn surface: keep answer text inside it
-            # instead of posting a second assistant message.
+            # Once prose has its own message, keep the fallback card progress-only.
             await self._update_fallback_progress(task)
         if paths:
             await self._require_bot().post_with_attachments(
@@ -3148,6 +3138,7 @@ class TaskRegistry:
         task.recent_tool_lines.clear()
         task.progress_sequence = 0
         task.progress_answer = ""
+        task.progress_answer_ts = None
         task.progress_had_subagent = False
         task.progress_any_content = False
         bot = self._require_bot()
@@ -3205,16 +3196,25 @@ class TaskRegistry:
                 stopper = getattr(self._require_bot(), "stop_stream", None)
                 if callable(stopper):
                     try:
+                        completed_stream_ts = task.progress_stream_ts
                         if outcome == "complete":
+                            final_blocks = None if task.progress_answer_ts else (
+                                self._source_blocks(task.progress_answer) + self._feedback_blocks(task)
+                            )
                             result = stopper(
-                                task.channel_id,
-                                task.progress_stream_ts,
-                                blocks=self._source_blocks(task.progress_answer) + self._feedback_blocks(task),
+                                task.channel_id, completed_stream_ts, blocks=final_blocks,
                             )
                         else:
-                            result = stopper(task.channel_id, task.progress_stream_ts)
+                            result = stopper(task.channel_id, completed_stream_ts)
                         if inspect.isawaitable(result):
                             await result
+                        if outcome == "complete" and task.progress_answer_ts:
+                            deleter = getattr(self._require_bot(), "delete_message", None)
+                            if callable(deleter):
+                                with contextlib.suppress(Exception):
+                                    deleted = deleter(task.channel_id, completed_stream_ts)
+                                    if inspect.isawaitable(deleted):
+                                        await deleted
                         task.progress_stream_ts = None
                         task.progress_stream_started_at = None
                     except Exception as exc:
@@ -3233,7 +3233,7 @@ class TaskRegistry:
                     await self._ensure_fallback_progress(task, outcome=outcome)
             if task.progress_fallback_ts is not None:
                 if outcome == "complete":
-                    if task.progress_answer:
+                    if task.progress_answer and task.progress_answer_ts is None:
                         # A converted stream has a much lower practical update
                         # ceiling than an ordinary Slack message. Remove the
                         # temporary progress card and publish the recovered answer

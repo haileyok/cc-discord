@@ -851,9 +851,9 @@ async def test_resumed_activity_reconstructs_one_native_progress_surface(in_memo
     await reg._render(task, events.AttentionPing("review completed"))
 
     assert len(bot.stream_starts) == 1
-    assert not bot.posts
+    assert [post["text"] for post in bot.posts] == ["review is still running"]
     task_chunks = [call["chunks"][0] for call in bot.stream_appends if call.get("chunks")]
-    assert any(chunk.get("type") == "markdown_text" for chunk in task_chunks)
+    assert not any(chunk.get("type") == "markdown_text" for chunk in task_chunks)
     assert any(chunk.get("id") == "activity" for chunk in task_chunks)
     assert any(chunk.get("id") == "background-job" for chunk in task_chunks)
     await reg._render(task, events.TurnComplete("resumed"))
@@ -991,14 +991,15 @@ async def test_native_progress_rotation_replaces_and_deletes_old_stream(in_memor
     task, _ = await _task(reg, root="1000.rotate")
     await reg._render(task, events.TurnStarted("prompt-rotate"))
     task.progress_lines.append("✓ Bash: checking services")
-    task.progress_answer = "partial answer"
+    await reg._render(task, events.AssistantText("partial answer"))
 
     assert await reg._rotate_progress_stream(task)
     assert task.progress_stream_ts == "stream-2"
     assert len(bot.stream_starts) == 2
     replacement = bot.stream_starts[-1]["chunks"]
     assert any(chunk.get("id") == "activity" for chunk in replacement)
-    assert any(chunk.get("type") == "markdown_text" and chunk.get("text") == "partial answer" for chunk in replacement)
+    assert not any(chunk.get("type") == "markdown_text" for chunk in replacement)
+    assert [post["text"] for post in bot.posts] == ["partial answer"]
     assert bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
     assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": "stream-1"}]
     await reg._render(task, events.TurnComplete("prompt-rotate"))
@@ -1028,12 +1029,11 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert start["task_display_mode"] == "timeline"
     # Native agent-session status supplies the working state and Stop button.
     assert start["chunks"] is None
-    # Prior tool activity already streamed this turn, so the text block gets a
-    # leading paragraph break to avoid rendering glued onto that activity.
-    assert any(
-        call["chunks"] == [{"type": "markdown_text", "text": "\u200b\n\nfinal answer"}]
-        and call["markdown_text"] is None
-        for call in rich_bot.stream_appends
+    # Prose is isolated from task_update chunks in one ordinary message.
+    assert [post["text"] for post in rich_bot.posts] == ["final answer"]
+    assert not any(
+        chunk.get("type") == "markdown_text"
+        for call in rich_bot.stream_appends for chunk in (call.get("chunks") or [])
     )
     task_chunks = [call["chunks"][0] for call in rich_bot.stream_appends if call["chunks"]]
     activity_chunks = [chunk for chunk in task_chunks if chunk["type"] == "task_update" and chunk["id"] == "activity"]
@@ -1046,14 +1046,13 @@ async def test_rich_progress_stream_lifecycle_and_assistant_output_once(in_memor
     assert len(rich_bot.stream_stops) == 1
     assert rich_bot.stream_stops[0]["channel_id"] == task.channel_id
     assert rich_bot.stream_stops[0]["stream_ts"] == "stream-1"
-    feedback = rich_bot.stream_stops[0]["blocks"][0]["elements"][0]
-    assert feedback["type"] == "feedback_buttons"
-    assert feedback["action_id"] == "task.feedback"
+    assert rich_bot.stream_stops[0]["blocks"] is None
+    assert {deletion["message_ts"] for deletion in rich_bot.deletions} == {"stream-1"}
     assert rich_bot.statuses == [
         {"channel_id": task.channel_id, "thread_ts": task.root_ts, "status": "processing"},
         {"channel_id": task.channel_id, "thread_ts": task.root_ts, "status": "active"},
     ]
-    assert not any(post.get("text") == "final answer" for post in rich_bot.posts)
+    assert sum(post.get("text") == "final answer" for post in rich_bot.posts) == 1
     assert task.progress_stream_ts is None and task.progress_started is False
     assert task.progress_keepalive is None
 
@@ -1121,17 +1120,15 @@ async def test_assistant_text_gets_paragraph_break_after_prior_activity(in_memor
     await reg._render(task, events.TurnComplete("prompt-glue"))
 
     assert task.progress_answer == (
-        "\n\nGoal persistence was not enabled.\n\nThe worktree is ready."
+        "Goal persistence was not enabled.\n\nThe worktree is ready."
     )
-    text_chunks = [
-        call["chunks"][0]["text"]
-        for call in rich_bot.stream_appends
-        if call["chunks"] and call["chunks"][0]["type"] == "markdown_text"
-    ]
-    assert text_chunks == [
-        "\u200b\n\nGoal persistence was not enabled.",
-        "\u200b\n\nThe worktree is ready.",
-    ]
+    assert not any(
+        chunk.get("type") == "markdown_text"
+        for call in rich_bot.stream_appends for chunk in (call.get("chunks") or [])
+    )
+    assert [post["text"] for post in rich_bot.posts] == ["Goal persistence was not enabled."]
+    answer_edits = [edit for edit in rich_bot.edits if edit.get("message_ts") == task.progress_answer_ts]
+    assert answer_edits[-1]["text"] == task.progress_answer
 
 
 @pytest.mark.asyncio
@@ -1495,14 +1492,15 @@ async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db
     reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
     task, _ = await _task(reg, root="1000.degrade")
     await reg._render(task, events.TurnStarted("prompt-degrade"))
+    await reg._render(task, events.ToolLine("✓ Bash: trigger degraded stream"))
     await reg._render(task, events.AssistantText("answer after degradation"))
 
     assert bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
     assert task.progress_stream_ts is None
     assert task.progress_fallback_ts == "stream-1"
     assert any(edit["message_ts"] == "stream-1" and edit["blocks"] for edit in bot.edits)
-    assert not any(post.get("text") == "answer after degradation" for post in bot.posts)
-    assert any("answer after degradation" in str(edit.get("text")) for edit in bot.edits)
+    assert [post.get("text") for post in bot.posts] == ["answer after degradation"]
+    assert not any("answer after degradation" in str(edit.get("text")) for edit in bot.edits)
 
     await reg._render(task, events.TurnComplete("prompt-degrade"))
     assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": "stream-1"}]
@@ -1754,7 +1752,7 @@ class TestAC8DaemonRendering:
         await reg._render(task, events.SubagentActivity("h1", "reading"))
         await reg._render(task, events.SubagentCompleted("h1", "success", None, "ok"))
         assert task.subagent_blocks["h1"].result_summary == "ok"
-        assert any("done" in edit.get("text", "") for edit in bot.edits)
+        assert any("done" in post.get("text", "") for post in bot.posts)
         assert any("Bash: ls" in edit.get("text", "") for edit in bot.edits)
         assert any(post.get("blocks") for post in bot.posts)
         assert bot.edits and bot.edits[-1]["blocks"]
