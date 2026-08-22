@@ -499,6 +499,26 @@ def _summary_fingerprint(text: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _commonmark_to_slack_mrkdwn(text: str) -> str:
+    """Translate the common model-output subset when Markdown blocks are too large."""
+    rendered: list[str] = []
+    in_fence = False
+    for line in str(text).splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            rendered.append(line)
+            continue
+        if in_fence:
+            rendered.append(line)
+            continue
+        line = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", line)
+        line = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"<\2|\1>", line)
+        line = re.sub(r"\*\*(.+?)\*\*", r"*\1*", line)
+        line = re.sub(r"__(.+?)__", r"*\1*", line)
+        rendered.append(line)
+    return "\n".join(rendered)
+
+
 def _parse_attach_markers(text: str) -> tuple[str, list[Path]]:
     paths: list[Path] = []
     for match in ATTACH_MARKER.finditer(text):
@@ -1264,6 +1284,18 @@ class TaskRegistry:
     async def _post(self, task: Task, text: str, *, blocks: list[dict[str, Any]] | None = None) -> list[str]:
         return await self._require_bot().post(text, channel_id=task.channel_id, root_ts=task.root_ts, blocks=blocks)
 
+    async def _post_assistant_markdown(self, task: Task, text: str) -> list[str]:
+        value = str(text)
+        if len(value) <= 12_000:
+            return await self._require_bot().post(
+                value,
+                channel_id=task.channel_id,
+                root_ts=task.root_ts,
+                blocks=[{"type": "markdown", "text": value}],
+                fallback_text=value,
+            )
+        return await self._post(task, _commonmark_to_slack_mrkdwn(value))
+
     async def _post_assistant_text(self, task: Task, text: str) -> None:
         cleaned, paths = _parse_attach_markers(text)
         if paths:
@@ -1271,7 +1303,7 @@ class TaskRegistry:
                 [str(path) for path in paths], channel_id=task.channel_id, root_ts=task.root_ts, text=cleaned
             )
         elif cleaned:
-            await self._post(task, cleaned)
+            await self._post_assistant_markdown(task, cleaned)
 
     @staticmethod
     def _progress_identifier(value: str) -> str:
@@ -1293,16 +1325,6 @@ class TaskRegistry:
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body[:2900]}"}},
         ]
-        if task.progress_answer and task.progress_answer_ts is None:
-            # Keep prose above the compact status footer. Slack renders adjacent
-            # context→section blocks with almost no visual gap, which produced
-            # the literal-looking "100 updatesI’m resuming…" failure whenever a
-            # native stream degraded to this fallback card.
-            blocks.append({
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": task.progress_answer[-2900:]},
-            })
-            fallback = f"{fallback}\n\n{task.progress_answer}"[:2900]
         blocks.append({
             "type": "context",
             "elements": [{"type": "mrkdwn", "text": f"{state} · {len(task.progress_lines)} updates"}],
@@ -1625,23 +1647,13 @@ class TaskRegistry:
         if cleaned:
             if task.progress_answer:
                 cleaned = "\n\n" + cleaned
-            # Native task streams have a substantially lower accumulated-text
-            # ceiling than ordinary Slack messages and can split prose without
-            # respecting Markdown boundaries. Keep progress in the native stream,
-            # but render the answer in one ordinary message that is edited as new
-            # assistant blocks arrive.
+            # Native streams split long prose, while Slack's agent-view message
+            # surface rejects growing chat.update payloads well below the normal
+            # chat.postMessage limit. Buffer the answer and publish it exactly once
+            # at TurnComplete; progress remains visible through the task stream.
             task.progress_answer = (task.progress_answer + cleaned)[-32000:]
-            if task.progress_answer_ts is None:
-                sent = await self._post(task, task.progress_answer)
-                task.progress_answer_ts = sent[0] if sent else None
-            else:
-                await self._require_bot().edit_message(
-                    task.channel_id, task.progress_answer_ts,
-                    text=task.progress_answer, blocks=None,
-                )
             task.progress_any_content = True
         if task.progress_fallback_ts is not None:
-            # Once prose has its own message, keep the fallback card progress-only.
             await self._update_fallback_progress(task)
         if paths:
             await self._require_bot().post_with_attachments(
@@ -3198,9 +3210,7 @@ class TaskRegistry:
                     try:
                         completed_stream_ts = task.progress_stream_ts
                         if outcome == "complete":
-                            final_blocks = None if task.progress_answer_ts else (
-                                self._source_blocks(task.progress_answer) + self._feedback_blocks(task)
-                            )
+                            final_blocks = None if task.progress_answer else self._feedback_blocks(task)
                             result = stopper(
                                 task.channel_id, completed_stream_ts, blocks=final_blocks,
                             )
@@ -3208,7 +3218,7 @@ class TaskRegistry:
                             result = stopper(task.channel_id, completed_stream_ts)
                         if inspect.isawaitable(result):
                             await result
-                        if outcome == "complete" and task.progress_answer_ts:
+                        if outcome == "complete" and task.progress_answer:
                             deleter = getattr(self._require_bot(), "delete_message", None)
                             if callable(deleter):
                                 with contextlib.suppress(Exception):
@@ -3264,7 +3274,8 @@ class TaskRegistry:
                                     "completed fallback compaction failed: %s",
                                     safe_error(exc, "progress compaction failed"),
                                 )
-                        await self._post(task, task.progress_answer)
+                        sent = await self._post_assistant_markdown(task, task.progress_answer)
+                        task.progress_answer_ts = sent[0] if sent else None
                     else:
                         deleter = getattr(self._require_bot(), "delete_message", None)
                         if callable(deleter):
@@ -3275,6 +3286,9 @@ class TaskRegistry:
                     task.progress_fallback_ts = None
                 else:
                     await self._update_fallback_progress(task, outcome=outcome)
+            if outcome == "complete" and task.progress_answer and task.progress_answer_ts is None:
+                sent = await self._post_assistant_markdown(task, task.progress_answer)
+                task.progress_answer_ts = sent[0] if sent else None
             await self._set_agent_status(task, "active")
             task.progress_started = False
             # Stream failures degrade only this turn. Slack capability and

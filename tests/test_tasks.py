@@ -152,10 +152,10 @@ class FakeBot:
     fail_root: bool = False
     _message_seq: int = 0
 
-    async def post(self, text: str, channel_id: str, root_ts=None, blocks=None):
+    async def post(self, text: str, channel_id: str, root_ts=None, blocks=None, fallback_text=None):
         self._message_seq += 1
         ts = f"m{self._message_seq}"
-        self.posts.append({"text": text, "channel_id": channel_id, "root_ts": root_ts, "blocks": blocks, "ts": ts})
+        self.posts.append({"text": text, "channel_id": channel_id, "root_ts": root_ts, "blocks": blocks, "fallback_text": fallback_text, "ts": ts})
         return [ts]
 
     async def edit_message(self, channel_id: str, message_ts: str, *, text=None, blocks=None, content=None):
@@ -851,12 +851,13 @@ async def test_resumed_activity_reconstructs_one_native_progress_surface(in_memo
     await reg._render(task, events.AttentionPing("review completed"))
 
     assert len(bot.stream_starts) == 1
-    assert [post["text"] for post in bot.posts] == ["review is still running"]
+    assert bot.posts == []
     task_chunks = [call["chunks"][0] for call in bot.stream_appends if call.get("chunks")]
     assert not any(chunk.get("type") == "markdown_text" for chunk in task_chunks)
     assert any(chunk.get("id") == "activity" for chunk in task_chunks)
     assert any(chunk.get("id") == "background-job" for chunk in task_chunks)
     await reg._render(task, events.TurnComplete("resumed"))
+    assert [post["text"] for post in bot.posts] == ["review is still running"]
 
 
 @pytest.mark.asyncio
@@ -999,10 +1000,11 @@ async def test_native_progress_rotation_replaces_and_deletes_old_stream(in_memor
     replacement = bot.stream_starts[-1]["chunks"]
     assert any(chunk.get("id") == "activity" for chunk in replacement)
     assert not any(chunk.get("type") == "markdown_text" for chunk in replacement)
-    assert [post["text"] for post in bot.posts] == ["partial answer"]
+    assert bot.posts == []
     assert bot.stream_stops == [{"channel_id": task.channel_id, "stream_ts": "stream-1"}]
     assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": "stream-1"}]
     await reg._render(task, events.TurnComplete("prompt-rotate"))
+    assert [post["text"] for post in bot.posts] == ["partial answer"]
     assert task.progress_keepalive is None
 
 
@@ -1084,7 +1086,7 @@ async def test_subagent_activity_burst_is_coalesced_before_native_stream_exhaust
 
 
 @pytest.mark.asyncio
-async def test_fallback_progress_places_answer_before_status_footer(in_memory_db):
+async def test_fallback_progress_remains_progress_only_while_answer_is_buffered(in_memory_db):
     task = Task(
         task_id="fallback-order", team_id="T1", channel_id="C1", cwd="/tmp",
         root_ts="1000.fallback-order", owner_user_id="UOWNER", mode="thread",
@@ -1094,9 +1096,9 @@ async def test_fallback_progress_places_answer_before_status_footer(in_memory_db
 
     _, blocks = TaskRegistry._progress_blocks(task)
 
-    assert [block["type"] for block in blocks] == ["section", "section", "context"]
-    assert blocks[1]["text"]["text"] == task.progress_answer
-    assert "2 updates" in blocks[2]["elements"][0]["text"]
+    assert [block["type"] for block in blocks] == ["section", "context"]
+    assert task.progress_answer not in str(blocks)
+    assert "2 updates" in blocks[1]["elements"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -1126,9 +1128,8 @@ async def test_assistant_text_gets_paragraph_break_after_prior_activity(in_memor
         chunk.get("type") == "markdown_text"
         for call in rich_bot.stream_appends for chunk in (call.get("chunks") or [])
     )
-    assert [post["text"] for post in rich_bot.posts] == ["Goal persistence was not enabled."]
-    answer_edits = [edit for edit in rich_bot.edits if edit.get("message_ts") == task.progress_answer_ts]
-    assert answer_edits[-1]["text"] == task.progress_answer
+    assert [post["text"] for post in rich_bot.posts] == [task.progress_answer]
+    assert not any(edit.get("message_ts") == task.progress_answer_ts for edit in rich_bot.edits)
 
 
 @pytest.mark.asyncio
@@ -1143,6 +1144,38 @@ async def test_assistant_text_first_block_has_no_leading_separator(in_memory_db)
     await reg._render(task, events.TurnComplete("prompt-no-glue"))
 
     assert task.progress_answer == "Hello there."
+
+
+@pytest.mark.asyncio
+async def test_completed_answer_uses_standard_markdown_block(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.markdown")
+    answer = "## Schema compatibility\n\n**Yes**, with one qualification."
+
+    await reg._render(task, events.TurnStarted("prompt-markdown"))
+    await reg._render(task, events.AssistantText(answer))
+    assert bot.posts == []
+    await reg._render(task, events.TurnComplete("prompt-markdown"))
+
+    assert bot.posts[-1]["blocks"] == [{"type": "markdown", "text": answer}]
+    assert bot.posts[-1]["fallback_text"] == answer
+
+
+@pytest.mark.asyncio
+async def test_oversized_markdown_answer_uses_single_mrkdwn_message(in_memory_db):
+    bot = RichFakeBot()
+    reg = TaskRegistry(in_memory_db, bot, FakeSupervisor())
+    task, _ = await _task(reg, root="1000.large-markdown")
+    answer = "## Heading\n\n**bold**\n\n" + ("x" * 12_050)
+
+    await reg._render(task, events.TurnStarted("prompt-large-markdown"))
+    await reg._render(task, events.AssistantText(answer))
+    await reg._render(task, events.TurnComplete("prompt-large-markdown"))
+
+    assert len(bot.posts) == 1
+    assert bot.posts[0]["blocks"] is None
+    assert bot.posts[0]["text"].startswith("*Heading*\n\n*bold*")
 
 
 @pytest.mark.asyncio
@@ -1499,7 +1532,7 @@ async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db
     assert task.progress_stream_ts is None
     assert task.progress_fallback_ts == "stream-1"
     assert any(edit["message_ts"] == "stream-1" and edit["blocks"] for edit in bot.edits)
-    assert [post.get("text") for post in bot.posts] == ["answer after degradation"]
+    assert bot.posts == []
     assert not any("answer after degradation" in str(edit.get("text")) for edit in bot.edits)
 
     await reg._render(task, events.TurnComplete("prompt-degrade"))
