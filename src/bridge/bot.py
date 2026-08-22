@@ -38,7 +38,10 @@ except ImportError:  # pragma: no cover - import-time compatibility
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
-MAX_CHUNK = 1900
+# Slack accepts ordinary message text up to 40,000 characters. Keep headroom for
+# provider-side normalization while avoiding the old Discord-sized 1,900-char
+# splits that fragmented otherwise valid answers across many Slack messages.
+MAX_CHUNK = 35_000
 MAX_PRIVATE_DOWNLOAD_BYTES = int(os.environ.get("BRIDGE_MAX_PRIVATE_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
 MAX_UPLOAD_BYTES = int(os.environ.get("BRIDGE_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
 MAX_UPLOAD_AGGREGATE_BYTES = int(os.environ.get("BRIDGE_MAX_UPLOAD_AGGREGATE_BYTES", str(2 * 1024 * 1024 * 1024)))

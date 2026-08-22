@@ -796,7 +796,7 @@ async def test_turn_status_fallback_is_one_editable_block_and_no_legacy_working_
 
 
 @pytest.mark.asyncio
-async def test_long_fallback_answer_uses_small_update_and_threaded_continuations(in_memory_db):
+async def test_long_fallback_answer_is_recovered_as_one_normal_slack_message(in_memory_db):
     reg, bot = _registry(in_memory_db)
     task, _ = await _task(reg, root="1000.long-fallback")
     answer = "x" * 7000
@@ -805,14 +805,9 @@ async def test_long_fallback_answer_uses_small_update_and_threaded_continuations
     await reg._render(task, events.AssistantText(answer))
     await reg._render(task, events.TurnComplete("prompt-long"))
 
-    final_edit = [edit for edit in bot.edits if edit["message_ts"] == working_ts and edit.get("blocks")][-1]
-    assert len(final_edit["blocks"]) == 2
-    assert final_edit["blocks"][0]["type"] == "section"
-    assert final_edit["blocks"][1]["type"] == "context_actions"
-    assert final_edit["blocks"][1]["elements"][0]["type"] == "feedback_buttons"
-    assert len(final_edit["text"]) <= 2800
-    continuations = [post["text"] for post in bot.posts[1:]]
-    assert "".join([final_edit["text"], *continuations]) == answer
+    assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": working_ts}]
+    recovered_answers = [post["text"] for post in bot.posts[1:]]
+    assert recovered_answers == [answer]
     assert task.progress_started is False and task.progress_fallback_ts is None
 
 
@@ -1510,8 +1505,8 @@ async def test_stream_append_failure_stops_before_in_place_fallback(in_memory_db
     assert any("answer after degradation" in str(edit.get("text")) for edit in bot.edits)
 
     await reg._render(task, events.TurnComplete("prompt-degrade"))
-    assert "answer after degradation" in bot.edits[-1]["text"]
-    assert all("Agent working" not in str(block) for block in bot.edits[-1]["blocks"])
+    assert bot.deletions == [{"channel_id": task.channel_id, "message_ts": "stream-1"}]
+    assert [post["text"] for post in bot.posts] == ["answer after degradation"]
     assert task.progress_stream_disabled is False
     await reg._render(task, events.TurnStarted("prompt-retry"))
     assert len(bot.stream_starts) == 2

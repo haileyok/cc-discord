@@ -1643,7 +1643,10 @@ class TaskRegistry:
                 # stored/final answer.
                 stream_text = "\u200b\n\n" + cleaned
                 cleaned = "\n\n" + cleaned
-            task.progress_answer = (task.progress_answer + cleaned)[-12000:]
+            # Preserve enough text to recover the complete answer as one normal
+            # Slack message if the native stream later degrades. This remains
+            # below Bot's conservative 35k ordinary-message ceiling.
+            task.progress_answer = (task.progress_answer + cleaned)[-32000:]
             task.progress_any_content = True
         chunks = self._progress_chunk_text(stream_text)
         for chunk in chunks:
@@ -3231,30 +3234,37 @@ class TaskRegistry:
             if task.progress_fallback_ts is not None:
                 if outcome == "complete":
                     if task.progress_answer:
-                        # Converted stream messages have a lower practical
-                        # chat.update payload ceiling than ordinary messages.
-                        # Keep the edited card small and continue long answers
-                        # as normal threaded replies instead of losing TurnComplete.
-                        answer_chunks = self._progress_chunk_text(task.progress_answer, 2800)
-                        first = answer_chunks[0]
-                        edited = False
-                        try:
-                            await self._require_bot().edit_message(
-                                task.channel_id, task.progress_fallback_ts,
-                                text=first,
-                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": first}}] + self._source_blocks(task.progress_answer) + self._feedback_blocks(task),
-                            )
-                            edited = True
-                        except Exception as exc:
-                            code = slack_error_code(exc)
-                            log.warning(
-                                "final fallback update failed%s: %s",
-                                f" ({code})" if code else "",
-                                safe_error(exc, "final answer update failed"),
-                            )
-                        for chunk in answer_chunks[1 if edited else 0:]:
-                            with contextlib.suppress(Exception):
-                                await self._post(task, chunk)
+                        # A converted stream has a much lower practical update
+                        # ceiling than an ordinary Slack message. Remove the
+                        # temporary progress card and publish the recovered answer
+                        # normally; Bot.post only splits above 35k and prefers
+                        # newline boundaries. The old 2,800-char slicing broke
+                        # Markdown and even split commands in half.
+                        removed = False
+                        deleter = getattr(self._require_bot(), "delete_message", None)
+                        if callable(deleter):
+                            try:
+                                result = deleter(task.channel_id, task.progress_fallback_ts)
+                                if inspect.isawaitable(result):
+                                    await result
+                                removed = True
+                            except Exception as exc:
+                                log.warning(
+                                    "completed fallback cleanup failed: %s",
+                                    safe_error(exc, "progress cleanup failed"),
+                                )
+                        if not removed:
+                            try:
+                                await self._require_bot().edit_message(
+                                    task.channel_id, task.progress_fallback_ts,
+                                    text="✅ Ready — final answer follows below.", blocks=None,
+                                )
+                            except Exception as exc:
+                                log.warning(
+                                    "completed fallback compaction failed: %s",
+                                    safe_error(exc, "progress compaction failed"),
+                                )
+                        await self._post(task, task.progress_answer)
                     else:
                         deleter = getattr(self._require_bot(), "delete_message", None)
                         if callable(deleter):

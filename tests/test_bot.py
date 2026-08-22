@@ -61,6 +61,7 @@ class TestTextHelpers:
         assert _chunk("") == [""]
         assert _chunk("a" * MAX_CHUNK) == ["a" * MAX_CHUNK]
         chunks = _chunk("a" * 5000)
+        assert chunks == ["a" * 5000]
         assert all(len(item) <= MAX_CHUNK for item in chunks)
         assert "".join(chunks) == "a" * 5000
 
