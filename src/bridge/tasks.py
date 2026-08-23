@@ -3097,6 +3097,16 @@ class TaskRegistry:
         await self._post(task, "🛑 Current turn stopped. The session remains ready.")
         return True
 
+    async def cancel_turn(self, task_id: str, owner_user_id: str | SlackActor) -> bool:
+        """Cancel only the active turn while keeping the durable task session alive."""
+        task = self._require_task(task_id, owner_user_id)
+        return await self.handle_agent_session_stopped({
+            "team_id": task.team_id,
+            "channel_id": task.channel_id,
+            "root_ts": task.root_ts,
+            "actor_id": task.owner_user_id,
+        })
+
     async def stop_task(self, task_id: str, owner_user_id: str | SlackActor, *, timeout: float = 5.0) -> bool:
         task = self._require_task(task_id, owner_user_id)
         if task.status not in {"running", "spawning", "paused"}:

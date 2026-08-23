@@ -63,6 +63,12 @@ async def bridge_compact_task(task_id: str) -> dict[str, Any]:
 
 
 @server.tool()
+async def bridge_cancel_turn(task_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Cancel only the active turn and preserve its task session. Requires confirm=true."""
+    return await _rpc("bridge_cancel_turn", {"task_id": task_id, "confirm": confirm})
+
+
+@server.tool()
 async def bridge_set_model(task_id: str, model: str, reasoning_effort: str | None = None) -> dict[str, Any]:
     """Set the active model and optional reasoning effort for one owned task."""
     return await _rpc("bridge_set_model", {"task_id": task_id, "model": model, "reasoning_effort": reasoning_effort})

@@ -101,6 +101,9 @@ class Registry:
     async def request_compaction(self, task_id, *, owner_user_id):
         self.calls.append(("compact", task_id, owner_user_id)); return "queued"
 
+    async def cancel_turn(self, task_id, owner_user_id):
+        self.calls.append(("cancel_turn", task_id, owner_user_id)); return True
+
     async def set_model(self, task_id, model, *, owner_user_id, reasoning_effort=None):
         self.calls.append(("model", task_id, model, owner_user_id, reasoning_effort))
 
@@ -157,6 +160,22 @@ async def test_destructive_actions_require_capability_and_confirmation(facade):
     result = await facade.call("bridge_stop_task", {"task_id": "task-1", "confirm": True}, ctx(McpCapability.DESTRUCTIVE, request="stop-2"))
     assert result["result"]["stopped"] is True
     assert facade.registry.calls[-1] == ("stop", "task-1", "UOWNER")
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_requires_confirmation_and_preserves_session(facade):
+    control = ctx(McpCapability.CONTROL)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call("bridge_cancel_turn", {"task_id": "task-1"}, control)
+    assert missing.value.code == "confirmation_required"
+    result = await facade.call(
+        "bridge_cancel_turn", {"task_id": "task-1", "confirm": True},
+        ctx(McpCapability.CONTROL, request="cancel-2"),
+    )
+    assert result["result"] == {
+        "task_id": "task-1", "cancelled": True, "session_preserved": True,
+    }
+    assert facade.registry.calls[-1] == ("cancel_turn", "task-1", "UOWNER")
 
 
 @pytest.mark.asyncio

@@ -95,6 +95,7 @@ class McpFacade:
         "bridge_list_tasks": (McpCapability.READ, "_list_tasks"),
         "bridge_task_status": (McpCapability.READ, "_task_status"),
         "bridge_compact_task": (McpCapability.CONTROL, "_compact_task"),
+        "bridge_cancel_turn": (McpCapability.CONTROL, "_cancel_turn"),
         "bridge_set_model": (McpCapability.CONTROL, "_set_model"),
         "bridge_set_facet": (McpCapability.CONTROL, "_set_facet"),
         "bridge_set_effort": (McpCapability.CONTROL, "_set_effort"),
@@ -195,7 +196,24 @@ class McpFacade:
 
     @staticmethod
     def _task_summary(task: Any) -> dict[str, Any]:
-        return {"task_id": str(task.task_id), "session_id": str(task.polytoken_session_id) if task.polytoken_session_id else None, "channel_id": str(task.channel_id), "root_ts": str(task.root_ts), "status": str(task.status), "mode": str(task.mode), "last_activity": int(task.last_activity or 0), "turn_active": bool(task.progress_started), "compaction_pending": bool(task.compaction_pending)}
+        active_work = []
+        for handle, block in list(getattr(task, "subagent_blocks", {}).items())[:20]:
+            active_work.append({
+                "handle": str(handle)[:100],
+                "type": str(getattr(block, "attribution", "subagent"))[:100],
+                "status": "complete" if getattr(block, "finished_at", None) else "running",
+                "recent_activity": [str(line)[:300] for line in list(getattr(block, "actions", []))[-5:]],
+            })
+        return {
+            "task_id": str(task.task_id),
+            "session_id": str(task.polytoken_session_id) if task.polytoken_session_id else None,
+            "channel_id": str(task.channel_id), "root_ts": str(task.root_ts),
+            "status": str(task.status), "mode": str(task.mode),
+            "last_activity": int(task.last_activity or 0),
+            "turn_active": bool(task.progress_started),
+            "compaction_pending": bool(task.compaction_pending),
+            "active_work": active_work,
+        }
 
     @staticmethod
     def _safe_state(state: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -228,6 +246,14 @@ class McpFacade:
         self._owned_task(ctx, task_id)
         outcome = await self.registry.request_compaction(task_id, owner_user_id=ctx.owner_user_id)
         return {"task_id": task_id, "outcome": outcome}
+
+    async def _cancel_turn(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        if args.get("confirm") is not True:
+            raise McpApiError("confirmation_required", "cancel_turn requires confirm=true")
+        self._owned_task(ctx, task_id)
+        cancelled = await self.registry.cancel_turn(task_id, ctx.owner_user_id)
+        return {"task_id": task_id, "cancelled": bool(cancelled), "session_preserved": True}
 
     async def _set_model(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); model = self._text(args, "model", limit=200)
