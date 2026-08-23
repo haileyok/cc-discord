@@ -6,8 +6,10 @@ import contextlib
 import inspect
 import json
 import logging
+import secrets as stdlib_secrets
 import signal
 import time
+import uuid
 from typing import Any, Callable, Mapping
 
 from aiohttp import web
@@ -17,6 +19,8 @@ from bridge import tasks as tasks_module
 from bridge.bot import Bot
 from bridge.commands import CommandDispatcher, build_dispatcher
 from bridge.daemon_supervisor import DaemonSupervisor
+from bridge.mcp_api import McpApiError, McpCapability, McpContext, McpFacade
+from bridge.mcp_auth import load_or_create_mcp_token
 from bridge.secrets import Secrets
 from bridge.redaction import safe_error
 from bridge.tasks import TaskRegistry
@@ -26,6 +30,10 @@ log = logging.getLogger(__name__)
 BOT_KEY: web.AppKey[Any] = web.AppKey("bot", object)
 TASK_REGISTRY_KEY: web.AppKey[Any] = web.AppKey("task_registry", object)
 STARTED_AT_KEY: web.AppKey[float] = web.AppKey("started_at", float)
+MCP_FACADE_KEY: web.AppKey[Any] = web.AppKey("mcp_facade", object)
+MCP_TOKEN_KEY: web.AppKey[str] = web.AppKey("mcp_token", str)
+MCP_CAPABILITIES_KEY: web.AppKey[Any] = web.AppKey("mcp_capabilities", object)
+MCP_MAX_REQUEST_BYTES = 64 * 1024
 
 
 def _value(source: Any, *names: str, default: Any = None) -> Any:
@@ -80,6 +88,36 @@ async def _handle_health(request: web.Request) -> web.Response:
     response.setdefault("bot_user_id", getattr(bot, "bot_user_id", None))
     response["uptime_secs"] = max(0, int(time.monotonic() - started_at))
     return web.Response(text=json.dumps(response), content_type="application/json")
+
+
+async def _handle_mcp_call(request: web.Request) -> web.Response:
+    """Authenticated private RPC used only by the local stdio MCP process."""
+    if request.content_length is not None and request.content_length > MCP_MAX_REQUEST_BYTES:
+        return web.json_response({"ok": False, "error": {"code": "request_too_large", "message": "MCP request body is too large", "retryable": False}}, status=413)
+    authorization = request.headers.get("Authorization", "")
+    expected = f"Bearer {request.app[MCP_TOKEN_KEY]}"
+    if not stdlib_secrets.compare_digest(authorization, expected):
+        return web.json_response({"ok": False, "error": {"code": "unauthorized", "message": "MCP authentication failed", "retryable": False}}, status=401)
+    try:
+        payload = await request.json(loads=json.loads)
+    except (json.JSONDecodeError, UnicodeError, ValueError):
+        return web.json_response({"ok": False, "error": {"code": "invalid_json", "message": "MCP request must be valid JSON", "retryable": False}}, status=400)
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("arguments", {}), Mapping):
+        return web.json_response({"ok": False, "error": {"code": "invalid_arguments", "message": "MCP request shape is invalid", "retryable": False}}, status=400)
+    facade: McpFacade = request.app[MCP_FACADE_KEY]
+    request_id = str(payload.get("request_id") or request.headers.get("Idempotency-Key") or uuid.uuid4())[:200]
+    context = McpContext(
+        owner_user_id=facade.owner_user_id,
+        team_id=facade.team_id,
+        request_id=request_id,
+        capabilities=request.app[MCP_CAPABILITIES_KEY],
+    )
+    try:
+        response = await facade.call(str(payload.get("tool") or ""), payload.get("arguments") or {}, context)
+    except McpApiError as exc:
+        status = {"forbidden": 403, "capability_denied": 403, "task_not_found": 404, "rate_limited": 429}.get(exc.code, 400)
+        return web.json_response(exc.as_dict(), status=status)
+    return web.json_response(response)
 
 
 def make_message_dispatcher(task_registry: TaskRegistry) -> Callable[[Any], Any]:
@@ -138,14 +176,22 @@ def make_interaction_dispatcher(dispatcher: CommandDispatcher) -> Callable[[Any]
 
 
 async def build_app(bot: Bot, *, task_registry: TaskRegistry | None = None,
-                    started_at: float | None = None) -> web.Application:
-    """Build the aiohttp health application; no external calls are made."""
-    app = web.Application()
+                    started_at: float | None = None,
+                    mcp_facade: McpFacade | None = None,
+                    mcp_token: str | None = None,
+                    mcp_capabilities: frozenset[McpCapability] | None = None) -> web.Application:
+    """Build the aiohttp health and authenticated private MCP RPC application."""
+    app = web.Application(client_max_size=MCP_MAX_REQUEST_BYTES)
     app[BOT_KEY] = bot
     if task_registry is not None:
         app[TASK_REGISTRY_KEY] = task_registry
     app[STARTED_AT_KEY] = started_at if started_at is not None else time.monotonic()
     app.router.add_get("/v1/health", _handle_health)
+    if mcp_facade is not None and mcp_token:
+        app[MCP_FACADE_KEY] = mcp_facade
+        app[MCP_TOKEN_KEY] = mcp_token
+        app[MCP_CAPABILITIES_KEY] = mcp_capabilities or frozenset(McpCapability)
+        app.router.add_post("/v1/mcp/call", _handle_mcp_call)
     return app
 
 
@@ -212,8 +258,17 @@ async def serve(
         task_registry.bind_bot(bot)
         dispatcher = build_dispatcher(bot, task_registry, load_projects_from_env())
         dispatcher_holder["dispatcher"] = dispatcher
+        mcp_token = load_or_create_mcp_token()
+        mcp_facade = McpFacade(
+            bot=bot,
+            registry=task_registry,
+            owner_user_id=str(_secret(secrets, "owner_user_id", "SLACK_OWNER_USER_ID")),
+            team_id=str(_secret(secrets, "team_id", "SLACK_TEAM_ID")),
+        )
 
-        app = await build_app(bot, task_registry=task_registry)
+        app = await build_app(
+            bot, task_registry=task_registry, mcp_facade=mcp_facade, mcp_token=mcp_token,
+        )
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host, port)

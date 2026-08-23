@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+import pytest
+from mcp import Client
+
+import bridge.mcp_server as mcp_server
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_registers_only_explicit_tools(monkeypatch):
+    calls = []
+
+    async def rpc(tool, arguments):
+        calls.append((tool, arguments))
+        return {"tool": tool, "arguments": arguments}
+
+    monkeypatch.setattr(mcp_server, "_rpc", rpc)
+    async with Client(mcp_server.server) as client:
+        listed = await client.list_tools()
+        names = {tool.name for tool in listed.tools}
+        assert names == {
+            "bridge_health", "bridge_list_tasks", "bridge_task_status",
+            "bridge_compact_task", "bridge_set_model", "bridge_set_facet",
+            "bridge_set_effort", "bridge_stop_task", "bridge_clear_context",
+        }
+        result = await client.call_tool("bridge_task_status", {"task_id": "task-1"})
+        assert result.structured_content == {"tool": "bridge_task_status", "arguments": {"task_id": "task-1"}}
+    assert calls == [("bridge_task_status", {"task_id": "task-1"})]
+
+
+@pytest.mark.asyncio
+async def test_destructive_tool_schema_defaults_confirmation_false(monkeypatch):
+    calls = []
+
+    async def rpc(tool, arguments):
+        calls.append((tool, arguments)); return {"ok": True}
+
+    monkeypatch.setattr(mcp_server, "_rpc", rpc)
+    async with Client(mcp_server.server) as client:
+        await client.call_tool("bridge_stop_task", {"task_id": "task-1"})
+    assert calls == [("bridge_stop_task", {"task_id": "task-1", "confirm": False})]

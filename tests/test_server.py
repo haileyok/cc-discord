@@ -11,6 +11,7 @@ import pytest
 from aiohttp import test_utils
 
 from bridge.bot import Bot
+from bridge.mcp_api import McpCapability
 from bridge.server import build_app, make_interaction_dispatcher, make_message_dispatcher, make_socket_dispatcher
 from bridge.tasks import normalize_message
 import bridge.server as server_module
@@ -59,6 +60,55 @@ async def test_health_reports_slack_identity_without_secrets() -> None:
     assert data["home_channel_id"] == "GHOME"
     assert data["bot_user_id"] == "UBOT"
     assert "token" not in json.dumps(data).lower()
+
+
+@pytest.mark.asyncio
+async def test_private_mcp_rpc_requires_auth_and_derives_principal() -> None:
+    class Facade:
+        owner_user_id = "UOWNER"
+        team_id = "T1"
+        calls = []
+
+        async def call(self, tool, arguments, context):
+            self.calls.append((tool, arguments, context))
+            return {"ok": True, "result": {"tool": tool}}
+
+    facade = Facade()
+    app = await build_app(
+        LocalBot(), mcp_facade=facade, mcp_token="private-token",
+        mcp_capabilities=frozenset({McpCapability.READ}),
+    )
+    async with test_utils.TestClient(test_utils.TestServer(app)) as client:
+        denied = await client.post("/v1/mcp/call", json={"tool": "bridge_health", "arguments": {}})
+        assert denied.status == 401
+        response = await client.post(
+            "/v1/mcp/call",
+            headers={"Authorization": "Bearer private-token", "Idempotency-Key": "request-1"},
+            json={"tool": "bridge_health", "arguments": {"owner_user_id": "UOTHER"}},
+        )
+        assert response.status == 200
+        assert (await response.json())["result"]["tool"] == "bridge_health"
+    _, _, context = facade.calls[0]
+    assert context.owner_user_id == "UOWNER"
+    assert context.team_id == "T1"
+    assert context.request_id == "request-1"
+    assert context.capabilities == frozenset({McpCapability.READ})
+
+
+@pytest.mark.asyncio
+async def test_private_mcp_rpc_rejects_bad_shapes_and_large_bodies() -> None:
+    class Facade:
+        owner_user_id = "UOWNER"
+        team_id = "T1"
+    app = await build_app(LocalBot(), mcp_facade=Facade(), mcp_token="private-token")
+    headers = {"Authorization": "Bearer private-token"}
+    async with test_utils.TestClient(test_utils.TestServer(app)) as client:
+        malformed = await client.post("/v1/mcp/call", data="{", headers=headers)
+        assert malformed.status == 400
+        bad_shape = await client.post("/v1/mcp/call", json={"tool": "x", "arguments": []}, headers=headers)
+        assert bad_shape.status == 400
+        too_large = await client.post("/v1/mcp/call", data="x" * (65 * 1024), headers=headers)
+        assert too_large.status == 413
 
 
 @pytest.mark.asyncio

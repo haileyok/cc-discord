@@ -7,11 +7,13 @@ dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.21",
     "click>=8.1",
+    "mcp>=2,<3",
     "slack-sdk>=3.43",
 ]
 
 [project.scripts]
 claude-slack-bridge = "bridge.cli:main"
+claude-slack-mcp = "bridge.mcp_server:main"
 
 [dependency-groups]
 dev = [
