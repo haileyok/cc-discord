@@ -443,6 +443,59 @@ async def test_scheduled_message_rejects_past_and_untracked_ids(facade):
 
 
 @pytest.mark.asyncio
+async def test_reaction_poll_and_approval_are_task_scoped(facade):
+    created = await facade.call(
+        "slack_create_poll",
+        {"task_id": "task-1", "question": "Ship?", "options": ["Yes", "No"]},
+        ctx(McpCapability.WRITE, request="poll-create"),
+    )
+    assert created["result"]["message_ts"] == "1.2"
+    assert facade.bot.calls == [
+        ("post", "*Poll: Ship?*\n:one: Yes\n:two: No", "C1", "1.0"),
+        ("react", "C1", "1.2", "one"),
+        ("react", "C1", "1.2", "two"),
+    ]
+    facade.bot.thread_pages = [{
+        "messages": [{"ts": "1.2", "reactions": [
+            {"name": "one", "count": 3}, {"name": "two", "count": 1},
+        ]}], "response_metadata": {"next_cursor": ""},
+    }]
+    results = await facade.call(
+        "slack_get_poll_results", {"task_id": "task-1", "message_ts": "1.2"},
+        ctx(McpCapability.READ, request="poll-results"),
+    )
+    assert results["result"]["results"] == [
+        {"label": "Yes", "emoji": "one", "votes": 2},
+        {"label": "No", "emoji": "two", "votes": 0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_approval_uses_fixed_approve_reject_options(facade):
+    result = await facade.call(
+        "slack_create_approval", {"task_id": "task-1", "question": "Merge now?"},
+        ctx(McpCapability.WRITE),
+    )
+    assert result["result"]["kind"] == "approval"
+    assert result["result"]["options"] == [
+        {"label": "Approve", "emoji": "white_check_mark"},
+        {"label": "Reject", "emoji": "x"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_rejects_duplicate_or_invalid_emojis(facade):
+    with pytest.raises(McpApiError) as invalid:
+        await facade.call(
+            "slack_create_poll",
+            {"task_id": "task-1", "question": "Pick", "options": ["A", "B"],
+             "emojis": ["same", "same"]},
+            ctx(McpCapability.WRITE),
+        )
+    assert invalid.value.code == "invalid_arguments"
+
+
+@pytest.mark.asyncio
 async def test_message_write_is_task_scoped_and_idempotent(facade):
     write = ctx(McpCapability.WRITE)
     first = await facade.call("slack_post_message", {"task_id": "task-1", "text": "hello"}, write)

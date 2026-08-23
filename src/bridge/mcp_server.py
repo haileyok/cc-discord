@@ -232,6 +232,29 @@ async def slack_cancel_scheduled_message(task_id: str, scheduled_message_id: str
 
 
 @server.tool()
+async def slack_create_poll(task_id: str, question: str, options: list[str],
+                            emojis: list[str] | None = None) -> dict[str, Any]:
+    """Create a reaction-backed poll in an owned task thread."""
+    return await _rpc("slack_create_poll", {
+        "task_id": task_id, "question": question, "options": options, "emojis": emojis,
+    })
+
+
+@server.tool()
+async def slack_create_approval(task_id: str, question: str) -> dict[str, Any]:
+    """Create an Approve/Reject reaction workflow in an owned task thread."""
+    return await _rpc("slack_create_approval", {"task_id": task_id, "question": question})
+
+
+@server.tool()
+async def slack_get_poll_results(task_id: str, message_ts: str) -> dict[str, Any]:
+    """Return aggregate reaction counts for a tracked task poll or approval."""
+    return await _rpc("slack_get_poll_results", {
+        "task_id": task_id, "message_ts": message_ts,
+    })
+
+
+@server.tool()
 async def slack_edit_message(task_id: str, message_ts: str, text: str) -> dict[str, Any]:
     """Edit a bot-authored message within an owned task thread."""
     return await _rpc("slack_edit_message", {"task_id": task_id, "message_ts": message_ts, "text": text})

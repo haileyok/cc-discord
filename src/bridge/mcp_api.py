@@ -91,6 +91,7 @@ class McpFacade:
     _idempotency: dict[str, _CacheEntry] = field(default_factory=dict, init=False, repr=False)
     _canvas_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _scheduled_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _polls: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _TOOLS: dict[str, tuple[McpCapability, str]] = field(default_factory=lambda: {
         "bridge_health": (McpCapability.READ, "_bridge_health"),
         "bridge_list_tasks": (McpCapability.READ, "_list_tasks"),
@@ -119,6 +120,9 @@ class McpFacade:
         "slack_schedule_message": (McpCapability.WRITE, "_schedule_message"),
         "slack_list_scheduled_messages": (McpCapability.READ, "_list_scheduled_messages"),
         "slack_cancel_scheduled_message": (McpCapability.DESTRUCTIVE, "_cancel_scheduled_message"),
+        "slack_create_poll": (McpCapability.WRITE, "_create_poll"),
+        "slack_create_approval": (McpCapability.WRITE, "_create_approval"),
+        "slack_get_poll_results": (McpCapability.READ, "_get_poll_results"),
         "slack_edit_message": (McpCapability.WRITE, "_edit_message"),
         "slack_add_reaction": (McpCapability.WRITE, "_add_reaction"),
         "slack_remove_reaction": (McpCapability.WRITE, "_remove_reaction"),
@@ -691,6 +695,85 @@ class McpFacade:
         self._scheduled_tasks.pop(scheduled_id, None)
         return {"task_id": task_id, "scheduled_message_id": scheduled_id,
                 "cancelled": True}
+
+    @staticmethod
+    def _poll_options(args: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+        raw_options = args.get("options")
+        if not isinstance(raw_options, list) or not 2 <= len(raw_options) <= 10:
+            raise McpApiError("invalid_arguments", "options must contain 2 to 10 labels")
+        options = [str(item).strip() for item in raw_options]
+        if any(not item or len(item) > 200 for item in options):
+            raise McpApiError("invalid_arguments", "poll option labels must be 1 to 200 characters")
+        raw_emojis = args.get("emojis")
+        defaults = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "keycap_ten"]
+        emojis = defaults[:len(options)] if raw_emojis is None else [str(item).strip().strip(":") for item in raw_emojis]
+        if len(emojis) != len(options) or len(set(emojis)) != len(emojis):
+            raise McpApiError("invalid_arguments", "emojis must be unique and match options length")
+        if any(not emoji or len(emoji) > 80 or not all(ch.isalnum() or ch in "_+-" for ch in emoji) for emoji in emojis):
+            raise McpApiError("invalid_arguments", "poll contains an invalid emoji name")
+        return options, emojis
+
+    async def _create_poll_common(self, ctx: McpContext, args: Mapping[str, Any], *, kind: str) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        question = self._text(args, "question", limit=1_000)
+        options, emojis = self._poll_options(args)
+        task = self._owned_task(ctx, task_id)
+        lines = [f"*{kind.title()}: {question}*"]
+        lines.extend(f":{emoji}: {label}" for label, emoji in zip(options, emojis, strict=True))
+        ids = await self.bot.post("\n".join(lines), channel_id=task.channel_id, root_ts=task.root_ts)
+        if not ids:
+            raise McpApiError("poll_create_failed", "Slack did not return a poll message ID")
+        message_ts = str(ids[0])
+        for emoji in emojis:
+            await self.bot.add_reaction(task.channel_id, message_ts, emoji)
+        self._polls[message_ts] = {
+            "task_id": task_id, "question": question, "options": options,
+            "emojis": emojis, "kind": kind,
+        }
+        return {"task_id": task_id, "message_ts": message_ts, "kind": kind,
+                "question": question, "options": [
+                    {"label": label, "emoji": emoji}
+                    for label, emoji in zip(options, emojis, strict=True)
+                ], "created": True}
+
+    async def _create_poll(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        return await self._create_poll_common(ctx, args, kind="poll")
+
+    async def _create_approval(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        values = dict(args)
+        values["options"] = ["Approve", "Reject"]
+        values["emojis"] = ["white_check_mark", "x"]
+        return await self._create_poll_common(ctx, values, kind="approval")
+
+    async def _get_poll_results(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        message_ts = self._text(args, "message_ts", limit=40)
+        task = self._owned_task(ctx, task_id)
+        poll = self._polls.get(message_ts)
+        if poll is None or poll.get("task_id") != task_id:
+            raise McpApiError("poll_not_in_task", "Poll was not created for this task by the current bridge process")
+        cursor: str | None = None
+        message: Mapping[str, Any] | None = None
+        for _ in range(5):
+            page = await self.bot.fetch_thread_replies(task.channel_id, task.root_ts, cursor=cursor, limit=100)
+            message = next((item for item in page.get("messages") or []
+                            if isinstance(item, Mapping) and str(item.get("ts") or "") == message_ts), None)
+            if message is not None:
+                break
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        if message is None:
+            raise McpApiError("poll_not_found", "Tracked poll message is no longer in the task thread")
+        counts = {str(item.get("name") or ""): max(0, int(item.get("count") or 0) - 1)
+                  for item in message.get("reactions") or [] if isinstance(item, Mapping)}
+        results = [
+            {"label": label, "emoji": emoji, "votes": counts.get(emoji, 0)}
+            for label, emoji in zip(poll["options"], poll["emojis"], strict=True)
+        ]
+        return {"task_id": task_id, "message_ts": message_ts,
+                "kind": poll["kind"], "question": poll["question"],
+                "results": results, "bot_seed_reaction_excluded": True}
 
     async def _edit_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)
