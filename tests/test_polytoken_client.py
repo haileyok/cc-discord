@@ -8,14 +8,24 @@ from aiohttp import test_utils, web
 from bridge.polytoken_client import (
     PolytokenClient,
     PolytokenClientError,
+    PolytokenCredentialError,
     PromptDenied,
     SseEnvelope,
     TurnInFlight,
+    load_bearer_token,
 )
 
 
 def _build_stub_app() -> web.Application:
     app = web.Application()
+    app["authorization_headers"] = []
+
+    @web.middleware
+    async def record_authorization(request: web.Request, handler):
+        app["authorization_headers"].append(request.headers.get("Authorization"))
+        return await handler(request)
+
+    app.middlewares.append(record_authorization)
 
     async def prompt(request: web.Request) -> web.Response:
         body = await request.json()
@@ -23,7 +33,7 @@ def _build_stub_app() -> web.Application:
         if mode == "409":
             return web.json_response({"error": "in flight"}, status=409)
         if mode == "422":
-            return web.json_response({"error": "denied"}, status=422)
+            return web.json_response({"prompt_id": "p-denied", "blocked_by_hook": "context-policy", "reason": "sensitive detail"}, status=422)
         return web.json_response(
             {
                 "prompt_id": "p-1",
@@ -45,6 +55,14 @@ def _build_stub_app() -> web.Application:
 
     async def cancel(_request: web.Request) -> web.Response:
         return web.json_response({"status": "cancel_requested"}, status=202)
+
+    async def reload(_request: web.Request) -> web.Response:
+        return web.json_response({"reloaded": ["models", "skills"], "failed": []})
+
+    async def compact(request: web.Request) -> web.Response:
+        assert request.content_type == "application/json"
+        assert await request.json() == {}
+        return web.json_response({"compaction_id": "compact-123"}, status=202)
 
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
@@ -82,9 +100,18 @@ def _build_stub_app() -> web.Application:
     app.router.add_post("/title", title)
     app.router.add_post("/model", model)
     app.router.add_post("/turn/cancel", cancel)
+    app.router.add_post("/reload", reload)
+    app.router.add_post("/compact", compact)
     app.router.add_get("/health", health)
     app.router.add_get("/events", events)
     return app
+
+
+def _credential_file(tmp_path, token: str = "daemon-secret"):
+    path = tmp_path / "credential.json"
+    path.write_text(json.dumps({"version": 1, "kind": "polytoken-daemon-credential", "token": token}), encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 @pytest.fixture
@@ -97,6 +124,17 @@ async def stub_port():
         await server.close()
 
 
+@pytest.fixture
+async def auth_stub():
+    app = _build_stub_app()
+    server = test_utils.TestServer(app)
+    await server.start_server()
+    try:
+        yield server.port, app["authorization_headers"]
+    finally:
+        await server.close()
+
+
 class TestPolytokenClient:
     async def test_prompt_happy_path(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
@@ -104,6 +142,15 @@ class TestPolytokenClient:
         assert accepted.prompt_id == "p-1"
         assert accepted.session_id == "s-1"
         assert accepted.resolved_references == [{"kind": "file", "name": "hello @/tmp/x.txt"}]
+
+    async def test_auth_header_is_sent_to_ordinary_and_sse_requests(self, auth_stub, tmp_path) -> None:
+        port, authorization_headers = auth_stub
+        credential = _credential_file(tmp_path)
+        async with PolytokenClient(port, credential_file_path=credential) as client:
+            await client.state()
+            async for _ in client.stream_events():
+                pass
+        assert authorization_headers == ["Bearer daemon-secret", "Bearer daemon-secret"]
 
     async def test_prompt_max_tool_turns_included(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
@@ -119,8 +166,11 @@ class TestPolytokenClient:
 
     async def test_prompt_422_denied(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
-            with pytest.raises(PromptDenied):
+            with pytest.raises(PromptDenied) as caught:
                 await _prompt_with_header(client, "hi", "422")
+        assert caught.value.code == "hook.context-policy"
+        assert caught.value.body is None
+        assert "sensitive detail" not in str(caught.value)
 
     async def test_state(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
@@ -141,6 +191,16 @@ class TestPolytokenClient:
         async with PolytokenClient(stub_port) as client:
             res = await client.cancel_turn()
         assert res["status"] == "cancel_requested"
+
+    async def test_reload(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            result = await client.reload()
+        assert result == {"reloaded": ["models", "skills"], "failed": []}
+
+    async def test_compact_returns_accepted_operation_id(self, stub_port) -> None:
+        async with PolytokenClient(stub_port) as client:
+            result = await client.compact()
+        assert result == "compact-123"
 
     async def test_health_true(self, stub_port) -> None:
         async with PolytokenClient(stub_port) as client:
@@ -175,6 +235,20 @@ class TestPolytokenClient:
         # subagent_handle is the routing key.
         assert envs[0].subagent_handle is None
         assert envs[1].subagent_handle == "agent-7"
+
+
+def test_load_bearer_token_validates_file_mode_and_schema(tmp_path) -> None:
+    path = _credential_file(tmp_path, "very-secret")
+    assert load_bearer_token(path) == "very-secret"
+    path.chmod(0o644)
+    with pytest.raises(PolytokenCredentialError) as exc:
+        load_bearer_token(path)
+    assert "very-secret" not in str(exc.value)
+
+    path.chmod(0o600)
+    path.write_text(json.dumps({"version": 1, "kind": "wrong", "token": "very-secret"}), encoding="utf-8")
+    with pytest.raises(PolytokenCredentialError):
+        load_bearer_token(path)
 
 
 def test_parse_envelope_bad_json() -> None:

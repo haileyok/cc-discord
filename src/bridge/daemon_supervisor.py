@@ -1,6 +1,6 @@
 """Supervise per-task Polytoken daemon processes via the ``polytoken`` CLI.
 
-The bridge runs one daemon per Discord task. This module owns the process
+The bridge runs one daemon per Slack task. This module owns the process
 side of that: spawning a fresh headless session, listing the live session
 registry, and terminating a session. The HTTP side of a session lives in
 :class:`bridge.polytoken_client.PolytokenClient`.
@@ -12,10 +12,11 @@ is unit-testable without a real ``polytoken`` binary or daemon.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
 from bridge.polytoken_client import PolytokenClient, PolytokenClientError
@@ -27,7 +28,7 @@ _SPAWN_RE = re.compile(r"session_id=(?P<sid>\S+)\s+port=(?P<port>\d+)")
 
 # Subprocess runner contract: (argv) -> (returncode, stdout, stderr).
 Runner = Callable[[list[str]], Awaitable[tuple[int, str, str]]]
-ClientFactory = Callable[[int], PolytokenClient]
+ClientFactory = Callable[..., PolytokenClient]
 
 
 class DaemonSupervisorError(Exception):
@@ -38,17 +39,24 @@ class DaemonSupervisorError(Exception):
 class SpawnResult:
     session_id: str
     port: int
+    credential_file_path: str | None = None
 
 
 @dataclass(frozen=True)
 class SessionInfo:
-    """One row from ``polytoken sessions``."""
+    """One row from ``polytoken sessions --format json``.
+
+    ``credential_file_path`` is the daemon's private bearer-token file.  It is
+    intentionally carried only in runtime objects; task persistence stores the
+    session id and re-discovers this path from the registry on startup.
+    """
 
     session_id: str
     port: int
     pid: int
     started_at: str
     project_path: str
+    credential_file_path: str | None = None
 
 
 async def _default_runner(argv: list[str]) -> tuple[int, str, str]:
@@ -75,7 +83,11 @@ class DaemonSupervisor:
     ) -> None:
         self._binary = binary
         self._runner = runner or _default_runner
-        self._client_factory = client_factory or (lambda port: PolytokenClient(port))
+        self._client_factory = client_factory or (
+            lambda port, credential_file_path=None: PolytokenClient(
+                port, credential_file_path=credential_file_path
+            )
+        )
 
     # -- spawn ------------------------------------------------------------
 
@@ -83,7 +95,9 @@ class DaemonSupervisor:
         """Spawn a fresh headless daemon session rooted at ``cwd``.
 
         Runs ``polytoken --working-dir <cwd> [--config-dir <config_dir>]
-        new --no-attach`` and parses the ``session_id=... port=...`` line.
+        new --no-attach``, parses the ``session_id=... port=...`` line, then
+        re-reads the JSON session registry to discover the private credential
+        file emitted for the new daemon.
         """
         argv = [self._binary, "--working-dir", cwd]
         if config_dir:
@@ -99,25 +113,106 @@ class DaemonSupervisor:
             raise DaemonSupervisorError(
                 f"could not parse session id/port from `polytoken new` output: {out.strip()[:500]!r}"
             )
-        return SpawnResult(session_id=match.group("sid"), port=int(match.group("port")))
+        session_id = match.group("sid")
+        try:
+            info = await self.find_session(session_id)
+            if info is None:
+                raise DaemonSupervisorError(
+                    f"new daemon {session_id!r} was not found in `polytoken sessions --format json`"
+                )
+            if not info.credential_file_path:
+                raise DaemonSupervisorError(
+                    f"new daemon {session_id!r} has no credential file in the session registry"
+                )
+        except Exception:
+            # The daemon already exists once spawn output is parsed. Credential
+            # discovery failures must not leave an unreachable process behind.
+            try:
+                await self.terminate(session_id)
+            except Exception as cleanup_exc:
+                log.warning("failed to clean up partially discovered daemon %s: %s", session_id, type(cleanup_exc).__name__)
+            raise
+        return SpawnResult(
+            session_id=session_id,
+            port=int(match.group("port")),
+            credential_file_path=info.credential_file_path,
+        )
 
     # -- registry ---------------------------------------------------------
 
     async def list_sessions(self) -> list[SessionInfo]:
-        """Parse ``polytoken sessions`` into rows.
+        """Parse the JSON ``polytoken sessions`` registry into rows.
 
         Listing also stale-cleans dead registry entries as a side effect, so
-        the result reflects only live daemons.
+        the result reflects only live daemons.  A one-time fallback to the old
+        human table keeps older Polytoken installations and test doubles
+        usable; 0.6 deployments always take the JSON path above.
         """
-        rc, out, err = await self._runner([self._binary, "sessions"])
-        if rc != 0:
-            raise DaemonSupervisorError(
-                f"`polytoken sessions` exited {rc}: {(err or out).strip()[:500]}"
-            )
-        return self._parse_sessions(out)
+        argv = [self._binary, "sessions", "--format", "json"]
+        rc, out, err = await self._runner(argv)
+        if rc == 0:
+            return self._parse_sessions(out)
+
+        # Polytoken before the JSON registry may reject --format.  Preserve a
+        # narrow compatibility fallback without making the table the primary
+        # contract.
+        legacy_rc, legacy_out, legacy_err = await self._runner([self._binary, "sessions"])
+        if legacy_rc == 0:
+            return self._parse_sessions(legacy_out)
+        raise DaemonSupervisorError(
+            f"`polytoken sessions --format json` exited {rc}: {(err or out).strip()[:500]}"
+        )
 
     @staticmethod
     def _parse_sessions(out: str) -> list[SessionInfo]:
+        """Parse 0.6 JSON rows, with a compatibility parser for old tables."""
+        stripped = out.lstrip()
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError as exc:
+            if stripped.startswith(("[", "{")):
+                raise DaemonSupervisorError(
+                    "`polytoken sessions --format json` returned invalid JSON"
+                ) from exc
+            return DaemonSupervisor._parse_sessions_table(out)
+        if not isinstance(payload, list):
+            raise DaemonSupervisorError("`polytoken sessions --format json` did not return a list")
+
+        rows: list[SessionInfo] = []
+        for item in payload:
+            if not isinstance(item, Mapping):
+                log.warning("skipping non-object `sessions --format json` row")
+                continue
+            try:
+                session_id = str(item["session_id"])
+                port = int(item["port"])
+                pid = int(item["pid"])
+                started_at = str(item["started_at"])
+                project_path = str(item["project_path"])
+            except (KeyError, TypeError, ValueError):
+                log.warning("skipping malformed `sessions --format json` row")
+                continue
+            if not session_id or not project_path:
+                log.warning("skipping incomplete `sessions --format json` row")
+                continue
+            credential = item.get("credential_file_path")
+            if credential is not None and not isinstance(credential, str):
+                log.warning("skipping `sessions --format json` row with invalid credential path")
+                continue
+            rows.append(
+                SessionInfo(
+                    session_id=session_id,
+                    port=port,
+                    pid=pid,
+                    started_at=started_at,
+                    project_path=project_path,
+                    credential_file_path=credential or None,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _parse_sessions_table(out: str) -> list[SessionInfo]:
         rows: list[SessionInfo] = []
         for line in out.splitlines():
             line = line.rstrip()
@@ -191,7 +286,11 @@ class DaemonSupervisor:
         info = await self.find_session(session_id)
         if info is None:
             return False
-        client = self._client_factory(info.port)
+        if info.credential_file_path:
+            client = self._client_factory(info.port, info.credential_file_path)
+        else:
+            # Compatibility with pre-auth test doubles/table registries.
+            client = self._client_factory(info.port)
         try:
             await client.terminate()
         except PolytokenClientError as exc:

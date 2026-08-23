@@ -8,8 +8,12 @@ from bridge.events import (
     AssistantThinking,
     AttentionPing,
     Clarification,
+    CompactionUpdate,
     Confirmation,
+    ContextCleared,
+    GoalProposal,
     ModelError,
+    PlanHandoff,
     Reconcile,
     StateRefresh,
     StatusNote,
@@ -75,6 +79,23 @@ class TestStreaming:
     def test_model_error(self) -> None:
         f = _Feed()
         assert _types(f.send({"type": "model_error", "prompt_id": "p", "error": "boom"})) == [ModelError]
+
+    def test_compaction_lifecycle_and_context_clear(self) -> None:
+        f = _Feed()
+        assert f.send({"type": "compaction_started", "reason": "threshold"}) == [CompactionUpdate("started", "threshold")]
+        assert f.send({"type": "compaction_retry", "reason": "threshold", "attempt": 2, "max_attempts": 3}) == [CompactionUpdate("retry", "threshold", "attempt 2/3")]
+        assert f.send({"type": "compaction_complete", "reason": "threshold", "compaction_id": "compact-123"}) == [
+            CompactionUpdate("complete", "threshold", compaction_id="compact-123")
+        ]
+        assert f.send({"type": "compaction_failed", "error": "secret upstream body"}) == [CompactionUpdate("failed")]
+        assert f.send({"type": "context_cleared"}) == [ContextCleared()]
+
+    def test_duplicate_and_out_of_order_lifecycle_events_are_ignored(self) -> None:
+        f = _Feed()
+        event = {"type": "compaction_complete", "compaction_id": "compact-1"}
+        assert f.send(event, seq=10) == [CompactionUpdate("complete", compaction_id="compact-1")]
+        assert f.send(event, seq=10) == []
+        assert f.send(event, seq=9) == []
 
 
 class TestTools:
@@ -147,6 +168,61 @@ class TestInterrogatives:
         out = f.send({"type": "interrogative", "prompt_id": "p", "interrogative_id": "i3",
                       "question": "sure?", "interrogative_type": "confirmation"})
         assert _types(out) == [Confirmation]
+
+    def test_plan_handoff(self) -> None:
+        """Schema captured live from a real daemon (`polytoken openapi` /
+        `PlanHandoffContext`): interrogative_type `plan_handoff` carries a
+        nested `plan_handoff` object with plan text, target facet, and the
+        daemon's own action_labels copy. This must produce a real,
+        actionable PlanHandoff -- not the generic StatusNote fallback."""
+        f = _Feed()
+        out = f.send({
+            "type": "interrogative", "prompt_id": "p", "interrogative_id": "i1",
+            "question": "Approve plan?", "interrogative_type": "plan_handoff",
+            "plan_handoff": {
+                "plan_path": "/sessions/s/plan-001.md",
+                "display_path": "/sessions/s/plan-001.md",
+                "plan_text": "### Goal\nDo the thing.",
+                "target_facet": "execute",
+                "title": "Approve plan?",
+                "action_labels": {
+                    "implement_new_context": "Implement plan with a new context",
+                    "implement_current_context": "Implement plan within current context",
+                    "cancel": "Refuse (Tab to add feedback)",
+                    "refuse": "Feedback (Shift+Enter/Alt+Enter newline, Ctrl+Up to exit):",
+                },
+            },
+        })
+        assert _types(out) == [PlanHandoff]
+        action = out[0]
+        assert action.interrogative_id == "i1"
+        assert action.plan_text == "### Goal\nDo the thing."
+        assert action.target_facet == "execute"
+        assert action.display_path == "/sessions/s/plan-001.md"
+        assert action.action_labels["implement_new_context"] == "Implement plan with a new context"
+
+    def test_goal_proposal(self) -> None:
+        """Schema captured live from a real daemon (`propose_goal` tool call
+        followed by GET /state.pending_interrogatives): interrogative_type
+        `goal_proposal` carries a nested `goal_proposal` object. This must
+        produce a real, actionable GoalProposal -- not the generic
+        StatusNote fallback."""
+        f = _Feed()
+        out = f.send({
+            "type": "interrogative", "prompt_id": "p", "interrogative_id": "i1",
+            "question": "Accept this goal?", "interrogative_type": "goal_proposal",
+            "goal_proposal": {
+                "proposed_summary": "Throwaway test goal for interrogative schema verification",
+                "title": "Accept this goal?",
+                "action_labels": {"accept": "Accept goal", "reject": "Reject goal"},
+            },
+        })
+        assert _types(out) == [GoalProposal]
+        action = out[0]
+        assert action.interrogative_id == "i1"
+        assert action.proposed_summary == "Throwaway test goal for interrogative schema verification"
+        assert action.proposed_file_path is None
+        assert action.action_labels["accept"] == "Accept goal"
 
     def test_permission_suppressed_under_bypass(self) -> None:
         f = _Feed()

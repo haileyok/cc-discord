@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Code <-> Slack bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# uv tool install . installs claude-slack-bridge under ~/.local/bin.
+ExecStart=%h/.local/bin/claude-slack-bridge serve
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+# Keep Polytoken discoverable under systemd's restricted user PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

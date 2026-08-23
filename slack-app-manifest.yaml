@@ -1,0 +1,75 @@
+display_information:
+  name: "Hailey's Robot"
+  description: Drive trusted Polytoken agent sessions from a private Slack workspace.
+  background_color: "#1f2937"
+features:
+  app_home:
+    # The DM composer is gated by these flags even under agent_view; without
+    # them Slack shows "Sending messages to this app has been turned off".
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  # Irreversible migration: agent_view converts the app's Messages tab into
+  # Slack's agent experience. Channel-thread operation is unaffected.
+  agent_view:
+    agent_description: "Drives trusted Polytoken agent sessions: coding tasks, infra investigation, and long-running background work from Slack threads or DMs."
+    suggested_prompts:
+      - title: "Investigate context"
+        message: "Investigate the Slack context I shared and recommend the next action."
+      - title: "Work on code"
+        message: "Inspect the relevant repository and implement the requested change with tests."
+  bot_user:
+    display_name: "Hailey's Robot"
+    always_online: true
+  slash_commands:
+    - command: /agent
+      description: Start or control a Polytoken agent session
+      usage_hint: "start / stop / list / help"
+      should_escape: false
+  shortcuts:
+    - name: Agent
+      type: global
+      callback_id: agent
+      description: Open claude-slack-bridge agent controls
+    - name: Start agent here
+      type: message
+      callback_id: start_agent_here
+      description: Start a Polytoken agent in the selected message thread
+settings:
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - app_mention
+      - app_home_opened
+      - app_context_changed
+      - agent_session_stopped
+  incoming_webhooks:
+    incoming_webhooks_enabled: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - assistant:write
+      - bookmarks:write
+      - canvases:write
+      - channels:read
+      - channels:manage
+      - channels:history
+      - chat:write
+      - commands
+      - files:read
+      - im:history
+      - files:write
+      - reactions:write
+      - users:read
+      - groups:read
+      - groups:write
+      - groups:history
+# There is intentionally no oauth_config.scopes.user section: the bridge
+# never requests or uses a user token to impersonate a human.

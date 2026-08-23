@@ -1,17 +1,17 @@
-"""Translate a Polytoken ``DaemonEvent`` stream into Discord render actions.
+"""Translate a Polytoken ``DaemonEvent`` stream into Slack render actions.
 
 This is a *pure* translation layer: it consumes :class:`SseEnvelope`s and
 produces a list of :class:`Action` intents. It holds only the per-session
 state needed to translate (content-block buffers, pending tool calls, the
-last seen ``seq``); it never touches Discord. ``TaskRegistry`` interprets the
-actions by driving the surviving renderers (the tool-summary aggregator,
-subagent embeds, and ``Bot`` posting).
+last seen ``seq``); it never touches Slack. ``TaskRegistry`` interprets the
+actions by driving the tool-summary aggregator, subagent Block Kit messages,
+and ``Bot`` posting.
 
 Routing rule: every event optionally carries ``subagent_handle``. When set,
 the activity belongs to a spawned subagent and is routed to that subagent's
-live embed; when unset, it belongs to the main session and is routed to the
-main thread aggregator. This replaces the old JSONL ``_is_sidechain_tool``
-heuristic.
+live Block Kit message; when unset, it belongs to the main session and is
+routed to the main root-message aggregator. This replaces the old JSONL
+``_is_sidechain_tool`` heuristic.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bridge import tool_summary
+from bridge.redaction import safe_error
 from bridge.polytoken_client import SseEnvelope
 
 log = logging.getLogger(__name__)
@@ -79,10 +80,47 @@ class SubagentStarted(Action):
 
 @dataclass(frozen=True)
 class SubagentActivity(Action):
-    """A tool one-liner attributed to a running subagent (drives its embed)."""
+    """A tool one-liner attributed to a running subagent message."""
 
     handle: str
     line: str
+
+
+@dataclass(frozen=True)
+class PlanHandoff(Action):
+    """A `plan_handoff` interrogative: the plan facet asking the operator to
+    approve, reject, or refuse-with-feedback a plan before implementation.
+
+    Mirrors the daemon's `PlanHandoffContext` (see `polytoken openapi`):
+    ``plan_text`` is the full plan document, ``action_labels`` carries the
+    daemon's own presentation strings for each decision so non-TUI clients
+    can render the same options without hardcoding copy.
+    """
+
+    interrogative_id: str
+    prompt_id: str | None
+    plan_text: str
+    plan_path: str
+    display_path: str
+    target_facet: str
+    title: str
+    action_labels: dict[str, str]
+    subagent_handle: str | None = None
+
+
+@dataclass(frozen=True)
+class GoalProposal(Action):
+    """A `goal_proposal` interrogative: the daemon asking the operator to
+    accept or reject tracking a saved-session goal (see `GoalProposalContext`
+    in `polytoken openapi`). Approval is binary (`accepted`/`rejected`)."""
+
+    interrogative_id: str
+    prompt_id: str | None
+    title: str
+    proposed_summary: str
+    proposed_file_path: str | None
+    action_labels: dict[str, str]
+    subagent_handle: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,12 +133,13 @@ class SubagentCompleted(Action):
 
 @dataclass(frozen=True)
 class AskQuestion(Action):
-    """Structured ``ask_user_question`` to render + collect a reply for."""
+    """Structured ``ask_user_question`` with an untrusted payload isolated."""
 
     interrogative_id: str
     prompt_id: str | None
     payload: dict[str, Any]
     subagent_handle: str | None = None
+    target_actor_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +187,19 @@ class StateRefresh(Action):
 @dataclass(frozen=True)
 class TitleChange(Action):
     title: str
+
+
+@dataclass(frozen=True)
+class CompactionUpdate(Action):
+    stage: str
+    reason: str | None = None
+    detail: str | None = None
+    compaction_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextCleared(Action):
+    pass
 
 
 @dataclass(frozen=True)
@@ -275,6 +327,10 @@ class Translator:
     # -- entry point ------------------------------------------------------
 
     def handle(self, env: SseEnvelope) -> list[Action]:
+        # Reconnects may replay the boundary event. Never dispatch duplicates or
+        # out-of-order envelopes twice; lifecycle actions are not all idempotent.
+        if env.seq is not None and self.last_seq is not None and env.seq <= self.last_seq:
+            return []
         actions = self._check_seq(env)
         try:
             actions.extend(self._dispatch(env.event))
@@ -337,7 +393,42 @@ class Translator:
         return [TurnCancelled(reason=e.get("reason", ""))]
 
     def _on_model_error(self, e: dict[str, Any]) -> list[Action]:
-        return [ModelError(error=str(e.get("error", "")))]
+        # Provider/model payloads may contain URLs, prompts, credentials, or
+        # filesystem paths. Never forward the raw daemon error to Slack.
+        return [ModelError(error=safe_error(None, "The daemon reported a model error"))]
+
+    @staticmethod
+    def _compaction_reason(e: dict[str, Any]) -> str | None:
+        reason = e.get("reason")
+        if isinstance(reason, dict):
+            reason = reason.get("type") or reason.get("kind")
+        return str(reason).strip()[:80] if reason else None
+
+    @staticmethod
+    def _compaction_id(e: dict[str, Any]) -> str | None:
+        value = e.get("compaction_id")
+        return value if isinstance(value, str) and value else None
+
+    def _on_compaction_started(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("started", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
+
+    def _on_compaction_retry(self, e: dict[str, Any]) -> list[Action]:
+        attempt = e.get("attempt")
+        maximum = e.get("max_attempts") or e.get("total_attempts")
+        detail = f"attempt {attempt}/{maximum}" if attempt and maximum else "retrying"
+        return [CompactionUpdate("retry", self._compaction_reason(e), detail, self._compaction_id(e))]
+
+    def _on_compaction_complete(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("complete", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
+
+    def _on_compaction_failed(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("failed", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
+
+    def _on_compaction_cancelled(self, e: dict[str, Any]) -> list[Action]:
+        return [CompactionUpdate("cancelled", self._compaction_reason(e), compaction_id=self._compaction_id(e))]
+
+    def _on_context_cleared(self, e: dict[str, Any]) -> list[Action]:
+        return [ContextCleared()]
 
     # -- tools ------------------------------------------------------------
 
@@ -362,7 +453,7 @@ class Translator:
         failed = tool_summary.is_failure(response, claude_name)
 
         if pending.subagent_handle:
-            # Subagent activity routes to its embed (one compact line).
+            # Subagent activity routes to its Block Kit message (one compact line).
             return [SubagentActivity(handle=pending.subagent_handle, line=line)]
 
         actions: list[Action] = []
@@ -403,8 +494,9 @@ class Translator:
             AskQuestion(
                 interrogative_id=e.get("interrogative_id", ""),
                 prompt_id=e.get("prompt_id"),
-                payload=e.get("payload") or {},
+                payload=e.get("payload") if isinstance(e.get("payload"), dict) else {},
                 subagent_handle=e.get("subagent_handle"),
+                target_actor_id=str((e.get("payload") or {}).get("actor_id") or (e.get("payload") or {}).get("target_actor_id") or "") or None,
             )
         ]
 
@@ -412,7 +504,7 @@ class Translator:
         itype = e.get("interrogative_type")
         iid = e.get("interrogative_id", "")
         pid = e.get("prompt_id")
-        question = e.get("question", "")
+        question = str(e.get("question", ""))[:4000]
         if itype == "permission":
             # Bypass mode: permission interrogatives never need a user answer.
             return []
@@ -426,7 +518,37 @@ class Translator:
             return [Clarification(interrogative_id=iid, prompt_id=pid, question=question, options=options)]
         if itype == "confirmation":
             return [Confirmation(interrogative_id=iid, prompt_id=pid, question=question)]
-        # capability / plan_handoff: surface as a clarification-less note for now.
+        if itype == "plan_handoff":
+            ph = e.get("plan_handoff") if isinstance(e.get("plan_handoff"), dict) else {}
+            labels = ph.get("action_labels")
+            return [
+                PlanHandoff(
+                    interrogative_id=iid,
+                    prompt_id=pid,
+                    plan_text=str(ph.get("plan_text", "")),
+                    plan_path=str(ph.get("plan_path", "")),
+                    display_path=str(ph.get("display_path", "")),
+                    target_facet=str(ph.get("target_facet", "")),
+                    title=str(ph.get("title") or question or "Approve plan?"),
+                    action_labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+                    subagent_handle=e.get("subagent_handle"),
+                )
+            ]
+        if itype == "goal_proposal":
+            gp = e.get("goal_proposal") if isinstance(e.get("goal_proposal"), dict) else {}
+            labels = gp.get("action_labels")
+            return [
+                GoalProposal(
+                    interrogative_id=iid,
+                    prompt_id=pid,
+                    title=str(gp.get("title") or question or "Accept this goal?"),
+                    proposed_summary=str(gp.get("proposed_summary", "")),
+                    proposed_file_path=gp.get("proposed_file_path") if isinstance(gp.get("proposed_file_path"), str) else None,
+                    action_labels={str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+                    subagent_handle=e.get("subagent_handle"),
+                )
+            ]
+        # capability: surface as a clarification-less note for now.
         return [StatusNote(text=f"❓ {question}")] if question else []
 
     # -- session / lifecycle ---------------------------------------------

@@ -1,4 +1,4 @@
-"""Pure formatter: convert PostToolUse payloads into one-line Discord messages."""
+"""Pure formatter: convert PostToolUse payloads into one-line Slack messages."""
 
 from typing import Any
 
@@ -11,7 +11,10 @@ _EMOJI_BASH = "✓"
 _EMOJI_SEARCH = "🔍"
 _EMOJI_WEB = "🌐"
 _EMOJI_TASK = "🤖"
-_EMOJI_OTHER = "•"
+# NOT "•": the fallback progress-line renderer always prepends its own "• "
+# bullet to every line, so an "other" emoji identical to that bullet renders
+# as a visually doubled "• • Foo" — use a distinct glyph instead.
+_EMOJI_OTHER = "🔧"
 
 
 def is_failure(tool_response: dict[str, Any] | None, tool_name: str) -> bool:
@@ -123,7 +126,7 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
         return f"{emoji} TaskGet: #{task_id}"
 
     if tool_name == "EnterWorktree":
-        # Surface the chosen branch / slug so the thread shows where claude
+        # Surface the chosen branch / slug so the root message shows where claude
         # ended up working.
         slug = (
             tool_input.get("branch")
@@ -138,6 +141,15 @@ def summarize(tool_name: str, tool_input: dict, tool_response: dict | None) -> s
         emoji = _EMOJI_FAIL if failed else "🌿"
         return f"{emoji} ExitWorktree"
 
+    if tool_name == "pushd":
+        path = tool_input.get("path", "?")
+        emoji = _EMOJI_FAIL if failed else "📂"
+        return f"{emoji} pushd: {_truncate(str(path), 80)}"
+
+    if tool_name == "popd":
+        emoji = _EMOJI_FAIL if failed else "📂"
+        return f"{emoji} popd"
+
     # Generic fallback
     emoji = _EMOJI_FAIL if failed else _EMOJI_OTHER
     return f"{emoji} {tool_name}"
@@ -148,9 +160,13 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _short_path(p: str | None) -> str:
+def _short_path(p: Any) -> str:
     if not p:
         return "?"
+    if isinstance(p, (list, tuple, set)):
+        paths = [_short_path(item) for item in p if item]
+        return _truncate(", ".join(paths), 80) if paths else "?"
+    p = str(p)
     if len(p) <= 50:
         return p
     parts = p.split("/")
@@ -168,22 +184,18 @@ def _diff_summary(tool_input: dict) -> str:
     return f"+{plus} -{minus}"
 
 
-# Discord's hard limit is 2000 chars per message; bot.py chunks at 1900
-# (`MAX_CHUNK`) to leave attribution-header headroom. Diff/code blocks get
-# wrapped in a fenced container (` ```diff\n…\n``` ` ≈ 12 chars) and may
-# also append a `\n…` truncation marker, so the body budget must stay
-# below 1900 minus that overhead — otherwise the bot's chunker splits a
-# fenced block in the middle and the second message arrives with no
-# opening fence (and the closing fence renders as visible text).
-_DISCORD_LIMIT = 2000
-_DIFF_BUDGET = 1850
+# Keep large tool payloads readable without applying the retired Discord-sized
+# 2,000-character transport limit. Ordinary Slack messages are bounded at 35k;
+# 12k preserves useful checklist/diff context while remaining scan-friendly.
+_MESSAGE_LIMIT = 12_000
+_DIFF_BUDGET = 11_800
 
 
 def diff_block(tool_name: str, tool_input: dict) -> str | None:
-    """Return a fenced Discord-renderable diff/content block for Edit / MultiEdit
+    """Return a fenced Slack-renderable diff/content block for Edit / MultiEdit
     / Write / TodoWrite, or None for tools that don't have a block to emit.
 
-    Truncates at ~_DISCORD_LIMIT to fit a single Discord message.
+    Truncates to keep a single Slack message readable.
     """
     if tool_name == "Edit":
         return _format_edit_diff(
@@ -217,7 +229,7 @@ def diff_block(tool_name: str, tool_input: dict) -> str | None:
 
 
 def _format_todo_checklist(todos: list) -> str:
-    """Render a Claude TodoWrite payload as a Discord-friendly checklist.
+    """Render a Claude TodoWrite payload as a Slack-friendly checklist.
 
     Each todo has `content`, `status` (pending|in_progress|completed), and
     `activeForm`. Use ▶ for in_progress, [x] for completed, [ ] otherwise.
@@ -238,8 +250,8 @@ def _format_todo_checklist(todos: list) -> str:
             mark = "⬜"
         lines.append(f"{mark} {content}")
     body = "\n".join(lines)
-    if len(body) > _DISCORD_LIMIT - 50:
-        body = body[: _DISCORD_LIMIT - 50] + "\n…"
+    if len(body) > _MESSAGE_LIMIT - 50:
+        body = body[: _MESSAGE_LIMIT - 50] + "\n…"
     return body
 
 

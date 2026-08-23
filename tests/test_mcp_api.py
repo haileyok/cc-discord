@@ -1,0 +1,704 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from types import SimpleNamespace
+
+import pytest
+
+from bridge.mcp_api import McpApiError, McpCapability, McpContext, McpFacade, SlidingWindowLimiter
+
+
+class Bot:
+    def __init__(self):
+        self.calls = []
+        self.thread_pages = [{
+            "messages": [
+                {"ts": "1.0", "user": "UOWNER", "text": "root"},
+                {"ts": "1.1", "bot_id": "BOTHER", "text": "reply", "files": [{"id": "F1", "name": "report.txt", "url_private": "must-not-leak"}]},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }]
+
+    def health(self):
+        return {"bot_connected": True, "team_id": "T1", "bot_token": "never"}
+
+    async def fetch_thread_replies(self, channel_id, root_ts, **kwargs):
+        self.calls.append(("read", channel_id, root_ts, kwargs)); return self.thread_pages.pop(0)
+
+    async def fetch_channel_history(self, channel_id, **kwargs):
+        self.calls.append(("history", channel_id, kwargs))
+        return {"messages": [{"ts": "2.0", "user": "UOWNER", "text": "channel item"}],
+                "response_metadata": {"next_cursor": ""}}
+
+    async def upload_file(self, path, **kwargs):
+        self.calls.append(("upload", str(path), kwargs)); return {"file_id": "FUP"}
+
+    async def download_file(self, url, destination, max_bytes):
+        self.calls.append(("download", url, str(destination), max_bytes))
+        destination.write_bytes(b"data")
+        return destination
+
+    async def create_canvas(self, **kwargs):
+        self.calls.append(("canvas_create", kwargs)); return {"canvas_id": "F-CANVAS"}
+
+    async def edit_canvas(self, canvas_id, **kwargs):
+        self.calls.append(("canvas_edit", canvas_id, kwargs)); return {"ok": True}
+
+    async def set_managed_channel_metadata(self, channel_id, **kwargs):
+        self.calls.append(("channel_metadata", channel_id, kwargs))
+
+    async def invite_participants(self, channel_id, user_ids):
+        self.calls.append(("invite", channel_id, user_ids))
+
+    async def remove_participants(self, channel_id, user_ids):
+        self.calls.append(("remove_users", channel_id, user_ids))
+
+    async def add_managed_channel_bookmark(self, channel_id, **kwargs):
+        self.calls.append(("bookmark_add", channel_id, kwargs))
+        return {"bookmark": {"id": "Bk1"}}
+
+    async def remove_managed_channel_bookmark(self, channel_id, bookmark_id):
+        self.calls.append(("bookmark_remove", channel_id, bookmark_id))
+
+    async def schedule_message(self, channel_id, root_ts, *, text, post_at):
+        self.calls.append(("schedule", channel_id, root_ts, text, post_at))
+        return {"scheduled_message_id": "Q1"}
+
+    async def list_scheduled_messages(self, channel_id, **kwargs):
+        self.calls.append(("list_scheduled", channel_id, kwargs))
+        return {"scheduled_messages": [{"id": "Q1", "post_at": 2_000_000_000,
+                                         "text": "follow up"}],
+                "response_metadata": {"next_cursor": ""}}
+
+    async def delete_scheduled_message(self, channel_id, scheduled_message_id):
+        self.calls.append(("cancel_scheduled", channel_id, scheduled_message_id))
+
+    async def post(self, text, *, channel_id, root_ts):
+        self.calls.append(("post", text, channel_id, root_ts)); return ["1.2"]
+
+    async def edit_message(self, channel_id, message_ts, *, text):
+        self.calls.append(("edit", channel_id, message_ts, text))
+
+    async def delete_message(self, channel_id, message_ts):
+        self.calls.append(("delete", channel_id, message_ts))
+
+    async def add_reaction(self, channel_id, message_ts, emoji):
+        self.calls.append(("react", channel_id, message_ts, emoji))
+
+    async def remove_reaction(self, channel_id, message_ts, emoji):
+        self.calls.append(("unreact", channel_id, message_ts, emoji))
+
+
+class Registry:
+    def __init__(self):
+        self.task = SimpleNamespace(
+            task_id="task-1", polytoken_session_id="session-1", channel_id="C1",
+            root_ts="1.0", status="running", mode="personal", last_activity=10,
+            progress_started=True, compaction_pending=False, owner_user_id="UOWNER",
+            team_id="T1", credential_file_path="/secret/credential.json", port=1234,
+        )
+        self.calls = []
+
+    def get_by_task_id(self, task_id):
+        return self.task if task_id == self.task.task_id else None
+
+    async def list_tasks(self, owner_user_id=None):
+        return [self.task] if owner_user_id == "UOWNER" else []
+
+    async def get_state(self, task_id, owner_user_id):
+        return {
+            "session_title": "Safe title", "active_model": "model", "turn_in_flight": True,
+            "todos": [{"title": "work", "status": "in_progress"}],
+            "credential_file_path": "/must/not/leak", "provider_token": "secret",
+        }
+
+    async def request_compaction(self, task_id, *, owner_user_id):
+        self.calls.append(("compact", task_id, owner_user_id)); return "queued"
+
+    async def cancel_turn(self, task_id, owner_user_id):
+        self.calls.append(("cancel_turn", task_id, owner_user_id)); return True
+
+    async def promote_task(self, task_id, owner_user_id, participant_user_ids, *, name=None):
+        self.calls.append(("promote", task_id, owner_user_id, participant_user_ids, name))
+        self.task.mode = "collaborative"; self.task.channel_owned = True
+        return self.task
+
+    async def set_model(self, task_id, model, *, owner_user_id, reasoning_effort=None):
+        self.calls.append(("model", task_id, model, owner_user_id, reasoning_effort))
+
+    async def set_facet(self, task_id, facet, *, owner_user_id):
+        self.calls.append(("facet", task_id, facet, owner_user_id))
+
+    async def set_effort(self, task_id, effort, *, owner_user_id):
+        self.calls.append(("effort", task_id, effort, owner_user_id))
+
+    async def stop_task(self, task_id, owner_user_id):
+        self.calls.append(("stop", task_id, owner_user_id)); return True
+
+    async def clear_context(self, task_id, *, owner_user_id):
+        self.calls.append(("clear", task_id, owner_user_id))
+
+
+@pytest.fixture
+def facade():
+    return McpFacade(Bot(), Registry(), "UOWNER", "T1")
+
+
+def ctx(*caps, request="req-1", owner="UOWNER", team="T1"):
+    return McpContext(owner, team, request, frozenset(caps))
+
+
+@pytest.mark.asyncio
+async def test_health_and_task_status_are_owner_scoped_and_redacted(facade):
+    read = ctx(McpCapability.READ)
+    health = await facade.call("bridge_health", {}, read)
+    assert health["result"]["active_task_count"] == 1
+    assert "token" not in str(health).lower()
+    status = await facade.call("bridge_task_status", {"task_id": "task-1"}, ctx(McpCapability.READ, request="req-2"))
+    assert status["result"]["task"]["session_id"] == "session-1"
+    assert "credential" not in str(status).lower()
+    assert "port" not in str(status).lower()
+
+
+@pytest.mark.asyncio
+async def test_health_and_list_filter_same_owner_tasks_from_other_teams(facade):
+    foreign = SimpleNamespace(**{
+        **vars(facade.registry.task), "task_id": "task-foreign", "team_id": "T2",
+    })
+
+    async def list_tasks(owner_user_id=None):
+        return [facade.registry.task, foreign] if owner_user_id == "UOWNER" else []
+
+    facade.registry.list_tasks = list_tasks
+    health = await facade.call("bridge_health", {}, ctx(McpCapability.READ))
+    listed = await facade.call(
+        "bridge_list_tasks", {}, ctx(McpCapability.READ, request="team-list"),
+    )
+    assert health["result"]["active_task_count"] == 1
+    assert [task["task_id"] for task in listed["result"]["tasks"]] == ["task-1"]
+
+
+@pytest.mark.asyncio
+async def test_principal_and_capability_cannot_be_supplied_in_arguments(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call("bridge_list_tasks", {"owner_user_id": "UOWNER"}, ctx(McpCapability.READ, owner="UOTHER"))
+    assert denied.value.code == "forbidden"
+    with pytest.raises(McpApiError) as missing:
+        await facade.call("bridge_set_facet", {"task_id": "task-1", "facet": "plan"}, ctx(McpCapability.READ))
+    assert missing.value.code == "capability_denied"
+
+
+@pytest.mark.asyncio
+async def test_destructive_actions_require_capability_and_confirmation(facade):
+    destructive = ctx(McpCapability.DESTRUCTIVE)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call("bridge_stop_task", {"task_id": "task-1"}, destructive)
+    assert missing.value.code == "confirmation_required"
+    result = await facade.call("bridge_stop_task", {"task_id": "task-1", "confirm": True}, ctx(McpCapability.DESTRUCTIVE, request="stop-2"))
+    assert result["result"]["stopped"] is True
+    assert facade.registry.calls[-1] == ("stop", "task-1", "UOWNER")
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_requires_confirmation_and_preserves_session(facade):
+    control = ctx(McpCapability.CONTROL)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call("bridge_cancel_turn", {"task_id": "task-1"}, control)
+    assert missing.value.code == "confirmation_required"
+    result = await facade.call(
+        "bridge_cancel_turn", {"task_id": "task-1", "confirm": True},
+        ctx(McpCapability.CONTROL, request="cancel-2"),
+    )
+    assert result["result"] == {
+        "task_id": "task-1", "cancelled": True, "session_preserved": True,
+    }
+    assert facade.registry.calls[-1] == ("cancel_turn", "task-1", "UOWNER")
+
+
+@pytest.mark.asyncio
+async def test_promote_task_defaults_to_dry_run_and_requires_confirmation(facade):
+    admin = ctx(McpCapability.CHANNEL_ADMIN)
+    plan = await facade.call(
+        "bridge_promote_task",
+        {"task_id": "task-1", "participant_user_ids": ["U2", "U2"], "name": "incident"},
+        admin,
+    )
+    assert plan["result"]["dry_run"] is True
+    assert plan["result"]["plan"]["participant_user_ids"] == ["U2"]
+    assert facade.registry.calls == []
+    with pytest.raises(McpApiError) as missing:
+        await facade.call(
+            "bridge_promote_task",
+            {"task_id": "task-1", "dry_run": False},
+            ctx(McpCapability.CHANNEL_ADMIN, request="promote-unconfirmed"),
+        )
+    assert missing.value.code == "confirmation_required"
+    result = await facade.call(
+        "bridge_promote_task",
+        {"task_id": "task-1", "participant_user_ids": ["U2"], "name": "incident",
+         "dry_run": False, "confirm": True},
+        ctx(McpCapability.CHANNEL_ADMIN, request="promote-execute"),
+    )
+    assert result["result"]["task"]["mode"] == "collaborative"
+    assert facade.registry.calls[-1] == ("promote", "task-1", "UOWNER", ["U2"], "incident")
+
+
+@pytest.mark.asyncio
+async def test_idempotency_returns_cached_result_and_rejects_conflicts(facade):
+    control = ctx(McpCapability.CONTROL, request="same")
+    first = await facade.call("bridge_compact_task", {"task_id": "task-1"}, control)
+    second = await facade.call("bridge_compact_task", {"task_id": "task-1"}, control)
+    assert first == second
+    assert facade.registry.calls.count(("compact", "task-1", "UOWNER")) == 1
+    with pytest.raises(McpApiError) as conflict:
+        await facade.call("bridge_set_facet", {"task_id": "task-1", "facet": "plan"}, control)
+    assert conflict.value.code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_idempotent_requests_share_one_side_effect(facade):
+    entered = asyncio.Event(); release = asyncio.Event(); executions = 0
+
+    async def blocking_compact(task_id, *, owner_user_id):
+        nonlocal executions
+        executions += 1; entered.set(); await release.wait(); return "queued"
+
+    facade.registry.request_compaction = blocking_compact
+    control = ctx(McpCapability.CONTROL, request="concurrent")
+    first = asyncio.create_task(facade.call("bridge_compact_task", {"task_id": "task-1"}, control))
+    await entered.wait()
+    second = asyncio.create_task(facade.call("bridge_compact_task", {"task_id": "task-1"}, control))
+    await asyncio.sleep(0)
+    release.set()
+    one, two = await asyncio.gather(first, second)
+    assert one == two
+    assert executions == 1
+
+
+@pytest.mark.asyncio
+async def test_denied_calls_are_audit_logged_without_arguments(facade, caplog):
+    caplog.set_level(logging.INFO, logger="bridge.mcp_api")
+    with pytest.raises(McpApiError):
+        await facade.call(
+            "bridge_set_facet", {"task_id": "task-1", "facet": "secret-facet-value"},
+            ctx(McpCapability.READ, request="audit-denied"),
+        )
+    messages = [record.getMessage() for record in caplog.records if "MCP audit" in record.getMessage()]
+    assert any("outcome=capability_denied" in message for message in messages)
+    assert all("secret-facet-value" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_is_audit_logged_as_cancelled(facade, caplog):
+    entered = asyncio.Event(); release = asyncio.Event()
+
+    async def blocking_compact(task_id, *, owner_user_id):
+        entered.set(); await release.wait(); return "queued"
+
+    facade.registry.request_compaction = blocking_compact
+    caplog.set_level(logging.INFO, logger="bridge.mcp_api")
+    call = asyncio.create_task(facade.call(
+        "bridge_compact_task", {"task_id": "task-1"},
+        ctx(McpCapability.CONTROL, request="cancelled-audit"),
+    ))
+    await entered.wait(); call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    release.set(); await asyncio.sleep(0)
+    messages = [record.getMessage() for record in caplog.records if "MCP audit" in record.getMessage()]
+    assert any("outcome=cancelled" in message for message in messages)
+    assert not any("outcome=ok" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_thread_read_is_bounded_and_omits_private_file_urls(facade):
+    result = await facade.call("slack_read_thread", {"task_id": "task-1", "limit": 20}, ctx(McpCapability.READ))
+    assert result["result"]["count"] == 2
+    assert result["result"]["messages"][1]["files"] == [{"id": "F1", "name": "report.txt"}]
+    assert "url_private" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_channel_history_requires_cross_channel_capability(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call("slack_read_channel_history", {"task_id": "task-1"}, ctx(McpCapability.READ))
+    assert denied.value.code == "capability_denied"
+    result = await facade.call(
+        "slack_read_channel_history", {"task_id": "task-1"},
+        ctx(McpCapability.CROSS_CHANNEL, request="history-2"),
+    )
+    assert result["result"]["messages"][0]["text"] == "channel item"
+
+
+@pytest.mark.asyncio
+async def test_task_search_is_bounded_to_owned_thread(facade):
+    result = await facade.call(
+        "slack_search_task_messages", {"task_id": "task-1", "query": "REPLY"},
+        ctx(McpCapability.READ),
+    )
+    assert [item["ts"] for item in result["result"]["matches"]] == ["1.1"]
+
+
+@pytest.mark.asyncio
+async def test_upload_is_forced_into_owned_task_thread(facade, tmp_path):
+    source = tmp_path / "report.txt"; source.write_text("hello")
+    result = await facade.call(
+        "slack_upload_file", {"task_id": "task-1", "path": str(source)},
+        ctx(McpCapability.WRITE),
+    )
+    assert result["result"]["file_id"] == "FUP"
+    assert facade.bot.calls == [("upload", str(source), {
+        "channel_id": "C1", "root_ts": "1.0", "title": None, "initial_comment": None,
+    })]
+
+
+@pytest.mark.asyncio
+async def test_download_requires_file_membership_and_uses_private_url(facade, tmp_path, monkeypatch):
+    import bridge.mcp_api as mcp_api
+    monkeypatch.setattr(mcp_api, "ATTACHMENTS_DIR", tmp_path)
+    facade.bot.thread_pages[0]["messages"][1]["files"][0].update({
+        "url_private_download": "https://files.slack.com/private/F1/report.txt",
+    })
+    result = await facade.call(
+        "slack_download_thread_file", {"task_id": "task-1", "file_id": "F1"},
+        ctx(McpCapability.READ),
+    )
+    assert result["result"]["size"] == 4
+    assert result["result"]["path"].startswith(str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_canvas_create_and_edit_are_bound_to_owned_task(facade):
+    write = ctx(McpCapability.WRITE, request="canvas-create")
+    created = await facade.call(
+        "slack_create_canvas",
+        {"task_id": "task-1", "title": "Plan", "markdown": "# Plan"}, write,
+    )
+    assert created["result"]["canvas_id"] == "F-CANVAS"
+    edited = await facade.call(
+        "slack_edit_canvas",
+        {"task_id": "task-1", "canvas_id": "F-CANVAS", "operation": "append",
+         "markdown": "## Update"},
+        ctx(McpCapability.WRITE, request="canvas-edit"),
+    )
+    assert edited["result"]["edited"] is True
+    assert facade.bot.calls == [
+        ("canvas_create", {"title": "Plan", "markdown": "# Plan", "channel_id": "C1"}),
+        ("canvas_edit", "F-CANVAS", {
+            "operation": "insert_at_end", "markdown": "## Update", "title": None,
+        }),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canvas_create_enforces_effective_mcp_transport_limit(facade):
+    with pytest.raises(McpApiError) as too_large:
+        await facade.call(
+            "slack_create_canvas",
+            {"task_id": "task-1", "title": "Large", "markdown": "x" * 60_001},
+            ctx(McpCapability.WRITE),
+        )
+    assert too_large.value.code == "invalid_arguments"
+    assert "60000" in str(too_large.value)
+
+
+@pytest.mark.asyncio
+async def test_canvas_edit_enforces_effective_mcp_transport_limit(facade):
+    await facade.call(
+        "slack_create_canvas",
+        {"task_id": "task-1", "title": "Plan", "markdown": "# Plan"},
+        ctx(McpCapability.WRITE, request="canvas-limit-create"),
+    )
+    with pytest.raises(McpApiError) as too_large:
+        await facade.call(
+            "slack_edit_canvas",
+            {"task_id": "task-1", "canvas_id": "F-CANVAS", "operation": "append",
+             "markdown": "x" * 60_001},
+            ctx(McpCapability.WRITE, request="canvas-limit-edit"),
+        )
+    assert too_large.value.code == "invalid_arguments"
+    assert "60000" in str(too_large.value)
+
+
+@pytest.mark.asyncio
+async def test_canvas_edit_rejects_untracked_canvas(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call(
+            "slack_edit_canvas",
+            {"task_id": "task-1", "canvas_id": "F-OTHER", "operation": "rename",
+             "title": "Nope"},
+            ctx(McpCapability.WRITE),
+        )
+    assert denied.value.code == "canvas_not_in_task"
+
+
+@pytest.mark.asyncio
+async def test_channel_admin_requires_bridge_owned_task_channel(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call(
+            "slack_set_channel_metadata",
+            {"task_id": "task-1", "field": "topic", "value": "Deploy"},
+            ctx(McpCapability.CHANNEL_ADMIN),
+        )
+    assert denied.value.code == "channel_not_managed"
+
+
+@pytest.mark.asyncio
+async def test_managed_channel_metadata_membership_and_bookmarks(facade):
+    facade.registry.task.channel_owned = True
+    await facade.call(
+        "slack_set_channel_metadata",
+        {"task_id": "task-1", "field": "purpose", "value": "Incident room"},
+        ctx(McpCapability.CHANNEL_ADMIN, request="meta"),
+    )
+    await facade.call(
+        "slack_invite_participants",
+        {"task_id": "task-1", "user_ids": ["U2", "U2", "U3"]},
+        ctx(McpCapability.CHANNEL_ADMIN, request="invite"),
+    )
+    added = await facade.call(
+        "slack_add_bookmark",
+        {"task_id": "task-1", "title": "Runbook", "link": "https://example.com/runbook"},
+        ctx(McpCapability.CHANNEL_ADMIN, request="bookmark"),
+    )
+    assert added["result"]["bookmark_id"] == "Bk1"
+    assert facade.bot.calls == [
+        ("channel_metadata", "C1", {"purpose": "Incident room"}),
+        ("invite", "C1", ["U2", "U3"]),
+        ("bookmark_add", "C1", {
+            "title": "Runbook", "link": "https://example.com/runbook", "emoji": None,
+        }),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_destructive_channel_actions_require_confirmation_and_protect_owner(facade):
+    facade.registry.task.channel_owned = True
+    destructive = ctx(McpCapability.DESTRUCTIVE)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call(
+            "slack_remove_participants", {"task_id": "task-1", "user_ids": ["U2"]},
+            destructive,
+        )
+    assert missing.value.code == "confirmation_required"
+    with pytest.raises(McpApiError) as owner:
+        await facade.call(
+            "slack_remove_participants",
+            {"task_id": "task-1", "user_ids": ["UOWNER"], "confirm": True},
+            ctx(McpCapability.DESTRUCTIVE, request="owner-remove"),
+        )
+    assert owner.value.code == "invalid_arguments"
+    removed = await facade.call(
+        "slack_remove_bookmark",
+        {"task_id": "task-1", "bookmark_id": "Bk1", "confirm": True},
+        ctx(McpCapability.DESTRUCTIVE, request="bookmark-remove"),
+    )
+    assert removed["result"]["removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_scheduled_messages_are_task_scoped_and_cancellation_is_verified(facade):
+    import time
+    post_at = int(time.time()) + 3600
+    scheduled = await facade.call(
+        "slack_schedule_message",
+        {"task_id": "task-1", "text": "follow up", "post_at": post_at},
+        ctx(McpCapability.WRITE, request="schedule"),
+    )
+    assert scheduled["result"]["scheduled_message_id"] == "Q1"
+    listed = await facade.call(
+        "slack_list_scheduled_messages", {"task_id": "task-1"},
+        ctx(McpCapability.READ, request="schedule-list"),
+    )
+    assert listed["result"]["messages"][0]["scheduled_message_id"] == "Q1"
+    with pytest.raises(McpApiError) as missing:
+        await facade.call(
+            "slack_cancel_scheduled_message",
+            {"task_id": "task-1", "scheduled_message_id": "Q1"},
+            ctx(McpCapability.DESTRUCTIVE, request="schedule-cancel-missing"),
+        )
+    assert missing.value.code == "confirmation_required"
+    cancelled = await facade.call(
+        "slack_cancel_scheduled_message",
+        {"task_id": "task-1", "scheduled_message_id": "Q1", "confirm": True},
+        ctx(McpCapability.DESTRUCTIVE, request="schedule-cancel"),
+    )
+    assert cancelled["result"]["cancelled"] is True
+    assert facade.bot.calls[-1] == ("cancel_scheduled", "C1", "Q1")
+
+
+@pytest.mark.asyncio
+async def test_slack_schedule_quota_maps_to_retryable_rate_limit(facade):
+    import time
+
+    class ScheduleQuotaError(RuntimeError):
+        error = "restricted_too_many"
+
+    async def fail_schedule(*args, **kwargs):
+        raise ScheduleQuotaError("response content must not leak")
+
+    facade.bot.schedule_message = fail_schedule
+    with pytest.raises(McpApiError) as limited:
+        await facade.call(
+            "slack_schedule_message",
+            {"task_id": "task-1", "text": "later", "post_at": int(time.time()) + 3600},
+            ctx(McpCapability.WRITE),
+        )
+    assert limited.value.code == "rate_limited"
+    assert limited.value.retryable is True
+    assert "response content" not in str(limited.value)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_message_rejects_past_and_untracked_ids(facade):
+    import time
+    with pytest.raises(McpApiError) as past:
+        await facade.call(
+            "slack_schedule_message",
+            {"task_id": "task-1", "text": "late", "post_at": int(time.time()) - 1},
+            ctx(McpCapability.WRITE),
+        )
+    assert past.value.code == "invalid_arguments"
+    with pytest.raises(McpApiError) as foreign:
+        await facade.call(
+            "slack_cancel_scheduled_message",
+            {"task_id": "task-1", "scheduled_message_id": "OTHER", "confirm": True},
+            ctx(McpCapability.DESTRUCTIVE, request="foreign-schedule"),
+        )
+    assert foreign.value.code == "scheduled_message_not_in_task"
+
+
+@pytest.mark.asyncio
+async def test_reaction_poll_and_approval_are_task_scoped(facade):
+    created = await facade.call(
+        "slack_create_poll",
+        {"task_id": "task-1", "question": "Ship?", "options": ["Yes", "No"]},
+        ctx(McpCapability.WRITE, request="poll-create"),
+    )
+    assert created["result"]["message_ts"] == "1.2"
+    assert facade.bot.calls == [
+        ("post", "*Poll: Ship?*\n:one: Yes\n:two: No", "C1", "1.0"),
+        ("react", "C1", "1.2", "one"),
+        ("react", "C1", "1.2", "two"),
+    ]
+    facade.bot.thread_pages = [{
+        "messages": [{"ts": "1.2", "reactions": [
+            {"name": "one", "count": 3}, {"name": "two", "count": 1},
+        ]}], "response_metadata": {"next_cursor": ""},
+    }]
+    results = await facade.call(
+        "slack_get_poll_results", {"task_id": "task-1", "message_ts": "1.2"},
+        ctx(McpCapability.READ, request="poll-results"),
+    )
+    assert results["result"]["results"] == [
+        {"label": "Yes", "emoji": "one", "votes": 2},
+        {"label": "No", "emoji": "two", "votes": 0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_approval_uses_fixed_approve_reject_options(facade):
+    result = await facade.call(
+        "slack_create_approval", {"task_id": "task-1", "question": "Merge now?"},
+        ctx(McpCapability.WRITE),
+    )
+    assert result["result"]["kind"] == "approval"
+    assert result["result"]["options"] == [
+        {"label": "Approve", "emoji": "white_check_mark"},
+        {"label": "Reject", "emoji": "x"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_rejects_duplicate_or_invalid_emojis(facade):
+    with pytest.raises(McpApiError) as invalid:
+        await facade.call(
+            "slack_create_poll",
+            {"task_id": "task-1", "question": "Pick", "options": ["A", "B"],
+             "emojis": ["same", "same"]},
+            ctx(McpCapability.WRITE),
+        )
+    assert invalid.value.code == "invalid_arguments"
+
+
+@pytest.mark.asyncio
+async def test_message_write_is_task_scoped_and_idempotent(facade):
+    write = ctx(McpCapability.WRITE)
+    first = await facade.call("slack_post_message", {"task_id": "task-1", "text": "hello"}, write)
+    second = await facade.call("slack_post_message", {"task_id": "task-1", "text": "hello"}, write)
+    assert first == second
+    assert facade.bot.calls == [("post", "hello", "C1", "1.0")]
+
+
+@pytest.mark.asyncio
+async def test_message_membership_scans_later_thread_pages(facade):
+    facade.bot.thread_pages = [
+        {"messages": [{"ts": "1.0"}], "response_metadata": {"next_cursor": "page-2"}},
+        {"messages": [{"ts": "1.5"}], "response_metadata": {"next_cursor": "page-3"}},
+        {"messages": [{"ts": "1.9"}], "response_metadata": {"next_cursor": ""}},
+    ]
+    result = await facade.call(
+        "slack_edit_message",
+        {"task_id": "task-1", "message_ts": "1.9", "text": "late reply"},
+        ctx(McpCapability.WRITE),
+    )
+    assert result["result"]["edited"] is True
+    reads = [call for call in facade.bot.calls if call[0] == "read"]
+    assert [call[3]["cursor"] for call in reads] == [None, "page-2", "page-3"]
+
+
+@pytest.mark.asyncio
+async def test_edit_and_delete_require_message_in_owned_thread(facade):
+    edited = await facade.call(
+        "slack_edit_message",
+        {"task_id": "task-1", "message_ts": "1.1", "text": "updated"},
+        ctx(McpCapability.WRITE),
+    )
+    assert edited["result"]["edited"] is True
+    assert facade.bot.calls[-1] == ("edit", "C1", "1.1", "updated")
+
+    other = McpFacade(Bot(), Registry(), "UOWNER", "T1")
+    with pytest.raises(McpApiError) as foreign:
+        await other.call(
+            "slack_edit_message",
+            {"task_id": "task-1", "message_ts": "9.9", "text": "no"},
+            ctx(McpCapability.WRITE),
+        )
+    assert foreign.value.code == "message_not_in_task"
+    other.bot.thread_pages = [{
+        "messages": [{"ts": "1.0", "text": "root"}, {"ts": "1.1", "text": "reply"}],
+        "response_metadata": {"next_cursor": ""},
+    }]
+
+    deleted = await other.call(
+        "slack_delete_message",
+        {"task_id": "task-1", "message_ts": "1.1", "confirm": True},
+        ctx(McpCapability.DESTRUCTIVE, request="delete-valid"),
+    )
+    assert deleted["result"]["deleted"] is True
+    assert other.bot.calls[-1] == ("delete", "C1", "1.1")
+
+
+@pytest.mark.asyncio
+async def test_reaction_target_must_be_in_owned_thread(facade):
+    write = ctx(McpCapability.WRITE)
+    await facade.call("slack_add_reaction", {"task_id": "task-1", "message_ts": "1.1", "emoji": ":eyes:"}, write)
+    assert facade.bot.calls[-1] == ("react", "C1", "1.1", ":eyes:")
+
+
+@pytest.mark.asyncio
+async def test_delete_requires_confirmation(facade):
+    destructive = ctx(McpCapability.DESTRUCTIVE)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call("slack_delete_message", {"task_id": "task-1", "message_ts": "1.0"}, destructive)
+    assert missing.value.code == "confirmation_required"
+
+
+def test_sliding_window_rate_limit():
+    limiter = SlidingWindowLimiter(limit=2, window_secs=10)
+    limiter.check("x", now=1); limiter.check("x", now=2)
+    with pytest.raises(McpApiError) as limited:
+        limiter.check("x", now=3)
+    assert limited.value.code == "rate_limited"
+    limiter.check("x", now=12.1)

@@ -1,0 +1,286 @@
+"""Local stdio MCP server that proxies explicit tools to the live bridge."""
+from __future__ import annotations
+
+import os
+import uuid
+from typing import Any
+
+import aiohttp
+from mcp.server import MCPServer
+
+from bridge.mcp_auth import MCP_TOKEN_FILE, load_or_create_mcp_token
+
+BRIDGE_RPC_URL = os.environ.get("BRIDGE_MCP_RPC_URL", "http://127.0.0.1:8787/v1/mcp/call")
+server = MCPServer(
+    "slack_bridge",
+    title="Slack Bridge",
+    description="Owner-scoped Slack and Polytoken bridge operations.",
+    instructions="Use current task/thread scope by default. Destructive tools require confirm=true.",
+)
+
+
+async def _rpc(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    token = load_or_create_mcp_token(MCP_TOKEN_FILE)
+    payload = {"tool": tool, "arguments": arguments, "request_id": str(uuid.uuid4())}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            BRIDGE_RPC_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "X-Bridge-Origin": "polytoken-mcp"},
+        ) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400 or not data.get("ok"):
+                error = data.get("error") if isinstance(data, dict) else None
+                code = str((error or {}).get("code") or "bridge_rpc_failed")
+                message = str((error or {}).get("message") or "Bridge MCP request failed")
+                raise RuntimeError(f"{code}: {message}")
+            return data["result"]
+
+
+@server.tool()
+async def bridge_health() -> dict[str, Any]:
+    """Return sanitized Slack bridge readiness and active task count."""
+    return await _rpc("bridge_health", {})
+
+
+@server.tool()
+async def bridge_list_tasks() -> dict[str, Any]:
+    """List active Polytoken tasks owned by the configured Slack owner."""
+    return await _rpc("bridge_list_tasks", {})
+
+
+@server.tool()
+async def bridge_task_status(task_id: str) -> dict[str, Any]:
+    """Return sanitized state for one owned task, including current turn/todos."""
+    return await _rpc("bridge_task_status", {"task_id": task_id})
+
+
+@server.tool()
+async def bridge_compact_task(task_id: str) -> dict[str, Any]:
+    """Request or queue context compaction for one owned task."""
+    return await _rpc("bridge_compact_task", {"task_id": task_id})
+
+
+@server.tool()
+async def bridge_cancel_turn(task_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Cancel only the active turn and preserve its task session. Requires confirm=true."""
+    return await _rpc("bridge_cancel_turn", {"task_id": task_id, "confirm": confirm})
+
+
+@server.tool()
+async def bridge_promote_task(task_id: str, participant_user_ids: list[str] | None = None,
+                              name: str | None = None, dry_run: bool = True,
+                              confirm: bool = False) -> dict[str, Any]:
+    """Plan or execute journaled promotion into a private collaborative channel."""
+    return await _rpc("bridge_promote_task", {
+        "task_id": task_id, "participant_user_ids": participant_user_ids,
+        "name": name, "dry_run": dry_run, "confirm": confirm,
+    })
+
+
+@server.tool()
+async def bridge_set_model(task_id: str, model: str, reasoning_effort: str | None = None) -> dict[str, Any]:
+    """Set the active model and optional reasoning effort for one owned task."""
+    return await _rpc("bridge_set_model", {"task_id": task_id, "model": model, "reasoning_effort": reasoning_effort})
+
+
+@server.tool()
+async def bridge_set_facet(task_id: str, facet: str) -> dict[str, Any]:
+    """Switch the active facet for one owned task."""
+    return await _rpc("bridge_set_facet", {"task_id": task_id, "facet": facet})
+
+
+@server.tool()
+async def bridge_set_effort(task_id: str, effort: str) -> dict[str, Any]:
+    """Set reasoning effort for the active model on one owned task."""
+    return await _rpc("bridge_set_effort", {"task_id": task_id, "effort": effort})
+
+
+@server.tool()
+async def bridge_stop_task(task_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Stop and terminate an owned task. Requires confirm=true."""
+    return await _rpc("bridge_stop_task", {"task_id": task_id, "confirm": confirm})
+
+
+@server.tool()
+async def bridge_clear_context(task_id: str, confirm: bool = False) -> dict[str, Any]:
+    """Clear an idle task's context. Requires confirm=true."""
+    return await _rpc("bridge_clear_context", {"task_id": task_id, "confirm": confirm})
+
+
+@server.tool()
+async def slack_read_thread(task_id: str, limit: int = 100) -> dict[str, Any]:
+    """Read a bounded, sanitized history of an owned task's Slack thread."""
+    return await _rpc("slack_read_thread", {"task_id": task_id, "limit": limit})
+
+
+@server.tool()
+async def slack_read_channel_history(task_id: str, limit: int = 100) -> dict[str, Any]:
+    """Read bounded history from an owned task's channel. Requires cross-channel capability."""
+    return await _rpc("slack_read_channel_history", {"task_id": task_id, "limit": limit})
+
+
+@server.tool()
+async def slack_search_task_messages(task_id: str, query: str, limit: int = 25) -> dict[str, Any]:
+    """Search text within the bounded history of an owned task thread."""
+    return await _rpc("slack_search_task_messages", {"task_id": task_id, "query": query, "limit": limit})
+
+
+@server.tool()
+async def slack_post_message(task_id: str, text: str) -> dict[str, Any]:
+    """Post a message in an owned task thread."""
+    return await _rpc("slack_post_message", {"task_id": task_id, "text": text})
+
+
+@server.tool()
+async def slack_upload_file(task_id: str, path: str, title: str | None = None,
+                            initial_comment: str | None = None) -> dict[str, Any]:
+    """Upload a local regular file into an owned task thread with bridge size limits."""
+    return await _rpc("slack_upload_file", {"task_id": task_id, "path": path,
+                                             "title": title, "initial_comment": initial_comment})
+
+
+@server.tool()
+async def slack_download_thread_file(task_id: str, file_id: str) -> dict[str, Any]:
+    """Download a Slack file proven to belong to an owned task thread into bridge state."""
+    return await _rpc("slack_download_thread_file", {"task_id": task_id, "file_id": file_id})
+
+
+@server.tool()
+async def slack_create_canvas(task_id: str, title: str, markdown: str) -> dict[str, Any]:
+    """Create a Markdown Canvas attached to an owned task channel."""
+    return await _rpc("slack_create_canvas", {
+        "task_id": task_id, "title": title, "markdown": markdown,
+    })
+
+
+@server.tool()
+async def slack_edit_canvas(task_id: str, canvas_id: str, operation: str,
+                            markdown: str | None = None,
+                            title: str | None = None) -> dict[str, Any]:
+    """Append, prepend, or rename a Canvas created for this task by the bridge."""
+    return await _rpc("slack_edit_canvas", {
+        "task_id": task_id, "canvas_id": canvas_id, "operation": operation,
+        "markdown": markdown, "title": title,
+    })
+
+
+@server.tool()
+async def slack_set_channel_metadata(task_id: str, field: str, value: str) -> dict[str, Any]:
+    """Set topic or purpose on a bridge-owned private task channel."""
+    return await _rpc("slack_set_channel_metadata", {
+        "task_id": task_id, "field": field, "value": value,
+    })
+
+
+@server.tool()
+async def slack_invite_participants(task_id: str, user_ids: list[str]) -> dict[str, Any]:
+    """Invite Slack users to a bridge-owned private task channel."""
+    return await _rpc("slack_invite_participants", {"task_id": task_id, "user_ids": user_ids})
+
+
+@server.tool()
+async def slack_remove_participants(task_id: str, user_ids: list[str],
+                                    confirm: bool = False) -> dict[str, Any]:
+    """Remove non-owner users from a managed task channel. Requires confirm=true."""
+    return await _rpc("slack_remove_participants", {
+        "task_id": task_id, "user_ids": user_ids, "confirm": confirm,
+    })
+
+
+@server.tool()
+async def slack_add_bookmark(task_id: str, title: str, link: str,
+                             emoji: str | None = None) -> dict[str, Any]:
+    """Add an HTTP(S) link bookmark to a bridge-owned private task channel."""
+    return await _rpc("slack_add_bookmark", {
+        "task_id": task_id, "title": title, "link": link, "emoji": emoji,
+    })
+
+
+@server.tool()
+async def slack_remove_bookmark(task_id: str, bookmark_id: str,
+                                confirm: bool = False) -> dict[str, Any]:
+    """Remove a bookmark from a managed task channel. Requires confirm=true."""
+    return await _rpc("slack_remove_bookmark", {
+        "task_id": task_id, "bookmark_id": bookmark_id, "confirm": confirm,
+    })
+
+
+@server.tool()
+async def slack_schedule_message(task_id: str, text: str, post_at: int) -> dict[str, Any]:
+    """Schedule a durable message in an owned task thread up to 120 days ahead."""
+    return await _rpc("slack_schedule_message", {
+        "task_id": task_id, "text": text, "post_at": post_at,
+    })
+
+
+@server.tool()
+async def slack_list_scheduled_messages(task_id: str) -> dict[str, Any]:
+    """List pending schedules created for a task by this bridge process."""
+    return await _rpc("slack_list_scheduled_messages", {"task_id": task_id})
+
+
+@server.tool()
+async def slack_cancel_scheduled_message(task_id: str, scheduled_message_id: str,
+                                         confirm: bool = False) -> dict[str, Any]:
+    """Cancel a verified pending task schedule. Requires confirm=true."""
+    return await _rpc("slack_cancel_scheduled_message", {
+        "task_id": task_id, "scheduled_message_id": scheduled_message_id,
+        "confirm": confirm,
+    })
+
+
+@server.tool()
+async def slack_create_poll(task_id: str, question: str, options: list[str],
+                            emojis: list[str] | None = None) -> dict[str, Any]:
+    """Create a reaction-backed poll in an owned task thread."""
+    return await _rpc("slack_create_poll", {
+        "task_id": task_id, "question": question, "options": options, "emojis": emojis,
+    })
+
+
+@server.tool()
+async def slack_create_approval(task_id: str, question: str) -> dict[str, Any]:
+    """Create an Approve/Reject reaction workflow in an owned task thread."""
+    return await _rpc("slack_create_approval", {"task_id": task_id, "question": question})
+
+
+@server.tool()
+async def slack_get_poll_results(task_id: str, message_ts: str) -> dict[str, Any]:
+    """Return aggregate reaction counts for a tracked task poll or approval."""
+    return await _rpc("slack_get_poll_results", {
+        "task_id": task_id, "message_ts": message_ts,
+    })
+
+
+@server.tool()
+async def slack_edit_message(task_id: str, message_ts: str, text: str) -> dict[str, Any]:
+    """Edit a bot-authored message within an owned task thread."""
+    return await _rpc("slack_edit_message", {"task_id": task_id, "message_ts": message_ts, "text": text})
+
+
+@server.tool()
+async def slack_add_reaction(task_id: str, message_ts: str, emoji: str) -> dict[str, Any]:
+    """Add a reaction to a message within an owned task thread."""
+    return await _rpc("slack_add_reaction", {"task_id": task_id, "message_ts": message_ts, "emoji": emoji})
+
+
+@server.tool()
+async def slack_remove_reaction(task_id: str, message_ts: str, emoji: str) -> dict[str, Any]:
+    """Remove the bot's reaction from a message within an owned task thread."""
+    return await _rpc("slack_remove_reaction", {"task_id": task_id, "message_ts": message_ts, "emoji": emoji})
+
+
+@server.tool()
+async def slack_delete_message(task_id: str, message_ts: str, confirm: bool = False) -> dict[str, Any]:
+    """Delete a bot-authored message in an owned task thread. Requires confirm=true."""
+    return await _rpc("slack_delete_message", {"task_id": task_id, "message_ts": message_ts, "confirm": confirm})
+
+
+def main() -> None:
+    server.run("stdio")
+
+
+if __name__ == "__main__":
+    main()

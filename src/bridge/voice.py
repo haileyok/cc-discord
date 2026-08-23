@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
 from pathlib import Path
 
 import aiohttp
+
+from bridge.redaction import safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -71,48 +74,54 @@ async def _transcribe_wispr(audio_path: Path, *, timeout: float) -> str | None:
     if wav_path is None:
         return None
     try:
-        audio_bytes = wav_path.read_bytes()
-    except OSError:
-        logger.exception("failed to read converted wav %s", wav_path)
-        return None
-    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        try:
+            if wav_path.stat().st_size > int(os.environ.get("BRIDGE_MAX_AUDIO_BYTES", str(25 * 1024 * 1024))):
+                logger.warning("converted audio exceeds configured size limit")
+                return None
+            audio_bytes = wav_path.read_bytes()
+        except OSError:
+            logger.warning("failed to read converted audio: %s", safe_error(None, "audio input unavailable"))
+            return None
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    body = {"audio": audio_b64}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                WISPR_TRANSCRIBE_URL,
-                headers=headers,
-                json=body,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                if resp.status >= 400:
-                    detail = (await resp.text())[:500]
-                    logger.warning(
-                        "Wispr transcribe HTTP %d: %s", resp.status, detail
-                    )
-                    return None
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    logger.exception("Wispr transcribe returned non-JSON body")
-                    return None
-    except asyncio.TimeoutError:
-        logger.warning("Wispr transcribe timed out after %ss", timeout)
-        return None
-    except aiohttp.ClientError:
-        logger.exception("Wispr transcribe HTTP client error")
-        return None
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        body = {"audio": audio_b64}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    WISPR_TRANSCRIBE_URL,
+                    headers=headers,
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning("Wispr transcribe HTTP %d: request rejected", resp.status)
+                        return None
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        logger.warning("Wispr transcribe returned a non-JSON response")
+                        return None
+        except asyncio.TimeoutError:
+            logger.warning("Wispr transcribe timed out after %ss", timeout)
+            return None
+        except aiohttp.ClientError:
+            logger.warning("Wispr transcribe HTTP client error")
+            return None
 
-    text = data.get("text") if isinstance(data, dict) else None
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    logger.warning("Wispr transcribe returned no `text`; payload=%r", data)
-    return None
+        text = data.get("text") if isinstance(data, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        logger.warning("Wispr transcribe returned no usable text")
+        return None
+    finally:
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("failed to remove temporary Wispr audio")
 
 
 async def _transcribe_local_whisper(
@@ -131,60 +140,57 @@ async def _transcribe_local_whisper(
     except FileNotFoundError:
         pass
     except OSError:
-        logger.exception("failed to clear stale transcript %s", expected_out)
+        logger.warning("failed to clear stale transcript output")
 
     try:
-        # Pass options first, then `--` and the positional audio path.
-        # Today our paths are anchored under ATTACHMENTS_DIR so they
-        # can't begin with `-`, but the `--` sentinel makes the argv
-        # robust to future filename-layout changes (and is supported
-        # by openai-whisper's argparse).
-        proc = await asyncio.create_subprocess_exec(
-            binary,
-            "--model",
-            model,
-            "--output_format",
-            "txt",
-            "--output_dir",
-            str(out_dir),
-            "--",
-            str(audio_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        logger.warning(
-            "transcription CLI %r not found — install with "
-            "`pip install -U openai-whisper`, or set BRIDGE_WHISPER_BIN to a "
-            "different binary",
-            binary,
-        )
-        return None
+        try:
+            # Pass options first, then `--` and the positional audio path.
+            proc = await asyncio.create_subprocess_exec(
+                binary,
+                "--model",
+                model,
+                "--output_format",
+                "txt",
+                "--output_dir",
+                str(out_dir),
+                "--",
+                str(audio_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            logger.warning("transcription CLI is unavailable")
+            return None
 
-    try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        logger.warning(
-            "transcribe timed out after %ss for %s", timeout, audio_path
-        )
-        return None
-    if proc.returncode != 0:
-        logger.warning(
-            "transcribe failed (rc=%d): %s",
-            proc.returncode,
-            stderr.decode("utf-8", errors="replace")[:500],
-        )
-        return None
-    if not expected_out.is_file():
-        logger.warning("transcribe produced no output at %s", expected_out)
-        return None
-    try:
-        text = expected_out.read_text(errors="replace").strip()
-    except OSError:
-        logger.exception("failed to read transcript output %s", expected_out)
-        return None
-    return text or None
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(asyncio.CancelledError, ProcessLookupError):
+                await proc.wait()
+            logger.warning("transcribe timed out after %ss", timeout)
+            return None
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(BaseException):
+                await proc.wait()
+            raise
+        if proc.returncode != 0:
+            logger.warning("transcription CLI failed")
+            return None
+        if not expected_out.is_file():
+            logger.warning("transcribe produced no output")
+            return None
+        try:
+            text = expected_out.read_text(errors="replace").strip()
+        except OSError:
+            logger.warning("failed to read transcript output")
+            return None
+        return text or None
+    finally:
+        with contextlib.suppress(OSError):
+            expected_out.unlink()
 
 
 async def _convert_to_pcm_wav(src: Path) -> Path | None:
@@ -208,14 +214,23 @@ async def _convert_to_pcm_wav(src: Path) -> Path | None:
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError:
-        logger.warning("ffmpeg not installed; cannot convert %s", src)
+        logger.warning("ffmpeg is unavailable")
+        with contextlib.suppress(OSError):
+            out.unlink()
         return None
-    _, stderr = await proc.communicate()
+    try:
+        await proc.communicate()
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(asyncio.CancelledError, ProcessLookupError):
+            await proc.wait()
+        with contextlib.suppress(OSError):
+            out.unlink()
+        raise
     if proc.returncode != 0:
-        logger.warning(
-            "ffmpeg conversion failed (rc=%d): %s",
-            proc.returncode,
-            stderr.decode("utf-8", errors="replace")[:500],
-        )
+        logger.warning("ffmpeg conversion failed")
+        with contextlib.suppress(OSError):
+            out.unlink()
         return None
     return out
