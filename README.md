@@ -30,7 +30,7 @@
 4. Enable the manifest's `/agent`, shortcuts, interactivity, `message.channels`, `message.groups`, `message.im`, `app_mention`, `app_home_opened`, `app_context_changed`, and `agent_session_stopped` subscriptions. Grant `assistant:write` (agent-session lifecycle and naming) and `im:history` (DM prompts).
 5. Invite the bot to a public or private home channel. Record the workspace team ID, home channel ID, and the trusted owner's user ID.
 
-The manifest enables public-channel history for an observable home channel and private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) for private homes and promoted collaboration channels. Review scopes against your workspace policy before installing.
+The manifest enables public-channel history for an observable home channel and private-channel capabilities (`groups:read`, `groups:write`, `groups:history`) for private homes and promoted collaboration channels. MCP Canvas and channel-bookmark tools additionally require `canvases:write` and `bookmarks:write`. Reinstall the Slack app after adding or changing scopes. Review scopes against your workspace policy before installing.
 
 The manifest enables Slack's `features.agent_view` (an irreversible migration for the app): the bot's Messages tab becomes the native agent experience, and a DM from the owner starts an ad-hoc task from `BRIDGE_AD_HOC_CWD` — no mention needed, threaded replies continue the session. Channel threads remain the canonical personal and collaborative task surface. Opening Messages installs four runtime suggested prompts without posting welcome-message spam. Slack's ordered `app_context_changed` entity references are access-checked, resolved where possible, and consumed by the owner's next DM; stale context is not silently reused. Attached Slack files carry their original name, IDs, type, uploader/sharer, timestamp, permalink, and authenticated local reference into the prompt. Final answers with URLs receive a compact native Sources context block.
 
@@ -83,6 +83,44 @@ uv run claude-slack-bridge doctor
 
 `doctor` checks secrets and directory modes, Slack identity/team/home-channel membership and observable Socket Mode state, local bridge health, Polytoken version plus a throwaway headless spawn/termination smoke, private state storage, and warns if a legacy Discord unit/process is still visible. Live checks require network access and a running daemon; warnings distinguish non-observable runtime state from hard failures.
 
+## Polytoken MCP integration
+
+The optional `claude-slack-mcp` executable is an MCP v2 stdio server. It contains no Slack token and does not open a second Slack client or database connection. It reads a separate high-entropy token from `~/.config/claude-slack-bridge/mcp-token` (directory `0700`, file `0600`) and calls the running bridge's authenticated loopback-only `POST /v1/mcp/call` endpoint. The bridge derives the owner, team, and capabilities server-side; model-supplied actor IDs or capabilities are never trusted.
+
+Install the current package and add the server to `~/.config/polytoken/config.yaml`:
+
+```bash
+uv tool install --force .
+```
+
+```yaml
+mcp_servers:
+  slack_bridge:
+    transport: stdio
+    command: /home/hailey/.local/bin/claude-slack-mcp
+    args: []
+    pass_env:
+      - HOME
+    env: {}
+    default_timeout_seconds: 30
+    default_enabled: true
+    block_list: []
+    log_stderr: true
+    log_stdout: false
+```
+
+Use the absolute executable path for the target account. `HOME` is the only required inherited variable; do not put the MCP token, Slack token, owner ID, or team ID in Polytoken configuration. Validate with `polytoken config validate`. Restart the bridge after upgrading it, then verify from a real session by calling `mcp__slack_bridge__bridge_health`.
+
+The MCP surface is explicit and typed—there is no generic Slack API passthrough:
+
+- `bridge_*`: health, owned-task list/status, active subagent work, current-turn cancellation, model/facet/effort, compaction, clear/stop, and dry-run/confirmed journaled promotion.
+- `slack_*` content: bounded task-thread reads/search, separately gated channel history, post/edit/delete, reactions, secure upload/download, and scheduled messages.
+- `slack_*` artifacts/workflows: task-owned Canvas creation/editing, managed-channel bookmarks, polls/approvals, topics/purpose, and participant administration.
+
+Every call is owner/team scoped, capability checked, rate limited, idempotency keyed, and audit logged without message content. The deployed single-operator bridge explicitly enables every registered capability tier for the holder of its local 0600 MCP bearer token; alternate `build_app` embedders default to deny-all unless they pass a policy. Destructive calls require `confirm=true`. File targets, message targets, channels, and scheduled-message IDs are verified against the owned task before mutation. MCP-originated Slack messages carry an internal origin header at RPC time and normal bot-self event suppression prevents recursive prompt routing.
+
+Some ownership capabilities intentionally live only in bridge memory. After restart, existing Slack delivery schedules still fire because Slack stores them, but the MCP will fail closed rather than edit an old Canvas, cancel/list an old schedule, or read results from an old poll. Recreate the workflow or manage that resource directly in Slack. Canvas Markdown is capped at 60,000 characters through MCP so the complete JSON request stays below the private RPC's 64 KiB body ceiling; direct Slack adapter calls retain Slack's 1 MiB limit. Full workspace/private search requires user OAuth and is intentionally not exposed; this bridge accepts bot tokens only.
+
 ## Commands and routing
 
 The Slack command surface is implemented by the current adapter. `/agent` is the primary entry point; task operations map to the existing registry lifecycle (start/spawn, list, stop, kill, reload, skill, effort, model, facet, rename, stats, tasks, pin/unpin where supported). `/agent reload` applies the daemon's on-disk configuration to the current task without restarting it. Use a root message thread for normal prompts and answers.
@@ -105,6 +143,8 @@ Slack limitations are intentional:
 | `BRIDGE_SECRETS_PATH` | `~/.config/claude-slack-bridge/secrets.json` | Explicit Slack JSON path; no legacy fallback |
 | `BRIDGE_STATE_DIR` | `~/.local/state/claude-slack-bridge` | Private state/attachments root |
 | `BRIDGE_URL` | `http://127.0.0.1:8787` | Local health URL used by `doctor` |
+| `BRIDGE_MCP_RPC_URL` | `http://127.0.0.1:8787/v1/mcp/call` | Loopback RPC URL used by the stdio MCP process |
+| `BRIDGE_MCP_TOKEN_FILE` | `~/.config/claude-slack-bridge/mcp-token` | Separate atomic 0600 MCP bearer-token file |
 | `POLYTOKEN_BIN` | `polytoken` | Polytoken executable for smoke checks |
 | `BRIDGE_PROJECT_ROOTS` | unset | Colon-separated parent paths for project selection |
 | `BRIDGE_AD_HOC_CWD` | `/home/hailey/bluesky` | Working directory for owner mentions that automatically start a task |
@@ -127,7 +167,10 @@ This is not a security boundary against a malicious workspace member, compromise
 | `src/bridge/bot.py` | Slack Web API and Socket Mode adapter; startup identity/channel checks, bounded retries, messages/blocks/files/reactions |
 | `src/bridge/cli.py` | `init`, `serve`, and `doctor` operational commands |
 | `src/bridge/secrets.py` | Slack-only secure JSON loader/writer |
-| `src/bridge/server.py` | aiohttp health endpoint and message dispatcher |
+| `src/bridge/server.py` | aiohttp health endpoint, Slack dispatch, and authenticated loopback MCP RPC |
+| `src/bridge/mcp_auth.py` | Atomic 0600 MCP token creation and validation |
+| `src/bridge/mcp_api.py` | Fixed-principal capability policy, audit/idempotency/rate limits, and typed façade |
+| `src/bridge/mcp_server.py` | Official MCP v2 stdio server with explicit tool registrations |
 | `src/bridge/tasks.py` | Task lifecycle, owner/participant routing, app-loop cap, attachment handling |
 | `src/bridge/events.py` | Pure Polytoken event-to-render action translator and gap reconciliation |
 | `src/bridge/polytoken_client.py` | Async per-daemon HTTP/SSE client |

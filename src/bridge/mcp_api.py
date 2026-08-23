@@ -1,6 +1,7 @@
 """Security boundary for Polytoken MCP access to the live Slack bridge."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from bridge.tasks import (
 )
 
 log = logging.getLogger(__name__)
+MCP_CANVAS_MARKDOWN_LIMIT = 60_000
 
 
 class McpCapability(StrEnum):
@@ -89,6 +91,8 @@ class McpFacade:
     limiter: SlidingWindowLimiter = field(default_factory=SlidingWindowLimiter)
     idempotency_ttl_secs: float = 600.0
     _idempotency: dict[str, _CacheEntry] = field(default_factory=dict, init=False, repr=False)
+    _inflight: dict[str, tuple[str, asyncio.Task[dict[str, Any]]]] = field(default_factory=dict, init=False, repr=False)
+    _inflight_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _canvas_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _scheduled_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _polls: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
@@ -131,20 +135,70 @@ class McpFacade:
 
     async def call(self, tool: str, arguments: Mapping[str, Any], ctx: McpContext) -> dict[str, Any]:
         started = time.monotonic()
-        if ctx.owner_user_id != self.owner_user_id or ctx.team_id != self.team_id:
-            raise McpApiError("forbidden", "MCP principal is not authorized")
-        spec = self._TOOLS.get(str(tool))
-        if spec is None:
-            raise McpApiError("unknown_tool", "Unknown bridge MCP tool")
-        capability, method_name = spec
-        if capability not in ctx.capabilities:
-            raise McpApiError("capability_denied", f"Tool requires {capability.value} capability")
-        self.limiter.check(f"{ctx.owner_user_id}:{tool}")
-        args = dict(arguments)
-        fingerprint = self._fingerprint(tool, args)
-        cached = self._cached(ctx.request_id, fingerprint)
-        if cached is not None:
-            return cached
+        outcome = "ok"
+        try:
+            if ctx.owner_user_id != self.owner_user_id or ctx.team_id != self.team_id:
+                raise McpApiError("forbidden", "MCP principal is not authorized")
+            spec = self._TOOLS.get(str(tool))
+            if spec is None:
+                raise McpApiError("unknown_tool", "Unknown bridge MCP tool")
+            capability, method_name = spec
+            if capability not in ctx.capabilities:
+                raise McpApiError("capability_denied", f"Tool requires {capability.value} capability")
+            self.limiter.check(f"{ctx.owner_user_id}:{tool}")
+            args = dict(arguments)
+            fingerprint = self._fingerprint(tool, args)
+            if not ctx.request_id:
+                return await self._execute_call(tool, method_name, args, ctx, fingerprint)
+            async with self._inflight_lock:
+                cached = self._cached(ctx.request_id, fingerprint)
+                if cached is not None:
+                    outcome = "cached"
+                    return cached
+                pending = self._inflight.get(ctx.request_id)
+                if pending is not None:
+                    pending_fingerprint, task = pending
+                    if pending_fingerprint != fingerprint:
+                        raise McpApiError(
+                            "idempotency_conflict",
+                            "Request ID was reused with different arguments",
+                        )
+                    outcome = "deduplicated"
+                else:
+                    task = asyncio.create_task(
+                        self._execute_call(tool, method_name, args, ctx, fingerprint),
+                        name=f"mcp-{tool}-{ctx.request_id[:12]}",
+                    )
+                    self._inflight[ctx.request_id] = (fingerprint, task)
+                    task.add_done_callback(
+                        lambda done, request_id=ctx.request_id: self._clear_inflight(
+                            request_id, done
+                        )
+                    )
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except McpApiError as exc:
+            outcome = exc.code
+            raise
+        finally:
+            log.info(
+                "MCP audit tool=%s request=%s outcome=%s duration_ms=%d",
+                str(tool)[:100], ctx.request_id[:12], outcome,
+                int((time.monotonic() - started) * 1000),
+            )
+
+    def _clear_inflight(self, request_id: str, task: asyncio.Task[dict[str, Any]]) -> None:
+        # asyncio callbacks run synchronously on this event loop. The guarded
+        # request path has no await while it reads/writes this dict, so cleanup
+        # cannot interleave with a partial critical-section update.
+        current = self._inflight.get(request_id)
+        if current is not None and current[1] is task:
+            self._inflight.pop(request_id, None)
+
+    async def _execute_call(self, tool: str, method_name: str, args: Mapping[str, Any],
+                            ctx: McpContext, fingerprint: str) -> dict[str, Any]:
         try:
             method: Callable[..., Awaitable[dict[str, Any]]] = getattr(self, method_name)
             result = await method(ctx, args)
@@ -163,7 +217,6 @@ class McpFacade:
             raise McpApiError("internal_error", "Bridge MCP operation failed", retryable=True) from exc
         response = {"ok": True, "result": result}
         self._remember(ctx.request_id, fingerprint, response)
-        log.info("MCP audit tool=%s request=%s outcome=ok duration_ms=%d", tool, ctx.request_id[:12], int((time.monotonic() - started) * 1000))
         return response
 
     @staticmethod
@@ -237,11 +290,13 @@ class McpFacade:
         health = self.bot.health() if callable(getattr(self.bot, "health", None)) else {}
         safe = {key: value for key, value in dict(health or {}).items() if "token" not in key.lower() and "secret" not in key.lower()}
         tasks = await self.registry.list_tasks(owner_user_id=ctx.owner_user_id)
+        tasks = [task for task in tasks if task.team_id == ctx.team_id]
         safe["active_task_count"] = len(tasks)
         return safe
 
     async def _list_tasks(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         tasks = await self.registry.list_tasks(owner_user_id=ctx.owner_user_id)
+        tasks = [task for task in tasks if task.team_id == ctx.team_id]
         return {"tasks": [self._task_summary(task) for task in tasks[:100]], "count": min(len(tasks), 100)}
 
     async def _task_status(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -370,9 +425,20 @@ class McpFacade:
     async def _require_thread_message(self, task: Any, message_ts: str) -> None:
         if message_ts == task.root_ts:
             return
-        messages = await self._thread_messages(task)
-        if not any(item["ts"] == message_ts for item in messages):
-            raise McpApiError("message_not_in_task", "Message is not in the owned task thread")
+        cursor: str | None = None
+        for _ in range(5):
+            page = await self.bot.fetch_thread_replies(
+                task.channel_id, task.root_ts, cursor=cursor, limit=100
+            )
+            if any(
+                isinstance(item, Mapping) and str(item.get("ts") or "") == message_ts
+                for item in page.get("messages") or []
+            ):
+                return
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        raise McpApiError("message_not_in_task", "Message is not in the owned task thread")
 
     async def _read_thread(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80)
@@ -493,7 +559,7 @@ class McpFacade:
     async def _create_canvas(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80)
         title = self._text(args, "title", limit=500)
-        markdown = self._text(args, "markdown", limit=1_048_576)
+        markdown = self._text(args, "markdown", limit=MCP_CANVAS_MARKDOWN_LIMIT)
         task = self._owned_task(ctx, task_id)
         try:
             result = await self.bot.create_canvas(
@@ -527,8 +593,11 @@ class McpFacade:
             title = title[:500]
         elif not markdown:
             raise McpApiError("invalid_arguments", "markdown is required for append or prepend")
-        elif len(markdown) > 1_048_576:
-            raise McpApiError("invalid_arguments", "markdown exceeds Slack's 1 MiB Canvas limit")
+        elif len(markdown) > MCP_CANVAS_MARKDOWN_LIMIT:
+            raise McpApiError(
+                "invalid_arguments",
+                f"markdown exceeds the MCP Canvas limit of {MCP_CANVAS_MARKDOWN_LIMIT} characters",
+            )
         slack_operation = {"append": "insert_at_end", "prepend": "insert_at_start",
                            "rename": "rename"}[operation]
         try:
@@ -628,9 +697,18 @@ class McpFacade:
         if post_at > now + 120 * 86400:
             raise McpApiError("invalid_arguments", "post_at cannot exceed 120 days")
         task = self._owned_task(ctx, task_id)
-        result = await self.bot.schedule_message(
-            task.channel_id, task.root_ts, text=text, post_at=post_at
-        )
+        try:
+            result = await self.bot.schedule_message(
+                task.channel_id, task.root_ts, text=text, post_at=post_at
+            )
+        except Exception as exc:
+            if slack_error_code(exc) == "restricted_too_many":
+                raise McpApiError(
+                    "rate_limited",
+                    "Slack allows at most 30 scheduled messages per five-minute channel window",
+                    retryable=True,
+                ) from exc
+            raise
         scheduled_id = str(result.get("scheduled_message_id") or "")
         if not scheduled_id:
             raise McpApiError("schedule_failed", "Slack did not return a scheduled message ID")

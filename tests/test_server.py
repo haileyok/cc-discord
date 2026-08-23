@@ -11,8 +11,14 @@ import pytest
 from aiohttp import test_utils
 
 from bridge.bot import Bot
-from bridge.mcp_api import McpCapability
-from bridge.server import build_app, make_interaction_dispatcher, make_message_dispatcher, make_socket_dispatcher
+from bridge.mcp_api import McpApiError, McpCapability
+from bridge.server import (
+    PRODUCTION_MCP_CAPABILITIES,
+    build_app,
+    make_interaction_dispatcher,
+    make_message_dispatcher,
+    make_socket_dispatcher,
+)
 from bridge.tasks import normalize_message
 import bridge.server as server_module
 
@@ -93,6 +99,56 @@ async def test_private_mcp_rpc_requires_auth_and_derives_principal() -> None:
     assert context.team_id == "T1"
     assert context.request_id == "request-1"
     assert context.capabilities == frozenset({McpCapability.READ})
+
+
+@pytest.mark.asyncio
+async def test_private_mcp_rpc_defaults_to_deny_all_capabilities() -> None:
+    class Facade:
+        owner_user_id = "UOWNER"
+        team_id = "T1"
+
+        async def call(self, tool, arguments, context):
+            assert context.capabilities == frozenset()
+            raise McpApiError("capability_denied", "Tool requires read capability")
+
+    app = await build_app(
+        LocalBot(), mcp_facade=Facade(), mcp_token="private-token",
+    )
+    async with test_utils.TestClient(test_utils.TestServer(app)) as client:
+        response = await client.post(
+            "/v1/mcp/call", headers={"Authorization": "Bearer private-token"},
+            json={"tool": "bridge_health", "arguments": {}},
+        )
+        assert response.status == 403
+        assert (await response.json())["error"]["code"] == "capability_denied"
+
+
+def test_production_mcp_policy_explicitly_enables_registered_capability_tiers() -> None:
+    assert PRODUCTION_MCP_CAPABILITIES == frozenset(McpCapability)
+
+
+@pytest.mark.asyncio
+async def test_private_mcp_rpc_returns_stable_internal_error_for_unexpected_bug() -> None:
+    class Facade:
+        owner_user_id = "UOWNER"
+        team_id = "T1"
+
+        async def call(self, tool, arguments, context):
+            raise RuntimeError("sensitive implementation detail")
+
+    app = await build_app(LocalBot(), mcp_facade=Facade(), mcp_token="private-token")
+    async with test_utils.TestClient(test_utils.TestServer(app)) as client:
+        response = await client.post(
+            "/v1/mcp/call", headers={"Authorization": "Bearer private-token"},
+            json={"tool": "bridge_health", "arguments": {}},
+        )
+        assert response.status == 500
+        body = await response.json()
+        assert body["error"] == {
+            "code": "internal_error", "message": "Bridge MCP operation failed",
+            "retryable": True,
+        }
+        assert "sensitive implementation detail" not in json.dumps(body)
 
 
 @pytest.mark.asyncio

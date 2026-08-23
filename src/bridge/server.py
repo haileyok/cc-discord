@@ -34,6 +34,11 @@ MCP_FACADE_KEY: web.AppKey[Any] = web.AppKey("mcp_facade", object)
 MCP_TOKEN_KEY: web.AppKey[str] = web.AppKey("mcp_token", str)
 MCP_CAPABILITIES_KEY: web.AppKey[Any] = web.AppKey("mcp_capabilities", object)
 MCP_MAX_REQUEST_BYTES = 64 * 1024
+# The deployed bridge is a single-operator localhost service: possession of
+# its separate 0600 bearer token grants the complete explicitly registered
+# suite. build_app itself defaults to deny-all so tests/alternate embedders
+# cannot gain capabilities by omission.
+PRODUCTION_MCP_CAPABILITIES = frozenset(McpCapability)
 
 
 def _value(source: Any, *names: str, default: Any = None) -> Any:
@@ -117,6 +122,14 @@ async def _handle_mcp_call(request: web.Request) -> web.Response:
     except McpApiError as exc:
         status = {"forbidden": 403, "capability_denied": 403, "task_not_found": 404, "rate_limited": 429}.get(exc.code, 400)
         return web.json_response(exc.as_dict(), status=status)
+    except Exception as exc:
+        log.warning("unexpected MCP RPC failure request=%s: %s", request_id[:12],
+                    safe_error(exc, "operation failed"))
+        return web.json_response({
+            "ok": False,
+            "error": {"code": "internal_error", "message": "Bridge MCP operation failed",
+                      "retryable": True},
+        }, status=500)
     return web.json_response(response)
 
 
@@ -190,7 +203,9 @@ async def build_app(bot: Bot, *, task_registry: TaskRegistry | None = None,
     if mcp_facade is not None and mcp_token:
         app[MCP_FACADE_KEY] = mcp_facade
         app[MCP_TOKEN_KEY] = mcp_token
-        app[MCP_CAPABILITIES_KEY] = mcp_capabilities or frozenset(McpCapability)
+        app[MCP_CAPABILITIES_KEY] = (
+            frozenset() if mcp_capabilities is None else mcp_capabilities
+        )
         app.router.add_post("/v1/mcp/call", _handle_mcp_call)
     return app
 
@@ -268,6 +283,7 @@ async def serve(
 
         app = await build_app(
             bot, task_registry=task_registry, mcp_facade=mcp_facade, mcp_token=mcp_token,
+            mcp_capabilities=PRODUCTION_MCP_CAPABILITIES,
         )
         runner = web.AppRunner(app)
         await runner.setup()
