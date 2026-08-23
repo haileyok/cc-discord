@@ -89,6 +89,12 @@ class McpFacade:
         "bridge_set_effort": (McpCapability.CONTROL, "_set_effort"),
         "bridge_stop_task": (McpCapability.DESTRUCTIVE, "_stop_task"),
         "bridge_clear_context": (McpCapability.DESTRUCTIVE, "_clear_context"),
+        "slack_read_thread": (McpCapability.READ, "_read_thread"),
+        "slack_post_message": (McpCapability.WRITE, "_post_message"),
+        "slack_edit_message": (McpCapability.WRITE, "_edit_message"),
+        "slack_add_reaction": (McpCapability.WRITE, "_add_reaction"),
+        "slack_remove_reaction": (McpCapability.WRITE, "_remove_reaction"),
+        "slack_delete_message": (McpCapability.DESTRUCTIVE, "_delete_message"),
     }, init=False, repr=False)
 
     async def call(self, tool: str, arguments: Mapping[str, Any], ctx: McpContext) -> dict[str, Any]:
@@ -231,6 +237,95 @@ class McpFacade:
             raise McpApiError("confirmation_required", "clear_context requires confirm=true")
         self._owned_task(ctx, task_id); await self.registry.clear_context(task_id, owner_user_id=ctx.owner_user_id)
         return {"task_id": task_id, "cleared": True}
+
+    @staticmethod
+    def _next_cursor(page: Mapping[str, Any]) -> str | None:
+        metadata = page.get("response_metadata")
+        if isinstance(metadata, Mapping):
+            value = str(metadata.get("next_cursor") or "").strip()
+            return value or None
+        return None
+
+    @staticmethod
+    def _safe_message(message: Mapping[str, Any]) -> dict[str, Any]:
+        files = []
+        for item in message.get("files") or []:
+            if isinstance(item, Mapping):
+                files.append({key: item.get(key) for key in ("id", "name", "title", "mimetype", "size", "permalink") if item.get(key) is not None})
+        return {
+            "ts": str(message.get("ts") or ""),
+            "thread_ts": str(message.get("thread_ts") or "") or None,
+            "actor_id": str(message.get("user") or message.get("bot_id") or "") or None,
+            "text": str(message.get("text") or "")[:8_000],
+            "files": files[:20],
+        }
+
+    async def _thread_messages(self, task: Any, *, max_messages: int = 200) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(5):
+            page = await self.bot.fetch_thread_replies(task.channel_id, task.root_ts, cursor=cursor, limit=min(100, max_messages - len(messages)))
+            for item in page.get("messages") or []:
+                if isinstance(item, Mapping):
+                    messages.append(self._safe_message(item))
+                    if len(messages) >= max_messages:
+                        return messages
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        return messages
+
+    async def _require_thread_message(self, task: Any, message_ts: str) -> None:
+        if message_ts == task.root_ts:
+            return
+        messages = await self._thread_messages(task)
+        if not any(item["ts"] == message_ts for item in messages):
+            raise McpApiError("message_not_in_task", "Message is not in the owned task thread")
+
+    async def _read_thread(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        task = self._owned_task(ctx, task_id)
+        try:
+            maximum = max(1, min(int(args.get("limit", 100)), 200))
+        except (TypeError, ValueError) as exc:
+            raise McpApiError("invalid_arguments", "limit must be an integer") from exc
+        messages = await self._thread_messages(task, max_messages=maximum)
+        return {"task_id": task_id, "channel_id": task.channel_id, "root_ts": task.root_ts, "messages": messages, "count": len(messages)}
+
+    async def _post_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80); text = self._text(args, "text", limit=32_000)
+        task = self._owned_task(ctx, task_id)
+        ids = await self.bot.post(text, channel_id=task.channel_id, root_ts=task.root_ts)
+        return {"task_id": task_id, "message_ts": ids[0] if ids else None, "message_count": len(ids)}
+
+    async def _edit_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)
+        text = self._text(args, "text", limit=32_000); task = self._owned_task(ctx, task_id)
+        await self._require_thread_message(task, message_ts)
+        await self.bot.edit_message(task.channel_id, message_ts, text=text)
+        return {"task_id": task_id, "message_ts": message_ts, "edited": True}
+
+    async def _add_reaction(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        return await self._reaction(ctx, args, remove=False)
+
+    async def _remove_reaction(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        return await self._reaction(ctx, args, remove=True)
+
+    async def _reaction(self, ctx: McpContext, args: Mapping[str, Any], *, remove: bool) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)
+        emoji = self._text(args, "emoji", limit=80); task = self._owned_task(ctx, task_id)
+        await self._require_thread_message(task, message_ts)
+        method = self.bot.remove_reaction if remove else self.bot.add_reaction
+        await method(task.channel_id, message_ts, emoji)
+        return {"task_id": task_id, "message_ts": message_ts, "emoji": emoji.strip(":"), "removed": remove}
+
+    async def _delete_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)
+        if args.get("confirm") is not True:
+            raise McpApiError("confirmation_required", "delete_message requires confirm=true")
+        task = self._owned_task(ctx, task_id); await self._require_thread_message(task, message_ts)
+        await self.bot.delete_message(task.channel_id, message_ts)
+        return {"task_id": task_id, "message_ts": message_ts, "deleted": True}
 
 
 __all__ = ["McpApiError", "McpCapability", "McpContext", "McpFacade", "SlidingWindowLimiter"]

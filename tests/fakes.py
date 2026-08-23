@@ -358,6 +358,12 @@ class FakeSlackClient:
     async def conversations_replies(self, **kwargs: Any) -> Any:
         return await self._call("conversations_replies", **kwargs)
 
+    async def conversations_history(self, **kwargs: Any) -> Any:
+        return await self._call("conversations_history", **kwargs)
+
+    async def conversations_list(self, **kwargs: Any) -> Any:
+        return await self._call("conversations_list", **kwargs)
+
 
 @dataclass
 class FakeEnvelopeAcknowledger:

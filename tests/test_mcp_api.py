@@ -8,8 +8,36 @@ from bridge.mcp_api import McpApiError, McpCapability, McpContext, McpFacade, Sl
 
 
 class Bot:
+    def __init__(self):
+        self.calls = []
+        self.thread_pages = [{
+            "messages": [
+                {"ts": "1.0", "user": "UOWNER", "text": "root"},
+                {"ts": "1.1", "bot_id": "BOTHER", "text": "reply", "files": [{"id": "F1", "name": "report.txt", "url_private": "must-not-leak"}]},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }]
+
     def health(self):
         return {"bot_connected": True, "team_id": "T1", "bot_token": "never"}
+
+    async def fetch_thread_replies(self, channel_id, root_ts, **kwargs):
+        self.calls.append(("read", channel_id, root_ts, kwargs)); return self.thread_pages.pop(0)
+
+    async def post(self, text, *, channel_id, root_ts):
+        self.calls.append(("post", text, channel_id, root_ts)); return ["1.2"]
+
+    async def edit_message(self, channel_id, message_ts, *, text):
+        self.calls.append(("edit", channel_id, message_ts, text))
+
+    async def delete_message(self, channel_id, message_ts):
+        self.calls.append(("delete", channel_id, message_ts))
+
+    async def add_reaction(self, channel_id, message_ts, emoji):
+        self.calls.append(("react", channel_id, message_ts, emoji))
+
+    async def remove_reaction(self, channel_id, message_ts, emoji):
+        self.calls.append(("unreact", channel_id, message_ts, emoji))
 
 
 class Registry:
@@ -106,6 +134,38 @@ async def test_idempotency_returns_cached_result_and_rejects_conflicts(facade):
     with pytest.raises(McpApiError) as conflict:
         await facade.call("bridge_set_facet", {"task_id": "task-1", "facet": "plan"}, control)
     assert conflict.value.code == "idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_thread_read_is_bounded_and_omits_private_file_urls(facade):
+    result = await facade.call("slack_read_thread", {"task_id": "task-1", "limit": 20}, ctx(McpCapability.READ))
+    assert result["result"]["count"] == 2
+    assert result["result"]["messages"][1]["files"] == [{"id": "F1", "name": "report.txt"}]
+    assert "url_private" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_message_write_is_task_scoped_and_idempotent(facade):
+    write = ctx(McpCapability.WRITE)
+    first = await facade.call("slack_post_message", {"task_id": "task-1", "text": "hello"}, write)
+    second = await facade.call("slack_post_message", {"task_id": "task-1", "text": "hello"}, write)
+    assert first == second
+    assert facade.bot.calls == [("post", "hello", "C1", "1.0")]
+
+
+@pytest.mark.asyncio
+async def test_reaction_target_must_be_in_owned_thread(facade):
+    write = ctx(McpCapability.WRITE)
+    await facade.call("slack_add_reaction", {"task_id": "task-1", "message_ts": "1.1", "emoji": ":eyes:"}, write)
+    assert facade.bot.calls[-1] == ("react", "C1", "1.1", ":eyes:")
+
+
+@pytest.mark.asyncio
+async def test_delete_requires_confirmation(facade):
+    destructive = ctx(McpCapability.DESTRUCTIVE)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call("slack_delete_message", {"task_id": "task-1", "message_ts": "1.0"}, destructive)
+    assert missing.value.code == "confirmation_required"
 
 
 def test_sliding_window_rate_limit():

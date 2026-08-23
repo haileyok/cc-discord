@@ -92,6 +92,42 @@ async def bridge_clear_context(task_id: str, confirm: bool = False) -> dict[str,
     return await _rpc("bridge_clear_context", {"task_id": task_id, "confirm": confirm})
 
 
+@server.tool()
+async def slack_read_thread(task_id: str, limit: int = 100) -> dict[str, Any]:
+    """Read a bounded, sanitized history of an owned task's Slack thread."""
+    return await _rpc("slack_read_thread", {"task_id": task_id, "limit": limit})
+
+
+@server.tool()
+async def slack_post_message(task_id: str, text: str) -> dict[str, Any]:
+    """Post a message in an owned task thread."""
+    return await _rpc("slack_post_message", {"task_id": task_id, "text": text})
+
+
+@server.tool()
+async def slack_edit_message(task_id: str, message_ts: str, text: str) -> dict[str, Any]:
+    """Edit a bot-authored message within an owned task thread."""
+    return await _rpc("slack_edit_message", {"task_id": task_id, "message_ts": message_ts, "text": text})
+
+
+@server.tool()
+async def slack_add_reaction(task_id: str, message_ts: str, emoji: str) -> dict[str, Any]:
+    """Add a reaction to a message within an owned task thread."""
+    return await _rpc("slack_add_reaction", {"task_id": task_id, "message_ts": message_ts, "emoji": emoji})
+
+
+@server.tool()
+async def slack_remove_reaction(task_id: str, message_ts: str, emoji: str) -> dict[str, Any]:
+    """Remove the bot's reaction from a message within an owned task thread."""
+    return await _rpc("slack_remove_reaction", {"task_id": task_id, "message_ts": message_ts, "emoji": emoji})
+
+
+@server.tool()
+async def slack_delete_message(task_id: str, message_ts: str, confirm: bool = False) -> dict[str, Any]:
+    """Delete a bot-authored message in an owned task thread. Requires confirm=true."""
+    return await _rpc("slack_delete_message", {"task_id": task_id, "message_ts": message_ts, "confirm": confirm})
+
+
 def main() -> None:
     server.run("stdio")
 

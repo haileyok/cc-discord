@@ -1193,6 +1193,47 @@ class Bot:
             return data
         raise SlackAdapterError("conversations.replies returned malformed data")
 
+    async def fetch_channel_history(self, channel_id: str, *, cursor: str | None = None,
+                                    limit: int = 100, oldest: str | None = None,
+                                    latest: str | None = None) -> Mapping[str, Any]:
+        """Fetch one bounded authenticated page from a joined conversation."""
+        if not channel_id:
+            raise ValueError("channel_id is required")
+        kwargs: dict[str, Any] = {
+            "channel": str(channel_id), "limit": max(1, min(int(limit), 100)),
+            "inclusive": True,
+        }
+        if cursor:
+            kwargs["cursor"] = str(cursor)
+        if oldest:
+            kwargs["oldest"] = str(oldest)
+        if latest:
+            kwargs["latest"] = str(latest)
+        result = await self._api("conversations_history", **kwargs)
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("conversations.history returned malformed data")
+
+    async def list_conversations(self, *, cursor: str | None = None, limit: int = 100,
+                                 types: str = "public_channel,private_channel") -> Mapping[str, Any]:
+        """List one bounded page of conversations visible to the bot."""
+        kwargs: dict[str, Any] = {
+            "limit": max(1, min(int(limit), 100)), "types": str(types),
+            "exclude_archived": True,
+        }
+        if cursor:
+            kwargs["cursor"] = str(cursor)
+        result = await self._api("conversations_list", **kwargs)
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("conversations.list returned malformed data")
+
     async def create_channel(self, name: str, *, private: bool = True,
                              invite_user_id: str | None = None) -> str:
         self._require_ready()
