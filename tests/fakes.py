@@ -343,6 +343,18 @@ class FakeSlackClient:
     async def canvases_edit(self, **kwargs: Any) -> Any:
         return await self._call("canvases_edit", **kwargs)
 
+    async def conversations_setTopic(self, **kwargs: Any) -> Any:
+        return await self._call("conversations_setTopic", **kwargs)
+
+    async def conversations_setPurpose(self, **kwargs: Any) -> Any:
+        return await self._call("conversations_setPurpose", **kwargs)
+
+    async def bookmarks_add(self, **kwargs: Any) -> Any:
+        return await self._call("bookmarks_add", **kwargs)
+
+    async def bookmarks_remove(self, **kwargs: Any) -> Any:
+        return await self._call("bookmarks_remove", **kwargs)
+
     async def files_getUploadURLExternal(self, **kwargs: Any) -> Any:
         return await self._call("files_getUploadURLExternal", **kwargs)
 

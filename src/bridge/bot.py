@@ -1324,6 +1324,45 @@ class Bot:
             raise ValueError("Slack bot is not a member of channel")
         return channel
 
+    async def set_managed_channel_metadata(self, channel_id: str, *,
+                                           topic: str | None = None,
+                                           purpose: str | None = None) -> Any:
+        """Set topic/purpose only after independently verifying managed ownership."""
+        await self._verify_managed_private_channel(channel_id)
+        if (topic is None) == (purpose is None):
+            raise ValueError("exactly one of topic or purpose is required")
+        if topic is not None:
+            return await self._api("conversations_setTopic", channel=channel_id,
+                                   topic=str(topic)[:250])
+        return await self._api("conversations_setPurpose", channel=channel_id,
+                               purpose=str(purpose)[:250])
+
+    async def add_managed_channel_bookmark(self, channel_id: str, *, title: str,
+                                           link: str, emoji: str | None = None) -> Mapping[str, Any]:
+        await self._verify_managed_private_channel(channel_id)
+        parsed = urlparse(link)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("bookmark link must be an absolute HTTP(S) URL")
+        kwargs: dict[str, Any] = {
+            "channel_id": channel_id, "title": str(title)[:250],
+            "type": "link", "link": link,
+        }
+        if emoji:
+            kwargs["emoji"] = str(emoji).strip().strip(":")[:80]
+        result = await self._api("bookmarks_add", **kwargs)
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("bookmarks.add returned malformed data")
+
+    async def remove_managed_channel_bookmark(self, channel_id: str,
+                                              bookmark_id: str) -> None:
+        await self._verify_managed_private_channel(channel_id)
+        await self._api("bookmarks_remove", channel_id=channel_id,
+                        bookmark_id=str(bookmark_id))
+
     async def invite_channel(self, channel_id: str, user_id: str) -> Any:
         if not channel_id or not user_id:
             raise ValueError("channel_id and user_id are required")

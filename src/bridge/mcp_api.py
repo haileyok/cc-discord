@@ -108,6 +108,11 @@ class McpFacade:
         "slack_download_thread_file": (McpCapability.READ, "_download_thread_file"),
         "slack_create_canvas": (McpCapability.WRITE, "_create_canvas"),
         "slack_edit_canvas": (McpCapability.WRITE, "_edit_canvas"),
+        "slack_set_channel_metadata": (McpCapability.CHANNEL_ADMIN, "_set_channel_metadata"),
+        "slack_invite_participants": (McpCapability.CHANNEL_ADMIN, "_invite_participants"),
+        "slack_remove_participants": (McpCapability.DESTRUCTIVE, "_remove_participants"),
+        "slack_add_bookmark": (McpCapability.CHANNEL_ADMIN, "_add_bookmark"),
+        "slack_remove_bookmark": (McpCapability.DESTRUCTIVE, "_remove_bookmark"),
         "slack_edit_message": (McpCapability.WRITE, "_edit_message"),
         "slack_add_reaction": (McpCapability.WRITE, "_add_reaction"),
         "slack_remove_reaction": (McpCapability.WRITE, "_remove_reaction"),
@@ -463,6 +468,82 @@ class McpFacade:
             raise self._canvas_error(exc) from exc
         return {"task_id": task_id, "canvas_id": canvas_id,
                 "operation": operation, "edited": True}
+
+    def _owned_managed_channel_task(self, ctx: McpContext, task_id: str) -> Any:
+        task = self._owned_task(ctx, task_id)
+        if not bool(getattr(task, "channel_owned", False)):
+            raise McpApiError(
+                "channel_not_managed",
+                "Task is not bound to a bridge-owned private channel",
+            )
+        return task
+
+    @staticmethod
+    def _user_ids(args: Mapping[str, Any]) -> list[str]:
+        raw = args.get("user_ids")
+        if not isinstance(raw, list) or not raw or len(raw) > 50:
+            raise McpApiError("invalid_arguments", "user_ids must be a non-empty list of at most 50 IDs")
+        values = list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+        if not values or any(len(item) > 100 for item in values):
+            raise McpApiError("invalid_arguments", "user_ids contains an invalid ID")
+        return values
+
+    async def _set_channel_metadata(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        field_name = self._text(args, "field", limit=20)
+        value = self._text(args, "value", limit=250)
+        if field_name not in {"topic", "purpose"}:
+            raise McpApiError("invalid_arguments", "field must be topic or purpose")
+        task = self._owned_managed_channel_task(ctx, task_id)
+        await self.bot.set_managed_channel_metadata(
+            task.channel_id, **{field_name: value}
+        )
+        return {"task_id": task_id, "channel_id": task.channel_id,
+                "field": field_name, "updated": True}
+
+    async def _invite_participants(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        users = self._user_ids(args)
+        task = self._owned_managed_channel_task(ctx, task_id)
+        await self.bot.invite_participants(task.channel_id, users)
+        return {"task_id": task_id, "channel_id": task.channel_id,
+                "user_ids": users, "invited": True}
+
+    async def _remove_participants(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        if args.get("confirm") is not True:
+            raise McpApiError("confirmation_required", "remove_participants requires confirm=true")
+        users = self._user_ids(args)
+        if ctx.owner_user_id in users:
+            raise McpApiError("invalid_arguments", "Task owner cannot be removed by MCP")
+        task = self._owned_managed_channel_task(ctx, task_id)
+        await self.bot.remove_participants(task.channel_id, users)
+        return {"task_id": task_id, "channel_id": task.channel_id,
+                "user_ids": users, "removed": True}
+
+    async def _add_bookmark(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        title = self._text(args, "title", limit=250)
+        link = self._text(args, "link", limit=2_000)
+        emoji = str(args.get("emoji") or "").strip()[:80] or None
+        task = self._owned_managed_channel_task(ctx, task_id)
+        result = await self.bot.add_managed_channel_bookmark(
+            task.channel_id, title=title, link=link, emoji=emoji
+        )
+        bookmark = result.get("bookmark") if isinstance(result, Mapping) else None
+        bookmark_id = bookmark.get("id") if isinstance(bookmark, Mapping) else None
+        return {"task_id": task_id, "channel_id": task.channel_id,
+                "bookmark_id": str(bookmark_id) if bookmark_id else None, "added": True}
+
+    async def _remove_bookmark(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        bookmark_id = self._text(args, "bookmark_id", limit=100)
+        if args.get("confirm") is not True:
+            raise McpApiError("confirmation_required", "remove_bookmark requires confirm=true")
+        task = self._owned_managed_channel_task(ctx, task_id)
+        await self.bot.remove_managed_channel_bookmark(task.channel_id, bookmark_id)
+        return {"task_id": task_id, "channel_id": task.channel_id,
+                "bookmark_id": bookmark_id, "removed": True}
 
     async def _edit_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)

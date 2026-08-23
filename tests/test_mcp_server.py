@@ -24,8 +24,10 @@ async def test_mcp_server_registers_only_explicit_tools(monkeypatch):
             "bridge_set_effort", "bridge_stop_task", "bridge_clear_context",
             "slack_read_thread", "slack_read_channel_history", "slack_search_task_messages",
             "slack_post_message", "slack_upload_file", "slack_download_thread_file",
-            "slack_create_canvas", "slack_edit_canvas", "slack_edit_message",
-            "slack_add_reaction", "slack_remove_reaction",
+            "slack_create_canvas", "slack_edit_canvas", "slack_set_channel_metadata",
+            "slack_invite_participants", "slack_remove_participants", "slack_add_bookmark",
+            "slack_remove_bookmark", "slack_edit_message", "slack_add_reaction",
+            "slack_remove_reaction",
             "slack_delete_message",
         }
         result = await client.call_tool("bridge_task_status", {"task_id": "task-1"})

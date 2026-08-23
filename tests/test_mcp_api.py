@@ -43,6 +43,22 @@ class Bot:
     async def edit_canvas(self, canvas_id, **kwargs):
         self.calls.append(("canvas_edit", canvas_id, kwargs)); return {"ok": True}
 
+    async def set_managed_channel_metadata(self, channel_id, **kwargs):
+        self.calls.append(("channel_metadata", channel_id, kwargs))
+
+    async def invite_participants(self, channel_id, user_ids):
+        self.calls.append(("invite", channel_id, user_ids))
+
+    async def remove_participants(self, channel_id, user_ids):
+        self.calls.append(("remove_users", channel_id, user_ids))
+
+    async def add_managed_channel_bookmark(self, channel_id, **kwargs):
+        self.calls.append(("bookmark_add", channel_id, kwargs))
+        return {"bookmark": {"id": "Bk1"}}
+
+    async def remove_managed_channel_bookmark(self, channel_id, bookmark_id):
+        self.calls.append(("bookmark_remove", channel_id, bookmark_id))
+
     async def post(self, text, *, channel_id, root_ts):
         self.calls.append(("post", text, channel_id, root_ts)); return ["1.2"]
 
@@ -245,6 +261,70 @@ async def test_canvas_edit_rejects_untracked_canvas(facade):
             ctx(McpCapability.WRITE),
         )
     assert denied.value.code == "canvas_not_in_task"
+
+
+@pytest.mark.asyncio
+async def test_channel_admin_requires_bridge_owned_task_channel(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call(
+            "slack_set_channel_metadata",
+            {"task_id": "task-1", "field": "topic", "value": "Deploy"},
+            ctx(McpCapability.CHANNEL_ADMIN),
+        )
+    assert denied.value.code == "channel_not_managed"
+
+
+@pytest.mark.asyncio
+async def test_managed_channel_metadata_membership_and_bookmarks(facade):
+    facade.registry.task.channel_owned = True
+    await facade.call(
+        "slack_set_channel_metadata",
+        {"task_id": "task-1", "field": "purpose", "value": "Incident room"},
+        ctx(McpCapability.CHANNEL_ADMIN, request="meta"),
+    )
+    await facade.call(
+        "slack_invite_participants",
+        {"task_id": "task-1", "user_ids": ["U2", "U2", "U3"]},
+        ctx(McpCapability.CHANNEL_ADMIN, request="invite"),
+    )
+    added = await facade.call(
+        "slack_add_bookmark",
+        {"task_id": "task-1", "title": "Runbook", "link": "https://example.com/runbook"},
+        ctx(McpCapability.CHANNEL_ADMIN, request="bookmark"),
+    )
+    assert added["result"]["bookmark_id"] == "Bk1"
+    assert facade.bot.calls == [
+        ("channel_metadata", "C1", {"purpose": "Incident room"}),
+        ("invite", "C1", ["U2", "U3"]),
+        ("bookmark_add", "C1", {
+            "title": "Runbook", "link": "https://example.com/runbook", "emoji": None,
+        }),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_destructive_channel_actions_require_confirmation_and_protect_owner(facade):
+    facade.registry.task.channel_owned = True
+    destructive = ctx(McpCapability.DESTRUCTIVE)
+    with pytest.raises(McpApiError) as missing:
+        await facade.call(
+            "slack_remove_participants", {"task_id": "task-1", "user_ids": ["U2"]},
+            destructive,
+        )
+    assert missing.value.code == "confirmation_required"
+    with pytest.raises(McpApiError) as owner:
+        await facade.call(
+            "slack_remove_participants",
+            {"task_id": "task-1", "user_ids": ["UOWNER"], "confirm": True},
+            ctx(McpCapability.DESTRUCTIVE, request="owner-remove"),
+        )
+    assert owner.value.code == "invalid_arguments"
+    removed = await facade.call(
+        "slack_remove_bookmark",
+        {"task_id": "task-1", "bookmark_id": "Bk1", "confirm": True},
+        ctx(McpCapability.DESTRUCTIVE, request="bookmark-remove"),
+    )
+    assert removed["result"]["removed"] is True
 
 
 @pytest.mark.asyncio

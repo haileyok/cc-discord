@@ -150,6 +150,47 @@ async def slack_edit_canvas(task_id: str, canvas_id: str, operation: str,
 
 
 @server.tool()
+async def slack_set_channel_metadata(task_id: str, field: str, value: str) -> dict[str, Any]:
+    """Set topic or purpose on a bridge-owned private task channel."""
+    return await _rpc("slack_set_channel_metadata", {
+        "task_id": task_id, "field": field, "value": value,
+    })
+
+
+@server.tool()
+async def slack_invite_participants(task_id: str, user_ids: list[str]) -> dict[str, Any]:
+    """Invite Slack users to a bridge-owned private task channel."""
+    return await _rpc("slack_invite_participants", {"task_id": task_id, "user_ids": user_ids})
+
+
+@server.tool()
+async def slack_remove_participants(task_id: str, user_ids: list[str],
+                                    confirm: bool = False) -> dict[str, Any]:
+    """Remove non-owner users from a managed task channel. Requires confirm=true."""
+    return await _rpc("slack_remove_participants", {
+        "task_id": task_id, "user_ids": user_ids, "confirm": confirm,
+    })
+
+
+@server.tool()
+async def slack_add_bookmark(task_id: str, title: str, link: str,
+                             emoji: str | None = None) -> dict[str, Any]:
+    """Add an HTTP(S) link bookmark to a bridge-owned private task channel."""
+    return await _rpc("slack_add_bookmark", {
+        "task_id": task_id, "title": title, "link": link, "emoji": emoji,
+    })
+
+
+@server.tool()
+async def slack_remove_bookmark(task_id: str, bookmark_id: str,
+                                confirm: bool = False) -> dict[str, Any]:
+    """Remove a bookmark from a managed task channel. Requires confirm=true."""
+    return await _rpc("slack_remove_bookmark", {
+        "task_id": task_id, "bookmark_id": bookmark_id, "confirm": confirm,
+    })
+
+
+@server.tool()
 async def slack_edit_message(task_id: str, message_ts: str, text: str) -> dict[str, Any]:
     """Edit a bot-authored message within an owned task thread."""
     return await _rpc("slack_edit_message", {"task_id": task_id, "message_ts": message_ts, "text": text})
