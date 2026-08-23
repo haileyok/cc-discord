@@ -24,6 +24,19 @@ class Bot:
     async def fetch_thread_replies(self, channel_id, root_ts, **kwargs):
         self.calls.append(("read", channel_id, root_ts, kwargs)); return self.thread_pages.pop(0)
 
+    async def fetch_channel_history(self, channel_id, **kwargs):
+        self.calls.append(("history", channel_id, kwargs))
+        return {"messages": [{"ts": "2.0", "user": "UOWNER", "text": "channel item"}],
+                "response_metadata": {"next_cursor": ""}}
+
+    async def upload_file(self, path, **kwargs):
+        self.calls.append(("upload", str(path), kwargs)); return {"file_id": "FUP"}
+
+    async def download_file(self, url, destination, max_bytes):
+        self.calls.append(("download", url, str(destination), max_bytes))
+        destination.write_bytes(b"data")
+        return destination
+
     async def post(self, text, *, channel_id, root_ts):
         self.calls.append(("post", text, channel_id, root_ts)); return ["1.2"]
 
@@ -142,6 +155,55 @@ async def test_thread_read_is_bounded_and_omits_private_file_urls(facade):
     assert result["result"]["count"] == 2
     assert result["result"]["messages"][1]["files"] == [{"id": "F1", "name": "report.txt"}]
     assert "url_private" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_channel_history_requires_cross_channel_capability(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call("slack_read_channel_history", {"task_id": "task-1"}, ctx(McpCapability.READ))
+    assert denied.value.code == "capability_denied"
+    result = await facade.call(
+        "slack_read_channel_history", {"task_id": "task-1"},
+        ctx(McpCapability.CROSS_CHANNEL, request="history-2"),
+    )
+    assert result["result"]["messages"][0]["text"] == "channel item"
+
+
+@pytest.mark.asyncio
+async def test_task_search_is_bounded_to_owned_thread(facade):
+    result = await facade.call(
+        "slack_search_task_messages", {"task_id": "task-1", "query": "REPLY"},
+        ctx(McpCapability.READ),
+    )
+    assert [item["ts"] for item in result["result"]["matches"]] == ["1.1"]
+
+
+@pytest.mark.asyncio
+async def test_upload_is_forced_into_owned_task_thread(facade, tmp_path):
+    source = tmp_path / "report.txt"; source.write_text("hello")
+    result = await facade.call(
+        "slack_upload_file", {"task_id": "task-1", "path": str(source)},
+        ctx(McpCapability.WRITE),
+    )
+    assert result["result"]["file_id"] == "FUP"
+    assert facade.bot.calls == [("upload", str(source), {
+        "channel_id": "C1", "root_ts": "1.0", "title": None, "initial_comment": None,
+    })]
+
+
+@pytest.mark.asyncio
+async def test_download_requires_file_membership_and_uses_private_url(facade, tmp_path, monkeypatch):
+    import bridge.mcp_api as mcp_api
+    monkeypatch.setattr(mcp_api, "ATTACHMENTS_DIR", tmp_path)
+    facade.bot.thread_pages[0]["messages"][1]["files"][0].update({
+        "url_private_download": "https://files.slack.com/private/F1/report.txt",
+    })
+    result = await facade.call(
+        "slack_download_thread_file", {"task_id": "task-1", "file_id": "F1"},
+        ctx(McpCapability.READ),
+    )
+    assert result["result"]["size"] == 4
+    assert result["result"]["path"].startswith(str(tmp_path))
 
 
 @pytest.mark.asyncio

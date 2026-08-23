@@ -8,10 +8,19 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from bridge.redaction import safe_error
-from bridge.tasks import TaskNotFound, TaskPrivilegeError, TaskRestartError, TaskRoutingError, TaskSpawnError
+from bridge.tasks import (
+    ATTACHMENTS_DIR,
+    MAX_ATTACHMENT_BYTES,
+    TaskNotFound,
+    TaskPrivilegeError,
+    TaskRestartError,
+    TaskRoutingError,
+    TaskSpawnError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +99,11 @@ class McpFacade:
         "bridge_stop_task": (McpCapability.DESTRUCTIVE, "_stop_task"),
         "bridge_clear_context": (McpCapability.DESTRUCTIVE, "_clear_context"),
         "slack_read_thread": (McpCapability.READ, "_read_thread"),
+        "slack_read_channel_history": (McpCapability.CROSS_CHANNEL, "_read_channel_history"),
+        "slack_search_task_messages": (McpCapability.READ, "_search_task_messages"),
         "slack_post_message": (McpCapability.WRITE, "_post_message"),
+        "slack_upload_file": (McpCapability.WRITE, "_upload_file"),
+        "slack_download_thread_file": (McpCapability.READ, "_download_thread_file"),
         "slack_edit_message": (McpCapability.WRITE, "_edit_message"),
         "slack_add_reaction": (McpCapability.WRITE, "_add_reaction"),
         "slack_remove_reaction": (McpCapability.WRITE, "_remove_reaction"),
@@ -292,11 +305,99 @@ class McpFacade:
         messages = await self._thread_messages(task, max_messages=maximum)
         return {"task_id": task_id, "channel_id": task.channel_id, "root_ts": task.root_ts, "messages": messages, "count": len(messages)}
 
+    async def _read_channel_history(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        task = self._owned_task(ctx, task_id)
+        try:
+            maximum = max(1, min(int(args.get("limit", 100)), 200))
+        except (TypeError, ValueError) as exc:
+            raise McpApiError("invalid_arguments", "limit must be an integer") from exc
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(2):
+            page = await self.bot.fetch_channel_history(
+                task.channel_id, cursor=cursor, limit=min(100, maximum - len(messages))
+            )
+            messages.extend(
+                self._safe_message(item) for item in page.get("messages") or []
+                if isinstance(item, Mapping)
+            )
+            if len(messages) >= maximum:
+                break
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        return {"task_id": task_id, "channel_id": task.channel_id,
+                "messages": messages[:maximum], "count": min(len(messages), maximum)}
+
+    async def _search_task_messages(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        query = self._text(args, "query", limit=500).casefold()
+        task = self._owned_task(ctx, task_id)
+        messages = await self._thread_messages(task, max_messages=200)
+        matches = [item for item in messages if query in str(item.get("text") or "").casefold()]
+        try:
+            maximum = max(1, min(int(args.get("limit", 25)), 100))
+        except (TypeError, ValueError) as exc:
+            raise McpApiError("invalid_arguments", "limit must be an integer") from exc
+        return {"task_id": task_id, "query": query, "matches": matches[:maximum],
+                "count": min(len(matches), maximum), "truncated": len(matches) > maximum}
+
     async def _post_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); text = self._text(args, "text", limit=32_000)
         task = self._owned_task(ctx, task_id)
         ids = await self.bot.post(text, channel_id=task.channel_id, root_ts=task.root_ts)
         return {"task_id": task_id, "message_ts": ids[0] if ids else None, "message_count": len(ids)}
+
+    async def _upload_file(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        path = Path(self._text(args, "path", limit=4096)).expanduser()
+        task = self._owned_task(ctx, task_id)
+        title = str(args.get("title") or "").strip()[:500] or None
+        comment = str(args.get("initial_comment") or "").strip()[:8_000] or None
+        result = await self.bot.upload_file(path, channel_id=task.channel_id, root_ts=task.root_ts,
+                                            title=title, initial_comment=comment)
+        file_id = None
+        if isinstance(result, Mapping):
+            file_id = result.get("file_id") or (result.get("file") or {}).get("id")
+        return {"task_id": task_id, "file_id": str(file_id) if file_id else None,
+                "name": path.name, "uploaded": True}
+
+    async def _download_thread_file(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        file_id = self._text(args, "file_id", limit=100)
+        task = self._owned_task(ctx, task_id)
+        cursor: str | None = None
+        selected: Mapping[str, Any] | None = None
+        for _ in range(5):
+            page = await self.bot.fetch_thread_replies(task.channel_id, task.root_ts,
+                                                       cursor=cursor, limit=100)
+            for message in page.get("messages") or []:
+                if not isinstance(message, Mapping):
+                    continue
+                for item in message.get("files") or []:
+                    if isinstance(item, Mapping) and str(item.get("id") or "") == file_id:
+                        selected = item
+                        break
+                if selected is not None:
+                    break
+            if selected is not None:
+                break
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        if selected is None:
+            raise McpApiError("file_not_in_task", "File is not in the owned task thread")
+        url = str(selected.get("url_private_download") or selected.get("url_private") or "")
+        if not url:
+            raise McpApiError("file_unavailable", "Slack file has no authenticated download URL")
+        filename = Path(str(selected.get("name") or selected.get("title") or file_id)).name
+        directory = ATTACHMENTS_DIR / task_id / "mcp-downloads"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = directory / f"{file_id}-{filename}"
+        await self.bot.download_file(url, destination, max_bytes=MAX_ATTACHMENT_BYTES)
+        return {"task_id": task_id, "file_id": file_id, "name": filename,
+                "size": destination.stat().st_size, "path": str(destination.resolve())}
 
     async def _edit_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)

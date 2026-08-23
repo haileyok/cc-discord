@@ -99,9 +99,35 @@ async def slack_read_thread(task_id: str, limit: int = 100) -> dict[str, Any]:
 
 
 @server.tool()
+async def slack_read_channel_history(task_id: str, limit: int = 100) -> dict[str, Any]:
+    """Read bounded history from an owned task's channel. Requires cross-channel capability."""
+    return await _rpc("slack_read_channel_history", {"task_id": task_id, "limit": limit})
+
+
+@server.tool()
+async def slack_search_task_messages(task_id: str, query: str, limit: int = 25) -> dict[str, Any]:
+    """Search text within the bounded history of an owned task thread."""
+    return await _rpc("slack_search_task_messages", {"task_id": task_id, "query": query, "limit": limit})
+
+
+@server.tool()
 async def slack_post_message(task_id: str, text: str) -> dict[str, Any]:
     """Post a message in an owned task thread."""
     return await _rpc("slack_post_message", {"task_id": task_id, "text": text})
+
+
+@server.tool()
+async def slack_upload_file(task_id: str, path: str, title: str | None = None,
+                            initial_comment: str | None = None) -> dict[str, Any]:
+    """Upload a local regular file into an owned task thread with bridge size limits."""
+    return await _rpc("slack_upload_file", {"task_id": task_id, "path": path,
+                                             "title": title, "initial_comment": initial_comment})
+
+
+@server.tool()
+async def slack_download_thread_file(task_id: str, file_id: str) -> dict[str, Any]:
+    """Download a Slack file proven to belong to an owned task thread into bridge state."""
+    return await _rpc("slack_download_thread_file", {"task_id": task_id, "file_id": file_id})
 
 
 @server.tool()

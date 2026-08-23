@@ -22,8 +22,10 @@ async def test_mcp_server_registers_only_explicit_tools(monkeypatch):
             "bridge_health", "bridge_list_tasks", "bridge_task_status",
             "bridge_compact_task", "bridge_set_model", "bridge_set_facet",
             "bridge_set_effort", "bridge_stop_task", "bridge_clear_context",
-            "slack_read_thread", "slack_post_message", "slack_edit_message",
-            "slack_add_reaction", "slack_remove_reaction", "slack_delete_message",
+            "slack_read_thread", "slack_read_channel_history", "slack_search_task_messages",
+            "slack_post_message", "slack_upload_file", "slack_download_thread_file",
+            "slack_edit_message", "slack_add_reaction", "slack_remove_reaction",
+            "slack_delete_message",
         }
         result = await client.call_tool("bridge_task_status", {"task_id": "task-1"})
         assert result.structured_content == {"tool": "bridge_task_status", "arguments": {"task_id": "task-1"}}
