@@ -176,6 +176,31 @@ class TestAC4WebApiAndRetry:
         assert call.kwargs == {"channel": "GTHREAD", "ts": "100.1", "limit": 100, "cursor": "cursor"}
 
     @pytest.mark.asyncio
+    async def test_canvas_create_and_edit_use_markdown_api_shapes(self) -> None:
+        client = FakeSlackClient(script=_startup_script() + [
+            ("canvases_create", {"ok": True, "canvas_id": "F-CANVAS"}),
+            ("canvases_edit", {"ok": True}),
+        ])
+        bot = _ready_bot(client=client)
+        await bot.start()
+        created = await bot.create_canvas(title="Plan", markdown="# Plan", channel_id="GHOME")
+        assert created["canvas_id"] == "F-CANVAS"
+        await bot.edit_canvas("F-CANVAS", operation="insert_at_end", markdown="## Update")
+        assert client.calls[-2].kwargs == {
+            "title": "Plan", "document_content": {"type": "markdown", "markdown": "# Plan"},
+            "channel_id": "GHOME",
+        }
+        assert client.calls[-1].kwargs == {
+            "canvas_id": "F-CANVAS",
+            "changes": [{"operation": "insert_at_end", "document_content": {
+                "type": "markdown", "markdown": "## Update",
+            }}],
+        }
+        with pytest.raises(ValueError, match="unsupported"):
+            await bot.edit_canvas("F-CANVAS", operation="delete")
+        client.assert_complete()
+
+    @pytest.mark.asyncio
     async def test_production_adapter_opens_interactive_modal(self) -> None:
         view = {"type": "modal", "callback_id": "bridge.configure", "title": {"type": "plain_text", "text": "Configure"}, "blocks": []}
         client = FakeSlackClient(

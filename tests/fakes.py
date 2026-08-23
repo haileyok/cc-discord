@@ -337,6 +337,12 @@ class FakeSlackClient:
     async def reactions_remove(self, **kwargs: Any) -> Any:
         return await self._call("reactions_remove", **kwargs)
 
+    async def canvases_create(self, **kwargs: Any) -> Any:
+        return await self._call("canvases_create", **kwargs)
+
+    async def canvases_edit(self, **kwargs: Any) -> Any:
+        return await self._call("canvases_edit", **kwargs)
+
     async def files_getUploadURLExternal(self, **kwargs: Any) -> Any:
         return await self._call("files_getUploadURLExternal", **kwargs)
 

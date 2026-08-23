@@ -131,6 +131,25 @@ async def slack_download_thread_file(task_id: str, file_id: str) -> dict[str, An
 
 
 @server.tool()
+async def slack_create_canvas(task_id: str, title: str, markdown: str) -> dict[str, Any]:
+    """Create a Markdown Canvas attached to an owned task channel."""
+    return await _rpc("slack_create_canvas", {
+        "task_id": task_id, "title": title, "markdown": markdown,
+    })
+
+
+@server.tool()
+async def slack_edit_canvas(task_id: str, canvas_id: str, operation: str,
+                            markdown: str | None = None,
+                            title: str | None = None) -> dict[str, Any]:
+    """Append, prepend, or rename a Canvas created for this task by the bridge."""
+    return await _rpc("slack_edit_canvas", {
+        "task_id": task_id, "canvas_id": canvas_id, "operation": operation,
+        "markdown": markdown, "title": title,
+    })
+
+
+@server.tool()
 async def slack_edit_message(task_id: str, message_ts: str, text: str) -> dict[str, Any]:
     """Edit a bot-authored message within an owned task thread."""
     return await _rpc("slack_edit_message", {"task_id": task_id, "message_ts": message_ts, "text": text})

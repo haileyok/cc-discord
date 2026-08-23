@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
+from bridge.bot import slack_error_code
 from bridge.redaction import safe_error
 from bridge.tasks import (
     ATTACHMENTS_DIR,
@@ -88,6 +89,7 @@ class McpFacade:
     limiter: SlidingWindowLimiter = field(default_factory=SlidingWindowLimiter)
     idempotency_ttl_secs: float = 600.0
     _idempotency: dict[str, _CacheEntry] = field(default_factory=dict, init=False, repr=False)
+    _canvas_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _TOOLS: dict[str, tuple[McpCapability, str]] = field(default_factory=lambda: {
         "bridge_health": (McpCapability.READ, "_bridge_health"),
         "bridge_list_tasks": (McpCapability.READ, "_list_tasks"),
@@ -104,6 +106,8 @@ class McpFacade:
         "slack_post_message": (McpCapability.WRITE, "_post_message"),
         "slack_upload_file": (McpCapability.WRITE, "_upload_file"),
         "slack_download_thread_file": (McpCapability.READ, "_download_thread_file"),
+        "slack_create_canvas": (McpCapability.WRITE, "_create_canvas"),
+        "slack_edit_canvas": (McpCapability.WRITE, "_edit_canvas"),
         "slack_edit_message": (McpCapability.WRITE, "_edit_message"),
         "slack_add_reaction": (McpCapability.WRITE, "_add_reaction"),
         "slack_remove_reaction": (McpCapability.WRITE, "_remove_reaction"),
@@ -398,6 +402,67 @@ class McpFacade:
         await self.bot.download_file(url, destination, max_bytes=MAX_ATTACHMENT_BYTES)
         return {"task_id": task_id, "file_id": file_id, "name": filename,
                 "size": destination.stat().st_size, "path": str(destination.resolve())}
+
+    @staticmethod
+    def _canvas_error(exc: Exception) -> McpApiError:
+        if slack_error_code(exc) in {
+            "missing_scope", "feature_disabled", "not_allowed_token_type",
+            "method_not_supported_for_channel_type", "unknown_method",
+        }:
+            return McpApiError(
+                "capability_unavailable",
+                "Slack Canvas is unavailable for this workspace, channel, or token scope",
+            )
+        return McpApiError("canvas_operation_failed", "Slack Canvas operation failed", retryable=True)
+
+    async def _create_canvas(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        title = self._text(args, "title", limit=500)
+        markdown = self._text(args, "markdown", limit=1_048_576)
+        task = self._owned_task(ctx, task_id)
+        try:
+            result = await self.bot.create_canvas(
+                title=title, markdown=markdown, channel_id=task.channel_id
+            )
+        except Exception as exc:
+            raise self._canvas_error(exc) from exc
+        canvas_id = str(result.get("canvas_id") or result.get("id") or "")
+        if not canvas_id:
+            raise McpApiError("canvas_operation_failed", "Slack did not return a Canvas ID")
+        self._canvas_tasks[canvas_id] = task_id
+        return {"task_id": task_id, "canvas_id": canvas_id, "title": title, "created": True}
+
+    async def _edit_canvas(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        canvas_id = self._text(args, "canvas_id", limit=100)
+        operation = self._text(args, "operation", limit=40)
+        self._owned_task(ctx, task_id)
+        if self._canvas_tasks.get(canvas_id) != task_id:
+            raise McpApiError(
+                "canvas_not_in_task",
+                "Canvas was not created for this owned task by the current bridge process",
+            )
+        if operation not in {"append", "prepend", "rename"}:
+            raise McpApiError("invalid_arguments", "operation must be append, prepend, or rename")
+        markdown = str(args.get("markdown") or "").strip()
+        title = str(args.get("title") or "").strip()
+        if operation == "rename":
+            if not title:
+                raise McpApiError("invalid_arguments", "title is required for rename")
+            title = title[:500]
+        elif not markdown:
+            raise McpApiError("invalid_arguments", "markdown is required for append or prepend")
+        elif len(markdown) > 1_048_576:
+            raise McpApiError("invalid_arguments", "markdown exceeds Slack's 1 MiB Canvas limit")
+        slack_operation = {"append": "insert_at_end", "prepend": "insert_at_start",
+                           "rename": "rename"}[operation]
+        try:
+            await self.bot.edit_canvas(canvas_id, operation=slack_operation,
+                                       markdown=markdown or None, title=title or None)
+        except Exception as exc:
+            raise self._canvas_error(exc) from exc
+        return {"task_id": task_id, "canvas_id": canvas_id,
+                "operation": operation, "edited": True}
 
     async def _edit_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)

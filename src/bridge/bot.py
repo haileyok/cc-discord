@@ -1174,6 +1174,51 @@ class Bot:
             raise SlackAdapterError("conversations.info returned malformed channel data")
         return channel
 
+    async def create_canvas(self, *, title: str, markdown: str,
+                            channel_id: str) -> Mapping[str, Any]:
+        """Create a standalone Markdown canvas tabbed into a task channel."""
+        if not channel_id:
+            raise ValueError("channel_id is required")
+        if len(markdown) > 1_048_576:
+            raise ValueError("canvas content exceeds Slack's 1 MiB limit")
+        result = await self._api(
+            "canvases_create", title=title,
+            document_content={"type": "markdown", "markdown": markdown},
+            channel_id=self._channel_for(channel_id),
+        )
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("canvases.create returned malformed data")
+
+    async def edit_canvas(self, canvas_id: str, *, operation: str,
+                          markdown: str | None = None,
+                          title: str | None = None) -> Mapping[str, Any]:
+        """Apply one non-destructive edit to a bridge-created Canvas."""
+        if operation not in {"insert_at_start", "insert_at_end", "rename"}:
+            raise ValueError("unsupported canvas edit operation")
+        change: dict[str, Any] = {"operation": operation}
+        if operation == "rename":
+            if not title:
+                raise ValueError("title is required for canvas rename")
+            change["title_content"] = {"type": "markdown", "markdown": title}
+        else:
+            content = markdown or ""
+            if not content:
+                raise ValueError("markdown is required for canvas content edit")
+            if len(content) > 1_048_576:
+                raise ValueError("canvas content exceeds Slack's 1 MiB limit")
+            change["document_content"] = {"type": "markdown", "markdown": content}
+        result = await self._api("canvases_edit", canvas_id=str(canvas_id), changes=[change])
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("canvases.edit returned malformed data")
+
     async def fetch_thread_replies(self, channel_id: str, root_ts: str, *,
                                    cursor: str | None = None, limit: int = 100) -> Mapping[str, Any]:
         """Fetch one authenticated page of a thread through the retrying API path."""

@@ -37,6 +37,12 @@ class Bot:
         destination.write_bytes(b"data")
         return destination
 
+    async def create_canvas(self, **kwargs):
+        self.calls.append(("canvas_create", kwargs)); return {"canvas_id": "F-CANVAS"}
+
+    async def edit_canvas(self, canvas_id, **kwargs):
+        self.calls.append(("canvas_edit", canvas_id, kwargs)); return {"ok": True}
+
     async def post(self, text, *, channel_id, root_ts):
         self.calls.append(("post", text, channel_id, root_ts)); return ["1.2"]
 
@@ -204,6 +210,41 @@ async def test_download_requires_file_membership_and_uses_private_url(facade, tm
     )
     assert result["result"]["size"] == 4
     assert result["result"]["path"].startswith(str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_canvas_create_and_edit_are_bound_to_owned_task(facade):
+    write = ctx(McpCapability.WRITE, request="canvas-create")
+    created = await facade.call(
+        "slack_create_canvas",
+        {"task_id": "task-1", "title": "Plan", "markdown": "# Plan"}, write,
+    )
+    assert created["result"]["canvas_id"] == "F-CANVAS"
+    edited = await facade.call(
+        "slack_edit_canvas",
+        {"task_id": "task-1", "canvas_id": "F-CANVAS", "operation": "append",
+         "markdown": "## Update"},
+        ctx(McpCapability.WRITE, request="canvas-edit"),
+    )
+    assert edited["result"]["edited"] is True
+    assert facade.bot.calls == [
+        ("canvas_create", {"title": "Plan", "markdown": "# Plan", "channel_id": "C1"}),
+        ("canvas_edit", "F-CANVAS", {
+            "operation": "insert_at_end", "markdown": "## Update", "title": None,
+        }),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canvas_edit_rejects_untracked_canvas(facade):
+    with pytest.raises(McpApiError) as denied:
+        await facade.call(
+            "slack_edit_canvas",
+            {"task_id": "task-1", "canvas_id": "F-OTHER", "operation": "rename",
+             "title": "Nope"},
+            ctx(McpCapability.WRITE),
+        )
+    assert denied.value.code == "canvas_not_in_task"
 
 
 @pytest.mark.asyncio
