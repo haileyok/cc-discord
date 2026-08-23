@@ -208,6 +208,30 @@ async def slack_remove_bookmark(task_id: str, bookmark_id: str,
 
 
 @server.tool()
+async def slack_schedule_message(task_id: str, text: str, post_at: int) -> dict[str, Any]:
+    """Schedule a durable message in an owned task thread up to 120 days ahead."""
+    return await _rpc("slack_schedule_message", {
+        "task_id": task_id, "text": text, "post_at": post_at,
+    })
+
+
+@server.tool()
+async def slack_list_scheduled_messages(task_id: str) -> dict[str, Any]:
+    """List pending schedules created for a task by this bridge process."""
+    return await _rpc("slack_list_scheduled_messages", {"task_id": task_id})
+
+
+@server.tool()
+async def slack_cancel_scheduled_message(task_id: str, scheduled_message_id: str,
+                                         confirm: bool = False) -> dict[str, Any]:
+    """Cancel a verified pending task schedule. Requires confirm=true."""
+    return await _rpc("slack_cancel_scheduled_message", {
+        "task_id": task_id, "scheduled_message_id": scheduled_message_id,
+        "confirm": confirm,
+    })
+
+
+@server.tool()
 async def slack_edit_message(task_id: str, message_ts: str, text: str) -> dict[str, Any]:
     """Edit a bot-authored message within an owned task thread."""
     return await _rpc("slack_edit_message", {"task_id": task_id, "message_ts": message_ts, "text": text})

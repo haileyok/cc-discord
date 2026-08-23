@@ -27,7 +27,8 @@ async def test_mcp_server_registers_only_explicit_tools(monkeypatch):
             "slack_post_message", "slack_upload_file", "slack_download_thread_file",
             "slack_create_canvas", "slack_edit_canvas", "slack_set_channel_metadata",
             "slack_invite_participants", "slack_remove_participants", "slack_add_bookmark",
-            "slack_remove_bookmark", "slack_edit_message", "slack_add_reaction",
+            "slack_remove_bookmark", "slack_schedule_message", "slack_list_scheduled_messages",
+            "slack_cancel_scheduled_message", "slack_edit_message", "slack_add_reaction",
             "slack_remove_reaction",
             "slack_delete_message",
         }

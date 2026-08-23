@@ -59,6 +59,19 @@ class Bot:
     async def remove_managed_channel_bookmark(self, channel_id, bookmark_id):
         self.calls.append(("bookmark_remove", channel_id, bookmark_id))
 
+    async def schedule_message(self, channel_id, root_ts, *, text, post_at):
+        self.calls.append(("schedule", channel_id, root_ts, text, post_at))
+        return {"scheduled_message_id": "Q1"}
+
+    async def list_scheduled_messages(self, channel_id, **kwargs):
+        self.calls.append(("list_scheduled", channel_id, kwargs))
+        return {"scheduled_messages": [{"id": "Q1", "post_at": 2_000_000_000,
+                                         "text": "follow up"}],
+                "response_metadata": {"next_cursor": ""}}
+
+    async def delete_scheduled_message(self, channel_id, scheduled_message_id):
+        self.calls.append(("cancel_scheduled", channel_id, scheduled_message_id))
+
     async def post(self, text, *, channel_id, root_ts):
         self.calls.append(("post", text, channel_id, root_ts)); return ["1.2"]
 
@@ -377,6 +390,56 @@ async def test_destructive_channel_actions_require_confirmation_and_protect_owne
         ctx(McpCapability.DESTRUCTIVE, request="bookmark-remove"),
     )
     assert removed["result"]["removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_scheduled_messages_are_task_scoped_and_cancellation_is_verified(facade):
+    import time
+    post_at = int(time.time()) + 3600
+    scheduled = await facade.call(
+        "slack_schedule_message",
+        {"task_id": "task-1", "text": "follow up", "post_at": post_at},
+        ctx(McpCapability.WRITE, request="schedule"),
+    )
+    assert scheduled["result"]["scheduled_message_id"] == "Q1"
+    listed = await facade.call(
+        "slack_list_scheduled_messages", {"task_id": "task-1"},
+        ctx(McpCapability.READ, request="schedule-list"),
+    )
+    assert listed["result"]["messages"][0]["scheduled_message_id"] == "Q1"
+    with pytest.raises(McpApiError) as missing:
+        await facade.call(
+            "slack_cancel_scheduled_message",
+            {"task_id": "task-1", "scheduled_message_id": "Q1"},
+            ctx(McpCapability.DESTRUCTIVE, request="schedule-cancel-missing"),
+        )
+    assert missing.value.code == "confirmation_required"
+    cancelled = await facade.call(
+        "slack_cancel_scheduled_message",
+        {"task_id": "task-1", "scheduled_message_id": "Q1", "confirm": True},
+        ctx(McpCapability.DESTRUCTIVE, request="schedule-cancel"),
+    )
+    assert cancelled["result"]["cancelled"] is True
+    assert facade.bot.calls[-1] == ("cancel_scheduled", "C1", "Q1")
+
+
+@pytest.mark.asyncio
+async def test_scheduled_message_rejects_past_and_untracked_ids(facade):
+    import time
+    with pytest.raises(McpApiError) as past:
+        await facade.call(
+            "slack_schedule_message",
+            {"task_id": "task-1", "text": "late", "post_at": int(time.time()) - 1},
+            ctx(McpCapability.WRITE),
+        )
+    assert past.value.code == "invalid_arguments"
+    with pytest.raises(McpApiError) as foreign:
+        await facade.call(
+            "slack_cancel_scheduled_message",
+            {"task_id": "task-1", "scheduled_message_id": "OTHER", "confirm": True},
+            ctx(McpCapability.DESTRUCTIVE, request="foreign-schedule"),
+        )
+    assert foreign.value.code == "scheduled_message_not_in_task"
 
 
 @pytest.mark.asyncio

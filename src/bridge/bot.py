@@ -560,7 +560,8 @@ class Bot:
     async def _api(self, method: str, **kwargs: Any) -> Any:
         if method in {
             "chat_postMessage", "chat_update", "chat_startStream", "chat_appendStream",
-            "chat_stopStream", "reactions_add", "reactions_remove", "files_completeUploadExternal",
+            "chat_stopStream", "chat_scheduleMessage", "chat_deleteScheduledMessage",
+            "reactions_add", "reactions_remove", "files_completeUploadExternal",
         }:
             await self._throttle_outbound(kwargs.get("channel") or kwargs.get("channel_id"))
         operation = getattr(self._client, method, None)
@@ -1416,6 +1417,44 @@ class Bot:
             if _response_value(response, "error") == "channel_not_found":
                 return
             raise
+
+    async def schedule_message(self, channel_id: str, root_ts: str, *,
+                               text: str, post_at: int) -> Mapping[str, Any]:
+        """Schedule a durable Slack message inside a task thread."""
+        result = await self._api(
+            "chat_scheduleMessage", channel=self._channel_for(channel_id),
+            thread_ts=str(root_ts), text=str(text), post_at=int(post_at),
+        )
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("chat.scheduleMessage returned malformed data")
+
+    async def list_scheduled_messages(self, channel_id: str, *,
+                                      cursor: str | None = None,
+                                      limit: int = 100) -> Mapping[str, Any]:
+        kwargs: dict[str, Any] = {
+            "channel": self._channel_for(channel_id),
+            "limit": max(1, min(int(limit), 100)),
+        }
+        if cursor:
+            kwargs["cursor"] = str(cursor)
+        result = await self._api("chat_scheduledMessages_list", **kwargs)
+        if isinstance(result, Mapping):
+            return result
+        data = getattr(result, "data", None)
+        if isinstance(data, Mapping):
+            return data
+        raise SlackAdapterError("chat.scheduledMessages.list returned malformed data")
+
+    async def delete_scheduled_message(self, channel_id: str,
+                                       scheduled_message_id: str) -> None:
+        await self._api(
+            "chat_deleteScheduledMessage", channel=self._channel_for(channel_id),
+            scheduled_message_id=str(scheduled_message_id),
+        )
 
     async def edit_message(self, channel_id: str, message_ts: str, *,
                            text: str | None = None,

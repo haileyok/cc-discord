@@ -355,6 +355,15 @@ class FakeSlackClient:
     async def bookmarks_remove(self, **kwargs: Any) -> Any:
         return await self._call("bookmarks_remove", **kwargs)
 
+    async def chat_scheduleMessage(self, **kwargs: Any) -> Any:
+        return await self._call("chat_scheduleMessage", **kwargs)
+
+    async def chat_scheduledMessages_list(self, **kwargs: Any) -> Any:
+        return await self._call("chat_scheduledMessages_list", **kwargs)
+
+    async def chat_deleteScheduledMessage(self, **kwargs: Any) -> Any:
+        return await self._call("chat_deleteScheduledMessage", **kwargs)
+
     async def files_getUploadURLExternal(self, **kwargs: Any) -> Any:
         return await self._call("files_getUploadURLExternal", **kwargs)
 

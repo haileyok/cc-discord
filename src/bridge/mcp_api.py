@@ -90,6 +90,7 @@ class McpFacade:
     idempotency_ttl_secs: float = 600.0
     _idempotency: dict[str, _CacheEntry] = field(default_factory=dict, init=False, repr=False)
     _canvas_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _scheduled_tasks: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _TOOLS: dict[str, tuple[McpCapability, str]] = field(default_factory=lambda: {
         "bridge_health": (McpCapability.READ, "_bridge_health"),
         "bridge_list_tasks": (McpCapability.READ, "_list_tasks"),
@@ -115,6 +116,9 @@ class McpFacade:
         "slack_remove_participants": (McpCapability.DESTRUCTIVE, "_remove_participants"),
         "slack_add_bookmark": (McpCapability.CHANNEL_ADMIN, "_add_bookmark"),
         "slack_remove_bookmark": (McpCapability.DESTRUCTIVE, "_remove_bookmark"),
+        "slack_schedule_message": (McpCapability.WRITE, "_schedule_message"),
+        "slack_list_scheduled_messages": (McpCapability.READ, "_list_scheduled_messages"),
+        "slack_cancel_scheduled_message": (McpCapability.DESTRUCTIVE, "_cancel_scheduled_message"),
         "slack_edit_message": (McpCapability.WRITE, "_edit_message"),
         "slack_add_reaction": (McpCapability.WRITE, "_add_reaction"),
         "slack_remove_reaction": (McpCapability.WRITE, "_remove_reaction"),
@@ -606,6 +610,87 @@ class McpFacade:
         await self.bot.remove_managed_channel_bookmark(task.channel_id, bookmark_id)
         return {"task_id": task_id, "channel_id": task.channel_id,
                 "bookmark_id": bookmark_id, "removed": True}
+
+    async def _schedule_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        text = self._text(args, "text", limit=32_000)
+        try:
+            post_at = int(args.get("post_at"))
+        except (TypeError, ValueError) as exc:
+            raise McpApiError("invalid_arguments", "post_at must be a Unix timestamp") from exc
+        now = int(time.time())
+        if post_at <= now:
+            raise McpApiError("invalid_arguments", "post_at must be in the future")
+        if post_at > now + 120 * 86400:
+            raise McpApiError("invalid_arguments", "post_at cannot exceed 120 days")
+        task = self._owned_task(ctx, task_id)
+        result = await self.bot.schedule_message(
+            task.channel_id, task.root_ts, text=text, post_at=post_at
+        )
+        scheduled_id = str(result.get("scheduled_message_id") or "")
+        if not scheduled_id:
+            raise McpApiError("schedule_failed", "Slack did not return a scheduled message ID")
+        self._scheduled_tasks[scheduled_id] = task_id
+        return {"task_id": task_id, "scheduled_message_id": scheduled_id,
+                "post_at": post_at, "scheduled": True}
+
+    async def _list_scheduled_messages(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        task = self._owned_task(ctx, task_id)
+        messages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(5):
+            page = await self.bot.list_scheduled_messages(
+                task.channel_id, cursor=cursor, limit=100
+            )
+            for item in page.get("scheduled_messages") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                scheduled_id = str(item.get("id") or item.get("scheduled_message_id") or "")
+                if scheduled_id and self._scheduled_tasks.get(scheduled_id) == task_id:
+                    messages.append({
+                        "scheduled_message_id": scheduled_id,
+                        "post_at": int(item.get("post_at") or 0),
+                        "text": str(item.get("text") or "")[:8_000],
+                    })
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        return {"task_id": task_id, "messages": messages[:100],
+                "count": min(len(messages), 100),
+                "restart_note": "Only schedules created by this bridge process are listed"}
+
+    async def _cancel_scheduled_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        scheduled_id = self._text(args, "scheduled_message_id", limit=200)
+        if args.get("confirm") is not True:
+            raise McpApiError("confirmation_required", "cancel_scheduled_message requires confirm=true")
+        task = self._owned_task(ctx, task_id)
+        if self._scheduled_tasks.get(scheduled_id) != task_id:
+            raise McpApiError(
+                "scheduled_message_not_in_task",
+                "Scheduled message was not created for this task by the current bridge process",
+            )
+        found = False
+        cursor: str | None = None
+        for _ in range(5):
+            page = await self.bot.list_scheduled_messages(task.channel_id, cursor=cursor, limit=100)
+            found = any(
+                str(item.get("id") or item.get("scheduled_message_id") or "") == scheduled_id
+                for item in page.get("scheduled_messages") or [] if isinstance(item, Mapping)
+            )
+            if found:
+                break
+            cursor = self._next_cursor(page)
+            if not cursor:
+                break
+        if not found:
+            self._scheduled_tasks.pop(scheduled_id, None)
+            raise McpApiError("scheduled_message_not_found", "Scheduled message is no longer pending")
+        await self.bot.delete_scheduled_message(task.channel_id, scheduled_id)
+        self._scheduled_tasks.pop(scheduled_id, None)
+        return {"task_id": task_id, "scheduled_message_id": scheduled_id,
+                "cancelled": True}
 
     async def _edit_message(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); message_ts = self._text(args, "message_ts", limit=40)
