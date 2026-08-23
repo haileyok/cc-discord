@@ -96,6 +96,7 @@ class McpFacade:
         "bridge_task_status": (McpCapability.READ, "_task_status"),
         "bridge_compact_task": (McpCapability.CONTROL, "_compact_task"),
         "bridge_cancel_turn": (McpCapability.CONTROL, "_cancel_turn"),
+        "bridge_promote_task": (McpCapability.CHANNEL_ADMIN, "_promote_task"),
         "bridge_set_model": (McpCapability.CONTROL, "_set_model"),
         "bridge_set_facet": (McpCapability.CONTROL, "_set_facet"),
         "bridge_set_effort": (McpCapability.CONTROL, "_set_effort"),
@@ -254,6 +255,41 @@ class McpFacade:
         self._owned_task(ctx, task_id)
         cancelled = await self.registry.cancel_turn(task_id, ctx.owner_user_id)
         return {"task_id": task_id, "cancelled": bool(cancelled), "session_preserved": True}
+
+    async def _promote_task(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
+        task_id = self._text(args, "task_id", limit=80)
+        task = self._owned_task(ctx, task_id)
+        raw_users = args.get("participant_user_ids")
+        users: list[str] | None = None
+        if raw_users is not None:
+            if not isinstance(raw_users, list) or len(raw_users) > 50:
+                raise McpApiError(
+                    "invalid_arguments",
+                    "participant_user_ids must be a list of at most 50 Slack IDs",
+                )
+            users = list(dict.fromkeys(
+                str(item).strip() for item in raw_users if str(item).strip()
+            ))
+            if any(len(item) > 100 for item in users):
+                raise McpApiError("invalid_arguments", "participant_user_ids contains an invalid ID")
+        name = self._text(args, "name", limit=80, required=False) or None
+        plan = {
+            "task_id": task_id,
+            "current_mode": str(task.mode),
+            "action": "create_private_channel_and_rebind_task",
+            "channel_name": name or f"task-{task_id[:8]}",
+            "participant_user_ids": users,
+            "guards": ["pending_questions_must_be_resolved", "journaled_rollback"],
+        }
+        if args.get("dry_run", True) is not False:
+            return {"dry_run": True, "plan": plan}
+        if args.get("confirm") is not True:
+            raise McpApiError("confirmation_required", "promote_task execution requires confirm=true")
+        promoted = await self.registry.promote_task(
+            task_id, ctx.owner_user_id, users, name=name
+        )
+        return {"dry_run": False, "promoted": True,
+                "task": self._task_summary(promoted)}
 
     async def _set_model(self, ctx: McpContext, args: Mapping[str, Any]) -> dict[str, Any]:
         task_id = self._text(args, "task_id", limit=80); model = self._text(args, "model", limit=200)

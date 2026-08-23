@@ -69,6 +69,17 @@ async def bridge_cancel_turn(task_id: str, confirm: bool = False) -> dict[str, A
 
 
 @server.tool()
+async def bridge_promote_task(task_id: str, participant_user_ids: list[str] | None = None,
+                              name: str | None = None, dry_run: bool = True,
+                              confirm: bool = False) -> dict[str, Any]:
+    """Plan or execute journaled promotion into a private collaborative channel."""
+    return await _rpc("bridge_promote_task", {
+        "task_id": task_id, "participant_user_ids": participant_user_ids,
+        "name": name, "dry_run": dry_run, "confirm": confirm,
+    })
+
+
+@server.tool()
 async def bridge_set_model(task_id: str, model: str, reasoning_effort: str | None = None) -> dict[str, Any]:
     """Set the active model and optional reasoning effort for one owned task."""
     return await _rpc("bridge_set_model", {"task_id": task_id, "model": model, "reasoning_effort": reasoning_effort})

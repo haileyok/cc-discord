@@ -20,7 +20,8 @@ async def test_mcp_server_registers_only_explicit_tools(monkeypatch):
         names = {tool.name for tool in listed.tools}
         assert names == {
             "bridge_health", "bridge_list_tasks", "bridge_task_status",
-            "bridge_compact_task", "bridge_cancel_turn", "bridge_set_model", "bridge_set_facet",
+            "bridge_compact_task", "bridge_cancel_turn", "bridge_promote_task",
+            "bridge_set_model", "bridge_set_facet",
             "bridge_set_effort", "bridge_stop_task", "bridge_clear_context",
             "slack_read_thread", "slack_read_channel_history", "slack_search_task_messages",
             "slack_post_message", "slack_upload_file", "slack_download_thread_file",

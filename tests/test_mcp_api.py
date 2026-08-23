@@ -104,6 +104,11 @@ class Registry:
     async def cancel_turn(self, task_id, owner_user_id):
         self.calls.append(("cancel_turn", task_id, owner_user_id)); return True
 
+    async def promote_task(self, task_id, owner_user_id, participant_user_ids, *, name=None):
+        self.calls.append(("promote", task_id, owner_user_id, participant_user_ids, name))
+        self.task.mode = "collaborative"; self.task.channel_owned = True
+        return self.task
+
     async def set_model(self, task_id, model, *, owner_user_id, reasoning_effort=None):
         self.calls.append(("model", task_id, model, owner_user_id, reasoning_effort))
 
@@ -176,6 +181,34 @@ async def test_cancel_turn_requires_confirmation_and_preserves_session(facade):
         "task_id": "task-1", "cancelled": True, "session_preserved": True,
     }
     assert facade.registry.calls[-1] == ("cancel_turn", "task-1", "UOWNER")
+
+
+@pytest.mark.asyncio
+async def test_promote_task_defaults_to_dry_run_and_requires_confirmation(facade):
+    admin = ctx(McpCapability.CHANNEL_ADMIN)
+    plan = await facade.call(
+        "bridge_promote_task",
+        {"task_id": "task-1", "participant_user_ids": ["U2", "U2"], "name": "incident"},
+        admin,
+    )
+    assert plan["result"]["dry_run"] is True
+    assert plan["result"]["plan"]["participant_user_ids"] == ["U2"]
+    assert facade.registry.calls == []
+    with pytest.raises(McpApiError) as missing:
+        await facade.call(
+            "bridge_promote_task",
+            {"task_id": "task-1", "dry_run": False},
+            ctx(McpCapability.CHANNEL_ADMIN, request="promote-unconfirmed"),
+        )
+    assert missing.value.code == "confirmation_required"
+    result = await facade.call(
+        "bridge_promote_task",
+        {"task_id": "task-1", "participant_user_ids": ["U2"], "name": "incident",
+         "dry_run": False, "confirm": True},
+        ctx(McpCapability.CHANNEL_ADMIN, request="promote-execute"),
+    )
+    assert result["result"]["task"]["mode"] == "collaborative"
+    assert facade.registry.calls[-1] == ("promote", "task-1", "UOWNER", ["U2"], "incident")
 
 
 @pytest.mark.asyncio
